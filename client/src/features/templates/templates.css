@@ -1,0 +1,87 @@
+/* Create Own Template: a plain test-harness layout inside the shared workspace dialog. Functional, not polished. */
+.tpl { display: grid; grid-template-columns: 268px minmax(0, 1fr); height: 100%; min-height: 0; font-size: 13px; color: var(--color-ink); }
+.tpl h3 { font-size: 12px; font-weight: 600; letter-spacing: .02em; }
+.tpl h3 span { font-weight: 400; color: var(--color-muted); }
+.tpl input[type=text], .tpl select, .tpl textarea { min-width: 0; height: 30px; border: 1px solid var(--color-line); border-radius: 7px; padding: 0 8px; font: inherit; background: #fff; color: inherit; }
+.tpl textarea { height: auto; padding: 6px 8px; resize: vertical; }
+.tpl input:focus-visible, .tpl select:focus-visible, .tpl textarea:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 1px; }
+.tpl .ws-btn { min-height: 30px; padding: 0 10px; font-size: 12px; }
+.tpl-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.tpl-check { display: inline-flex; gap: 5px; align-items: center; }
+
+.tpl-sidebar { min-height: 0; overflow: auto; padding: 14px; display: grid; gap: 10px; align-content: start; background: var(--color-panel); border-right: 1px solid var(--color-line); }
+.tpl-card { display: grid; gap: 6px; padding: 10px; border: 1px solid var(--color-line); border-radius: 10px; }
+.tpl-card.is-on { border-color: var(--color-primary); background: var(--color-selected); }
+.tpl-creatives, .tpl-layers { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.tpl-creatives li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.tpl-creatives li > button:first-child, .tpl-layers button { display: flex; justify-content: space-between; gap: 8px; width: 100%; padding: 5px 8px; border-radius: 6px; text-align: left; }
+.tpl-creatives li > button:first-child:hover, .tpl-layers button:hover { background: var(--color-chrome); }
+.tpl-creatives button.is-on, .tpl-layers button.is-on { background: var(--color-selected); color: var(--color-primary); font-weight: 600; }
+
+.tpl-main { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; min-height: 0; }
+.tpl-toolbar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 10px 14px; background: var(--color-panel); border-bottom: 1px solid var(--color-line); }
+.tpl-work { display: grid; grid-template-columns: minmax(0, 1fr) 340px; min-height: 0; }
+.tpl-work.is-creative { grid-template-columns: 340px minmax(0, 1fr); }
+.tpl-stage { position: relative; min-width: 0; min-height: 0; background: var(--color-workspace); }
+.tpl-stage:focus-visible { outline: 2px solid var(--color-primary); outline-offset: -2px; }
+.tpl-viewport { width: 100%; height: 100%; overflow: hidden; display: grid; place-items: center; }
+.tpl-canvas-frame { line-height: 0; box-shadow: 0 1px 3px rgba(20, 30, 25, .25), 0 8px 24px rgba(20, 30, 25, .08); }
+.tpl-empty { position: absolute; inset: auto 0 18px; text-align: center; color: var(--color-muted); pointer-events: none; }
+
+.tpl-panel { min-height: 0; overflow: auto; padding: 12px 14px; display: grid; gap: 14px; align-content: start; background: var(--color-panel); border-left: 1px solid var(--color-line); }
+.tpl-work.is-creative .tpl-panel { border-left: 0; border-right: 1px solid var(--color-line); }
+.tpl-section { display: grid; gap: 7px; }
+.tpl-field { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 8px; align-items: center; }
+.tpl-field > span:first-child { color: var(--color-muted); }
+.tpl-number, .tpl-color { display: flex; gap: 6px; align-items: center; min-width: 0; }
+.tpl-number input { width: 76px; }
+.tpl-number span { color: var(--color-muted); font-size: 11.5px; }
+.tpl-color input[type=color] { width: 34px; height: 30px; padding: 0; border: 1px solid var(--color-line); border-radius: 7px; background: #fff; }
+.tpl-color input[type=text] { width: 86px; }
+.tpl-fields { display: grid; gap: 7px; margin: 0; padding: 10px; border: 1px solid var(--color-line); border-radius: 10px; }
+.tpl-fields.is-on { border-color: var(--color-primary); }
+.tpl-fields legend { padding: 0 4px; font-weight: 600; }
+.tpl-debug { margin: 0; padding: 8px 10px; border-radius: 7px; background: #f3f4f0; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tpl-ratios { width: 100%; margin-top: 6px; border-collapse: collapse; font: 11.5px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tpl-ratios th, .tpl-ratios td { padding: 3px 5px; border-bottom: 1px solid var(--color-line); text-align: right; }
+.tpl-ratios th:first-child, .tpl-ratios td:first-child { text-align: left; }
+
+/* Offer themes live in the existing inspector; no second canvas or library. */
+.theme-cards { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; margin:12px 0; }
+.theme-card { padding:5px; border:1px solid #d8dfda; border-radius:9px; background:white; color:#24352d; text-align:left; cursor:pointer; min-width:0; }
+.theme-card.is-active { border-color:#275c48; outline:2px solid #275c48; }
+.theme-card svg { display:block; width:100%; border-radius:5px; margin-bottom:5px; }
+.theme-card strong,.theme-card small { display:block; }
+.theme-card strong { font-size:12px; }
+.theme-card small { font-size:10px; line-height:1.4; margin:3px 0; }
+.theme-swatches { display:flex; gap:5px; margin:6px 0; flex-wrap:wrap; }
+.theme-swatches i,.theme-swatches button { display:block; width:17px; height:17px; border:1px solid #0002; border-radius:50%; padding:0; }
+.theme-swatches button { width:23px; height:23px; cursor:pointer; }
+.theme-confirm { padding:12px; background:#fff8e8; border:1px solid #e7ce92; border-radius:8px; }
+.theme-confirm p { font-size:12px; line-height:1.5; }
+.theme-confirm button { margin:3px; }
+.theme-font-picker { margin:10px 0; }
+.theme-font-menu { padding:10px; border:1px solid #ccd6cf; border-radius:8px; background:#fff; }
+.theme-font-menu label,.theme-font-menu strong,.theme-font-menu small { display:block; margin:6px 0; }
+.theme-font-menu input { width:100%; box-sizing:border-box; }
+.theme-font-results { max-height:180px; overflow:auto; margin:7px 0; }
+.theme-font-results button { width:100%; text-align:left; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:7px; background:#fff; border:0; cursor:pointer; font:inherit; font-size:12px; }
+.theme-font-results button:hover { background:#eef5f0; }
+.theme-font-results small { font-size:9px; color:#48715a; }
+.tpl-layers { max-height:220px; overflow:auto; }
+
+.diwali-gallery summary,.ai-theme-panel summary,.legacy-themes summary { cursor:pointer; font-weight:600; padding:9px 0; }
+.diwali-cards { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.diwali-cards .theme-card { padding:7px; }
+.diwali-cards .theme-card strong { font-size:12px; margin-top:7px; }
+.ai-theme-panel { padding:8px 10px; border:1px solid #d8dfda; border-radius:8px; background:#f5f8f5; }
+.ai-theme-panel label,.ai-theme-panel textarea { display:block; width:100%; box-sizing:border-box; }
+.ai-theme-panel p { line-height:1.5; }
+.ai-theme-panel button { margin-top:8px; }
+.theme-font-picker > strong { display:block; margin-bottom:7px; }
+
+.tpl-element-properties { display:grid; gap:14px; }
+.tpl-history button:disabled { pointer-events: none; } /* Let canvas drag-end bubble through the wrapper when released here. */
+
+.premium-gallery summary { cursor:pointer; font-weight:600; padding:12px 0; border-top:1px solid #d8ded5; margin-top:12px; }
+.premium-gallery .theme-card img { width:100%; display:block; aspect-ratio:1; object-fit:contain; }

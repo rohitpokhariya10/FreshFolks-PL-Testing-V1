@@ -1,0 +1,737 @@
+# FrameFlow
+
+A browser-based design editor for event artwork, reusable templates, format adaptation, and AI-assisted image decomposition.
+
+**[Live Demo](https://frameflow-h7fa.onrender.com/)** · **[Source Code](https://github.com/rohitpokhariya10/frameflow)**
+
+**[Run locally](#run-frameflow-on-your-computer)** · [Features](#key-features) · [How to use](#how-to-use-the-features) · [Architecture](#architecture) · [Deployment](#production-deployment) · [Testing](#verification-and-testing)
+
+## Run FrameFlow on your computer
+
+> **Start here:** install Node.js, clone the repository, run `npm ci`, copy the example server configuration, and run `npm run dev`. Open **http://127.0.0.1:5173**. **API keys are optional for the basic editor.**
+
+### 1. Prerequisites
+
+- **Git** to clone the repository, or download and extract its source ZIP.
+- **Node.js 22.12 or newer** and **npm**. The repository's `.nvmrc` selects Node 22.
+- A modern browser such as Chrome, Edge, or Firefox.
+- Internet access to install dependencies and, optionally, call AI providers.
+
+Check the tools in your terminal:
+
+```sh
+node --version
+npm --version
+git --version
+```
+
+The standard editor and Offer Templates flow do not require a separately installed database, Docker, or a separate worker. The optional legacy decomposition flow has its own worker setup below.
+
+### 2. Get the code and install dependencies
+
+Run these commands in Terminal, PowerShell, or Git Bash:
+
+```sh
+git clone https://github.com/rohitpokhariya10/frameflow.git
+cd frameflow
+npm ci
+```
+
+If you downloaded a ZIP, open a terminal inside the extracted folder containing the root `package.json`, then run `npm ci`. If you already have the repository, use that folder instead of cloning again.
+
+**Using nvm on macOS/Linux?** Run `nvm install` and `nvm use` inside the repository before `npm ci`. If Node is installed another way, skip those two commands.
+
+Run npm commands from the **repository root** unless stated otherwise. One `npm ci` installs the `client`, `server`, and `shared` workspaces; do not install them separately.
+
+### 3. Create your local configuration
+
+Copy the example file **once on a fresh checkout**. If `server/.env` already exists, edit it instead of overwriting it.
+
+**macOS / Linux / Git Bash:**
+
+```sh
+cp server/.env.example server/.env
+```
+
+**Windows PowerShell:**
+
+```powershell
+Copy-Item server/.env.example server/.env
+```
+
+For the basic editor, the copied defaults are sufficient. Leave credential fields empty. The important local defaults are:
+
+```dotenv
+PORT=3001
+AI_PROVIDER=cloudflare
+AI_TIMEOUT_MS=120000
+CLIENT_ORIGIN=http://localhost:5173
+TRUST_PROXY_HOPS=0
+DECOMPOSITION_ENABLED=false
+```
+
+The editor, text tools, Auto Layout, browser-local templates and PNG export work without provider keys. AI operations report unavailable until their relevant provider is configured. Configure only the features you intend to use; see [optional AI setup](#optional-ai-configuration).
+
+**Which `.env` file should I use?**
+
+| File | Purpose |
+| --- | --- |
+| `server/.env` | Backend credentials and settings; use this for local setup. |
+| Root `.env` | Optional shared backend defaults; not required for a fresh setup. |
+| `client/.env.local` | Optional frontend settings and feature flags; never put secrets here. |
+| `server/.env.example`, `client/.env.example` | Safe configuration templates committed to Git. |
+
+The API's dev/start scripts load the root `.env` first, then `server/.env`; server-file values override duplicate root-file values. Existing shell environment variables take precedence. The legacy worker loads `server/.env` only. Avoid maintaining duplicate settings in both files. Normal local development needs no client env file: Vite already proxies `/api` to port 3001.
+
+### 4. Start the app
+
+From the repository root:
+
+```sh
+npm run dev
+```
+
+Keep that terminal open. This starts both services:
+
+| Service | Address | What to expect |
+| --- | --- | --- |
+| **Frontend — open this in your browser** | **http://127.0.0.1:5173** | FrameFlow editor |
+| Backend API | http://127.0.0.1:3001 | Express server; development normally uses the Vite frontend |
+| Health check | http://127.0.0.1:3001/api/health | JSON containing `"status": "ok"` |
+
+The backend prints `FrameFlow server: http://127.0.0.1:3001`; Vite prints the frontend address. The health check does not call an AI provider. `aiConfigured: false` is expected when core artwork credentials are empty; it is not an editor startup failure. Health does not verify OpenAI/fal credit or model access.
+
+**First check:** choose a canvas → add a heading → move it → export PNG. This confirms the editor works without spending AI credits.
+
+Press **Ctrl+C** in the terminal to stop development. Restart after changing server env settings, once any running AI job has finished. Browser storage is origin-specific, so consistently use the same address: `localhost:5173` and `127.0.0.1:5173` have separate local libraries.
+
+### Optional AI configuration
+
+All values below belong in `server/.env`. Use **your own** credentials and available provider credit/allocation. Never commit `.env`, put keys in `VITE_` variables, or share someone else's local env file.
+
+| Feature | Required configuration | Separate worker? |
+| --- | --- | --- |
+| Core **AI → Generate / Adapt** | `AI_PROVIDER=cloudflare`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN` | No |
+| Alternate core image generation | `AI_PROVIDER=gemini`, `GEMINI_API_KEY` | No; reference adaptation requires Cloudflare |
+| **Offer Templates**, product variations, OpenAI + Seedream recipes | `LAYERIZE_EXPERIMENT=1`, `OPENAI_API_KEY`, `FAL_KEY` | No |
+| AI Template Studio | `LAYERIZE_EXPERIMENT=1`, `OPENAI_API_KEY`; fal key for subsequent Seedream decomposition | No |
+| Optional legacy **Image to layers** | Legacy flags, fal key and worker described below | Yes |
+
+`AI_PROVIDER` selects the core artwork adapter only. Setting it to Cloudflare does **not** route OpenAI planners or Seedream through Cloudflare. Gemini is explicitly selected, not an automatic fallback.
+
+For core artwork generation/adaptation, fill the existing Cloudflare fields in `server/.env`:
+
+```dotenv
+AI_PROVIDER=cloudflare
+CLOUDFLARE_ACCOUNT_ID=your_account_id
+CLOUDFLARE_API_TOKEN=your_workers_ai_token
+CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-2-klein-4b
+```
+
+`AI_TIMEOUT_MS` controls the core artwork flow; it is not a global timeout for every decomposition/planner operation.
+
+### OpenAI + Seedream experiment setup
+
+For Offer Templates and the decomposition experiments, set these fields in `server/.env`, then start/restart with `npm run dev`:
+
+```dotenv
+LAYERIZE_EXPERIMENT=1
+OPENAI_API_KEY=your_openai_api_key
+FAL_KEY=your_fal_key
+```
+
+Open **OpenAI + Seedream test → Offer Templates** for the product-template workflow. The launcher can be visible even when backend routes are disabled; `LAYERIZE_EXPERIMENT=1` enables those routes.
+
+This work runs inside the API process. It does **not** require `DECOMPOSITION_ENABLED=true` or the legacy worker. Model selection lives in [aiModels.ts](server/src/decomposition/aiModels.ts): the product decomposition planner defaults to `gpt-5.6-sol`, the older general planner helper to `gpt-5-mini`, and image generation to `gpt-image-2`. `OPENAI_DECOMPOSITION_MODEL` and `OPENAI_IMAGE_MODEL` override the relevant defaults. These are repository defaults, not guarantees of access for your account. Template Studio has separate `STUDIO_*` settings in [server/.env.example](server/.env.example).
+
+Review the displayed estimates before approving generation or decomposition. A timeout or connection reset does not prove an attempt was unbilled; inspect saved progress before authorizing another attempt. Successful mock tests do not guarantee live image or background quality.
+
+### Run the built application locally
+
+To serve the compiled frontend and API together, stop the development server first, then run:
+
+```sh
+npm run build
+npm start
+```
+
+Open **http://127.0.0.1:3001**. Port 5173 is only used by the development frontend. `npm start` requires a successful build and does not start the legacy worker. For hosted deployment, see [Production Deployment](#production-deployment).
+
+### Optional legacy Image to layers setup
+
+Skip this section for the editor, Offer Templates, and OpenAI + Seedream recipes. For the older worker-based flow, add these settings to `server/.env`:
+
+```dotenv
+DECOMPOSITION_ENABLED=true
+DECOMP_PROVIDER_MODE=live
+DECOMP_AUTH_MODE=development
+DECOMP_DATA_DIR=./data/decomposition
+FAL_KEY=your_fal_key
+```
+
+On **macOS/Linux/Git Bash**, run `npm run dev:decomposition` instead of `npm run dev`. It starts the client, API and worker, with the legacy frontend flag enabled.
+
+On **Windows PowerShell**, add `VITE_LEGACY_IMAGE_TO_LAYERS=1` to `client/.env.local`, then use two terminals from the repository root:
+
+```sh
+# Terminal 1: frontend and API
+npm run dev
+```
+
+```sh
+# Terminal 2: background worker
+npm run worker:dev -w @frameflow/server
+```
+
+The same two-terminal approach works on other platforms. Relative legacy data paths resolve from `server/`; the API and worker must share their configuration and data directory. For operator login, use `DECOMP_AUTH_MODE=local-operator` and run `npm run decomp:setup`. Development authentication is for local use only. `DECOMP_PROVIDER_MODE=mock` is a fixture mode, not general-purpose free AI decomposition.
+
+### Common commands
+
+| Command (from repository root) | Purpose |
+| --- | --- |
+| **`npm run dev`** | **Start the local frontend and API.** |
+| `npm run build` | Build shared code, client and server. |
+| `npm start` | Serve the compiled app and API on port 3001; build first. |
+| `npm run typecheck` | Check all workspaces and browser test types. |
+| `npm run lint` | Run ESLint with zero warnings allowed. |
+| `npm test` | Run the Vitest suite. |
+| `npx playwright install chromium` | Install the browser needed for Playwright tests. |
+| `npm run test:e2e` | Run the main browser suite. |
+| `npm run test:e2e:offline` | Run the isolated image-template browser suite with fake providers. |
+| `npm run dev:decomposition` | Start the optional legacy flow; POSIX-style environment syntax. |
+| `npm run decomp:setup` | Set up legacy storage and operator credentials. |
+| `npm run decomp:verify` | Run focused legacy pipeline tests. |
+| `npm run test:e2e:decomposition` | Run the dedicated legacy decomposition browser suite. |
+| `npm run decomp:backup -- /absolute/path/to/backup` | Back up legacy data; stop its API and worker first. |
+
+Some specialist tests use private reference images/manifests that are not included in a normal clone; consult their fixture requirements. Do not copy credentials or private customer assets just to run those tests.
+
+### Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| `node` or `npm` is not recognized | Install Node, reopen the terminal, and check the versions. With nvm, select Node 22 before installing dependencies. |
+| `npm ci` fails on a native module | Check your Node version and platform. `sharp` and `better-sqlite3` use native binaries; if npm falls back to compilation, install the platform's C/C++ build tools and Python, then rerun `npm ci`. |
+| Windows blocks `npm.ps1` | Use `npm.cmd` in PowerShell, or run the commands in Command Prompt/Git Bash. |
+| Port 5173 or 3001 is already in use | Stop the other process or your previous dev session. Do not start a second copy on the same ports. Vite uses strict port 5173. |
+| Frontend loads but `/api` requests fail | Ensure both dev processes are running. Changing server `PORT` also requires updating Vite's API target; keep the defaults for first setup. |
+| Port 3001 shows no editor during development | Open port **5173**. To use port 3001 for the UI, run `npm run build` followed by `npm start`. |
+| Core AI says it is not configured | Match `AI_PROVIDER` to its credentials in `server/.env`, then restart. Core `/api/health` does not check OpenAI/fal configuration. |
+| Experiment launcher opens but its API returns 404 | Set exactly `LAYERIZE_EXPERIMENT=1`, then restart the API. |
+| Planner/image request fails with 429 or a connection error | Read the failure reason. Credit exhaustion, rate limiting and transport errors are different. Check the relevant account; do not repeatedly submit paid attempts. |
+| Image to layers button is missing | Enable `VITE_LEGACY_IMAGE_TO_LAYERS=1` in the client env and restart Vite/rebuild. |
+| Legacy job remains queued | Start the worker with the same `DECOMP_DATA_DIR` as the API. |
+| A request is denied by origin checks | Set `CLIENT_ORIGIN` to the browser's exact origin, without an API path. |
+| Another browser or fresh clone has no saved designs | Browser-local designs and ignored server artifacts are not included in a Git clone. See [Local Persistence and History](#local-persistence-and-history). |
+
+
+## Overview
+
+FrameFlow began as a Canva-style editor for the FreshFolks assessment. The current code includes the original artwork/text editor, a local reusable-template studio, an OpenAI + Seedream experiment with Templates A/B/C, and an optional legacy Image to layers workflow. Choose a canvas, compose text, generate artwork, or import separated layers, then export the active design as a PNG.
+
+This README describes the repository code. The linked deployment and historical verification notes below do not establish that every newer feature is enabled on the live site.
+
+For the core AI Generate and Adapt tools, the central decision is simple: **AI owns the artwork; FrameFlow owns the words.** Names, dates, venues, and headings remain editable text layers. Auto Layout measures and fits those layers locally, while reference-based AI adaptation recomposes the artwork around them.
+
+## Key Features
+
+| Feature | What it does |
+| --- | --- |
+| Canvas sizing | Poster **1080×1350**, Square **1080×1080**, Landscape **1600×900**, Story **1080×1920**, and validated custom sizes |
+| Text editing | Add headings, subheadings, or body text; drag, resize width, edit typography, duplicate, and delete |
+| Frame-aware placement | Logical coordinates independent of zoom; overflow feedback and recoverable out-of-frame elements |
+| Auto Layout | Measure, wrap, reposition, and reduce text size only when necessary, without changing the wording |
+| AI generation | Describe artwork direction, add optional exact event wording, and review before applying |
+| AI adaptation | Recompose source artwork for another format and deterministically lay out copies of the exact text |
+| Variants | Keep the original and adapted design, compare them, and switch between editable versions |
+| Local recovery and history | Save the project and artwork in the browser; undo/redo meaningful edits |
+| PNG export | Download the active design at its exact logical dimensions, without editor controls |
+| Editable design title | Rename inline, cancel drafts, undo/redo renames, and restore the name after refresh |
+| Reusable templates | Author text, image slots, shapes, and backgrounds; save versions and create content-filled creatives locally |
+| Offer Templates | Review a master, generate preserved-layout product variations, approve selected-variation decomposition, then edit/save/reopen/export |
+| Layer editing | Inspect imported layers; move, resize, rotate, change opacity, hide, lock, and reorder |
+| Template A/B/C experiments | Generate source creatives in several ratios, plan decomposition with OpenAI, and separate images through Seedream on fal.ai |
+| Image to layers (optional) | Upload, review, refine, and import detected layers through a server/worker pipeline; hidden by default |
+
+Custom canvases accept integer sides from **256–4096 px**, with a maximum area of **12 million pixels**. Side handles reflow text without stretching glyphs; the font-size control changes glyph size. Inter and Lora are bundled locally with their [font licenses](client/public/licenses/).
+
+## How to Use the Features
+
+### 1. Create and edit a design
+
+1. Open **Design** and choose Poster, Square, Landscape, Story, or a custom size. Set the canvas background as needed.
+2. Open **Text**, then add a heading, subheading, or body text. Select it on the canvas or in the list.
+3. Use **Properties** to change wording, font, size, colour, alignment, and position. Drag to move; side handles change text-box width and reflow the words.
+4. Select an overflowing text box and click **Auto Layout** to fit that box within the canvas. Review the result; it does not resolve collisions with other elements.
+5. Rename the design in the top bar. Use Undo/Redo for document changes, and **Export PNG** to download the active version at its canvas dimensions.
+6. Wait for **Saved on this device** before closing. **New design** asks before resetting the current editor project.
+
+### 2. Generate artwork and adapt its format
+
+Requires the core AI provider setup in [Running Locally](#run-frameflow-on-your-computer).
+
+1. Open **AI → Generate**. Describe the visual style, such as “ivory florals, gold borders, quiet space for a wedding heading”.
+2. Expand **Exact event wording** and enter the title, date, venue, and other supported copy. These fields become editable text rather than instructions to draw lettering.
+3. Click **Generate design**, review the composition, then **Use this design**. Applying replaces the active version's artwork and text; Undo restores it.
+4. With artwork in the design, choose **Adapt format**, select a target such as Landscape, and click **Adapt artwork**. Reference adaptation requires Cloudflare.
+5. Compare Source and Target, then click **Use this version**. The source remains available in the version selector; the target's text can be edited independently.
+
+### 3. Create a reusable template (no AI required)
+
+1. Click **Create Own Template** at the bottom right. Give the template a name and choose its supported aspect ratios.
+2. Add text, image slots, shapes, and a background. Position and resize them, set their styles and order, and upload slot images where needed.
+3. For each element, choose which properties a creative may edit—for example wording, image, or colour. Leave position and size locked when every creative should keep the layout.
+4. Preview the supported ratios, then click **Save Template**. Ratios use the same normalized layout; they do not automatically rearrange the design.
+5. In **Existing templates**, click **Use Template**. Name the creative, choose its ratio, and fill in the permitted content. Click **Save Creative** to keep it in the local library.
+6. Click **Open in editor** to add an independent design version, then **Export PNG** in the main editor. Main-editor changes do not save back to the template or creative.
+
+Use **Edit Template** to change a saved structure. Saving creates a new version; existing creatives retain their earlier version until explicitly updated. **Duplicate** creates a separate template. This studio saves in the current browser, requires no provider keys, and has no template-editor Undo or direct PNG export.
+
+### 4. Separate an image with OpenAI + Seedream
+
+Enable the [layerize experiment](#openai--seedream-experiment-setup) first. The **OpenAI + Seedream test** launcher is visible even when its backend routes are disabled.
+
+| Recipe | Suitable source image |
+| --- | --- |
+| Template A | A framed portrait of one person or animal, optionally holding an object |
+| Template B | A dominant product, food item, furniture item, or other non-human hero with optional supports and props |
+| Template C | A designed human-centric campaign with people, repeated panels, product showcases, or promotional modules |
+
+1. Click **OpenAI + Seedream test** and select the matching **Template**.
+2. Choose a PNG, JPEG, or WebP. For A, choose whether to **Separate held object from subject**; for B/C, use the recipe's own grouping options.
+3. Leave **Target layers** empty for the natural result, or enter a permitted count. The count includes the base image; reducing it merges layers rather than discovering more objects.
+4. Run **Generate new prompt (OpenAI)** where shown. OpenAI plans the layers and fal.ai Seedream performs the separation. B/C use image-specific prompts; A can save and reuse a representative prompt.
+5. Inspect the run's source, plan, outputs, and warnings. When done, click **Open in editor** and edit the imported layers through **Properties** and **Layers**.
+6. Use the saved-run selector to revisit results. Where available, **Resume from saved request** or **Re-render from saved results** reuses existing provider work; a button marked as a paid retry submits a new request.
+
+Separated lettering can remain raster artwork. Do not assume every image's words become editable text or that hidden content is reconstructed exactly. This experimental flow is separate from the core Generate tool's exact-text guarantee.
+
+### 5. Generate test images for Templates A/B/C
+
+1. In **OpenAI + Seedream test**, choose **Create Template A**, **Create Template B**, or **Create Template C**.
+2. Fill that recipe's creative fields, review the shared prompt, and select the ratios to generate: **1:1**, **16:9**, and/or **4:5**.
+3. Start generation and inspect each ratio card. Each generated variant is a provider operation; failed variants can be generated again individually.
+4. Set the decomposition options on a completed card, then click **Decompose … image** to send it into the matching recipe.
+5. Review the resulting run and use **Open in editor** to continue editing.
+
+Template B normally generates the first selected ratio from text and uses that image as a reference for the remaining ratios. Set `TEMPLATE_RATIO_REFERENCE=off` to generate every B ratio independently. A/C generate each ratio independently. Consistency across generated images is best effort. These AI recipes are separate from the reusable templates created in **Create Own Template**.
+
+### 6. Use the optional Image to layers workflow
+
+Enable both its backend and frontend entry points using the [legacy setup](#optional-legacy-image-to-layers-setup).
+
+1. Click **Image to layers**, or open **AI → Decompose**. Sign in with the operator password if prompted.
+2. Choose, drop, or paste an image, or use the current design's artwork. Optionally list things to separate, then click **Separate layers**.
+3. Follow the review/refinement steps shown for the job. Inspect proposed layers and adjust masks or edges where requested.
+4. At the ready screen, choose **Open on blank canvas** for the separated layers alone, or **Keep original background** to place them over the original image. In the latter mode, moving a layer can reveal the original pixels below it.
+5. Use **Detected layers** in the editor to add deferred detections. Where offered, **Make text editable** converts a detected text layer for wording changes; check its appearance afterward.
+
+Recent designs lets you reopen jobs. The API and separate worker must remain running for background processing.
+
+### 7. Reuse a product/offer master template
+
+Enable the [OpenAI + Seedream setup](#openai--seedream-experiment-setup), then open **OpenAI + Seedream test → Offer Templates**.
+
+1. Upload your own creative, review the detected objects/text/logos, and choose what to decompose. Inspect the background and independent layers before saving a master.
+2. Use the saved master → **Generate with AI** → choose three preserved-layout product variations. Review the number of image requests and approve the generation estimate.
+3. Inspect the results for suitable products, proportions and clean backgrounds. The fixed character, brand assets and editable overlays should retain the approved design identity.
+4. Select one passing variation → **Decompose & Edit** → review the selection → separately approve the OpenAI planner and Seedream operation.
+5. Inspect the separated layers → open in the editor → edit text and move/resize/hide products → save, reopen and export.
+
+A known defective master background blocks paid product generation. Failed/partial jobs retain saved images and expose explicit recovery; generation approval does not approve decomposition. Provider credit, account access and visual quality still need verification on your own inputs. See [product progress](docs/PRODUCT_FEATURE_PROGRESS.md) and the [recovery/background verification report](docs/LIVE_PRODUCT_GENERATION_FIX.md) for implementation status and limitations. Private LG reference assets and saved jobs from development are not shipped as a ready-to-use template library.
+
+## FreshFolks Requirement Mapping
+
+| Assessment requirement | FrameFlow implementation | Status |
+| --- | --- | --- |
+| Select poster, banner, or custom dimensions | Four presets plus validated custom width/height | Implemented; browser verified |
+| Add, move, and resize text | Text panel, canvas dragging, width handles, and numeric/typography controls | Implemented; browser verified |
+| Place elements within a frame | Frame clipping, logical coordinates, overflow warnings, and recovery through the element list | Implemented; browser verified |
+| Auto Layout for overflowing text | Renderer-based fitting with safe margins and readable font limits | Implemented; unit and browser verified |
+| Generate themed artwork | Backend integration with Cloudflare Workers AI | Implemented; real generation verified |
+| Adapt to another aspect ratio | Source-image reference plus a new target composition | Implemented; real portrait-to-landscape adaptation verified |
+| Preserve visual theme | Reference-conditioned palette, motifs, and mood | Visually verified; best-effort generative preservation |
+| Preserve exact editable content | App-controlled TextElements copied and reflowed separately from artwork | Exact strings and editability verified |
+| Share a live application | Single Render service serving the editor and API | Deployed; hosted browser regression verified |
+| Provide source and approach | This repository, architecture diagrams, and engineering notes | Available |
+
+The original artwork integration uses Cloudflare, with Gemini as an explicitly selected alternate generation adapter. The separate layerize experiment uses OpenAI and fal.ai; the legacy decomposition pipeline uses fal.ai.
+
+## Quick Reviewer Demo
+
+Allow roughly 1–2 minutes of interaction, plus provider generation time. AI latency and account allocation vary.
+
+1. Open the **[live app](https://frameflow-h7fa.onrender.com/)** and choose **Poster** in Design.
+2. Click **Add heading**. In the inspector, replace its content with “The Grand Royal Wedding Palace, Connaught Place, New Delhi, India”. Set **X to 950** and **Y to 1250** to demonstrate overflow.
+3. Click **Auto Layout**. Observe the fitted text, then try Undo and Redo.
+4. Open **AI → Generate**. Use an artwork direction such as “Ivory florals, warm gold ornamentation, soft romantic lighting”. In the expanded **Exact event wording** section, enter a title, date, and venue; these become the generated design's editable text.
+5. Click **Generate design**, inspect the preview, then **Use this design**. Applying generation replaces the active design's artwork and text with the preview; Undo restores the prior design.
+6. Choose **Adapt format → Landscape → Adapt artwork**. Compare Source and Target, then select **Use this version**.
+7. Switch versions, return to editing if comparison is open, and change the target venue to confirm it remains editable.
+8. Rename the design in the top bar. Click **Export PNG**, wait for **Saved on this device**, and refresh to check recovery. Both variants return; the first variant opens by default.
+
+```mermaid
+flowchart TD
+    A[Choose canvas] --> B[Edit text and create overflow]
+    B --> C[Auto Layout]
+    C --> D[Generate artwork]
+    D --> E[Review and apply]
+    E --> F[Adapt format]
+    F --> G[Compare Source and Target]
+    G --> H[Apply and switch variants]
+    H --> I[Edit target and export PNG]
+```
+
+## Architecture
+
+The repository uses three npm workspaces:
+
+- **Client:** React controls, Redux document/history, and Konva rendering. Canvas positions are stored in logical pixels; zoom changes only the view.
+- **Server:** Express validates requests and keeps credentials server-side. Core artwork adapters call Cloudflare or Gemini. The layerize experiment coordinates OpenAI and fal.ai; the legacy decomposition API queues SQLite-backed work for a separate worker.
+- **Shared:** TypeScript document/API contracts, handwritten runtime validators, generation profiles, and pure reusable-template geometry/versioning functions.
+
+```mermaid
+flowchart TD
+    Browser[Browser] -->|Load editor| UI
+    Browser -->|API requests| API
+    subgraph Render[Render Web Service]
+        UI[Built React and Vite frontend]
+        API[Express API]
+        Adapter[AI provider adapters]
+        API --> Adapter
+    end
+    Adapter --> CF[Cloudflare Workers AI - active]
+    Adapter -.-> Gemini[Gemini - alternate generation]
+    Browser --> LS[localStorage - project JSON]
+    Browser --> IDB[IndexedDB - artwork Blobs]
+```
+
+The frontend executes in the browser; Render serves its built assets and the API from one origin. Main-editor projects and reusable templates remain browser-local. The optional legacy decomposition service uses SQLite and filesystem artifacts under `DECOMP_DATA_DIR`. The layerize experiment, the offer and product templates and Template Studio store their files under `artifacts/`: in the repository during development, or in `FRAMEFLOW_DATA_DIR` (a persistent disk) on a deployed server.
+
+Redux stores serializable documents, asset IDs, UI metadata, and bounded history snapshots. Image Blobs, decoded images, canvas/DOM nodes, object URLs, and request controllers stay outside Redux. This keeps saving and undo/redo predictable without duplicating image data in every snapshot.
+
+## Why Core Artwork and Text Are Separate
+
+Image models can create visual compositions, but exact event copy needs a stronger guarantee than generated lettering. FrameFlow asks the model for decorative artwork and renders **names, dates, venues, headings, and supporting wording** itself as TextElements.
+
+The server repeats an authoritative artwork-only rule around the visual brief and explicitly excludes source lettering during adaptation. This discourages baked-in copy even when a visual brief requests a name or logo; model compliance is still best effort.
+
+Optional event-content fields stay in the client. During adaptation, every text string—including spaces and explicit newlines—is copied exactly. Font family, weight, and color are retained; geometry and font size can change to fit the target. The model receives the artwork reference and visual instructions, not the editable text elements.
+
+This separation makes a landscape version independently editable and lets the application verify content preservation. Decorative similarity remains a visual judgment; text equality is a deterministic invariant. Preview still matters because generated artwork may contain unwanted lettering or detail in an intended text area.
+
+## Auto Layout
+
+Auto Layout fits the selected text box into a safe region using the same font and Konva measurement rules as the editor:
+
+1. Measure the current text and return unchanged if it already fits.
+2. Try a bounded preferred width, then the full available width, at the original font size.
+3. Reposition the candidate only as far as needed to bring it inside the region.
+4. If necessary, use a bounded search for the largest fitting font above the readable floor.
+5. Re-measure before applying. If fitting safely is impossible, retain the original element and show an unresolved warning.
+
+The operation preserves the exact text, uses real renderer measurements rather than character-count estimates, and makes one undoable change. It is **idempotent**: fitting an already-fitted element again makes no change. No AI request is involved. Single-box fitting does not solve collisions between unrelated elements.
+
+[Auto Layout implementation and limits](docs/AUTO_LAYOUT.md)
+
+## AI Artwork Generation
+
+The active provider is **Cloudflare Workers AI**, using **`@cf/black-forest-labs/flux-2-klein-4b`**. The frontend uses a provider-independent request/response contract; credentials and provider payloads belong to the backend.
+
+```mermaid
+flowchart TD
+    Brief[Visual brief and target size] --> API[POST /api/ai/generate]
+    API --> Validate[Validate and compose artwork prompt]
+    Validate --> Adapter[Provider adapter]
+    Adapter --> CF[Cloudflare Workers AI]
+    CF --> Image[Validate returned artwork]
+    Image --> Store[Browser decode and IndexedDB storage]
+    Store --> Preview[Composed preview]
+    Text[Exact event wording - app controlled] --> Preview
+    Preview --> Apply[User selects Use this design]
+    Apply --> Document[Document stores asset ID and text layers]
+```
+
+Artwork must decode and finish its IndexedDB write before the preview becomes ready. The existing document remains unchanged until Apply. Regenerate, Discard, and Cancel are explicit actions; failures do not clear the current design. Applying a preview is one history operation.
+
+Gemini remains an explicitly selected alternate generation provider. Its configured image model had **zero daily Free Tier image quota for this project** during recorded verification. There is no automatic fallback, and Gemini reference adaptation is unavailable.
+
+[AI generation contracts, provider mapping, and evidence](docs/AI_GENERATION.md)
+
+## AI Format Adaptation
+
+Adaptation uses the current artwork as a real visual reference rather than generating solely from a repeated prompt. The browser prepares a proportional PNG thumbnail with a maximum side of **511 px** and a maximum size of **2 MiB**, leaving the original Blob unchanged. The backend validates it and sends its bytes to Cloudflare as multipart **`input_image_0`**.
+
+```mermaid
+flowchart TD
+    Source[Source variant] --> Artwork[Source artwork]
+    Source --> Text[Source TextElements]
+    subgraph ArtworkBranch[Artwork recomposition]
+        Artwork --> Reference[Bounded reference PNG]
+        Reference --> API[POST /api/ai/adapt]
+        API --> Input[Cloudflare input_image_0]
+        Input --> Recompose[Reference-based recomposition]
+        Recompose --> TargetArt[Target artwork stored in IndexedDB]
+    end
+    subgraph TextBranch[Exact editable content]
+        Text --> Layout[Deterministic target layout]
+        Layout --> Fit[Auto Layout]
+        Fit --> TargetText[Target TextElements - same strings]
+    end
+    TargetArt --> Preview[Source and Target preview]
+    TargetText --> Preview
+    Preview --> Apply[User selects Use this version]
+    Apply --> Target[New target variant]
+    Source --> Preserved[Source variant preserved]
+```
+
+Portrait-to-landscape adaptation asks for a related composition with decoration toward the left and readable text space on the right. App-controlled semantic regions and Auto Layout place the exact text in the target frame. Other presets have their own arrangements; custom layouts use normalized source positions and may need manual adjustment.
+
+Visual identity is **best-effort generative preservation**, not pixel-identical reproduction. Both previews retain their natural aspect ratios. Source edits, history traversal, version switching, cancellation, and newer requests invalidate obsolete work so a late result cannot silently overwrite the current design.
+
+[AI adaptation design and real verification](docs/AI_ADAPTATION.md)
+
+## Variants
+
+An original Poster and an adapted Landscape remain separate versions of one project. **Use this version** appends and selects the target; it does not overwrite the source. The version selector identifies each format and its Original/Adapted relationship, while **Compare versions** shows both compositions.
+
+Applying adaptation is one undo step. Undo removes that application; Redo restores the saved snapshot without another provider request. Both variants and their artwork survive refresh. Switching versions is UI state, so it does not create a document-history entry.
+
+## Local Persistence and History
+
+```mermaid
+flowchart TD
+    Actions[Meaningful editor actions] --> History[Bounded undo and redo snapshots]
+    History --> Document[Redux project document]
+    Document --> Save[Debounced save to localStorage]
+    Blob[AI artwork Blob] --> IDB[IndexedDB]
+    IDB -->|Asset ID only| Document
+    History --> Redo[Redo AI Apply from snapshot]
+    Redo --> NoRequest[No provider request]
+```
+
+The project JSON—including its title, text, variants, and asset IDs—is saved to `localStorage`. Artwork Blobs live in IndexedDB. Normal saving is debounced by 500 ms; the top bar reports success only after the write succeeds. Wait for **Saved on this device** before closing.
+
+History retains up to **30 meaningful document operations**. Typing and numeric editing sessions are grouped; drag, width resize, Auto Layout, rename, and AI Apply have clear commit boundaries. Selection, tabs, and zoom do not fill history. Use the top-bar buttons or Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z outside typing controls.
+
+**New design** in the left panel footer requires confirmation before clearing the current device-local project and its referenced artwork. It saves a fresh default document, clears Undo/Redo and AI previews, and leaves unrelated storage and application configuration alone.
+
+Refresh restores the document and artwork, opens the first variant, and starts with empty history. This is **browser-local persistence**, not cloud sync or a backup. Invalid saved documents produce a recovery warning; missing artwork leaves usable text available.
+
+[Persistence, history, and asset lifecycle](docs/PERSISTENCE_AND_HISTORY.md)
+
+## Exact-size PNG Export
+
+**Export PNG** captures the active applied variant at its logical canvas size, independent of viewport zoom and device pixel ratio. It waits for fonts and artwork, then renders the background and text through the same drawing helpers as the editor. Selection handles, comparison frames, and editor chrome are excluded.
+
+Export does not change the document or make an AI/server request. Unapplied previews are not exported. Filenames depend on format and dimensions, never on the user-entered title:
+
+- `frameflow-poster-1080x1350.png`
+- `frameflow-landscape-1600x900.png`
+- `frameflow-custom-1000x1000.png`
+
+Artwork uses proportional fitting and clipping without stretching. Existing overlaps remain as edited, and content outside the frame is clipped. Export does not silently run Auto Layout.
+
+## Editable Design Title
+
+Click or focus the top-bar **Design name** to edit inline. Enter or blur commits a trimmed name; empty input becomes **New design**. Escape cancels, and committing the same name creates no history entry. Renames support Undo/Redo and refresh recovery through the existing document field. Long names truncate visually while the input stays compact.
+
+## Tech Stack
+
+| Area | Technology |
+| --- | --- |
+| Frontend | React, TypeScript, Vite |
+| State and canvas | Redux Toolkit, Konva, react-konva |
+| Styling | Tailwind CSS, custom editor styles, Lucide icons |
+| Backend | Node.js, Express, TypeScript |
+| Contracts and validation | Shared TypeScript types and handwritten runtime validators |
+| Active AI | Cloudflare Workers AI — FLUX.2 Klein 4B |
+| Alternate AI | Gemini generation adapter through `@google/genai` |
+| Storage | localStorage for document JSON; IndexedDB for artwork |
+| Testing | Vitest and Playwright |
+| Deployment | Single Render Web Service |
+
+## Project Structure
+
+```text
+client/
+  src/
+    features/       Editor, canvas, text, AI, variants, and PNG export
+    store/          Document/UI state, actions, and history
+    lib/
+      layout/       Deterministic fitting and renderer measurement
+      assets/       IndexedDB, image decoding, and reference preparation
+      persistence/  Saved-document validation, recovery, and saving
+  public/licenses/  Bundled font licenses
+server/
+  src/
+    app.ts          API routes, configuration, validation, and request limits
+    index.ts        Server startup and built-client static serving
+    providers/      Cloudflare and Gemini adapters
+    services/       AI orchestration and image validation
+    decomposition/  Legacy queue/worker, SQLite, providers, layerize recipes and generators
+shared/src/         Document/API types, limits, template generation and runtime contracts
+  designTemplates/  Local template schema, normalized geometry, versions and creatives
+artifacts/          Generated experiment runs and images (local runtime output)
+tests/e2e/          Browser regression flows at both desktop sizes
+docs/               Engineering notes and controlled live evidence
+```
+
+## API Endpoints
+
+| Endpoint | Responsibility |
+| --- | --- |
+| `GET /api/health` | Service status, selected provider, and credential-presence flags; does not call the provider or prove remaining quota |
+| `POST /api/ai/generate` | Validate a visual brief, target size, style, and text-space region; return normalized artwork metadata and image data |
+| `POST /api/ai/adapt` | Validate a bounded source reference and target intent; return recomposed artwork for the new variant |
+| `/api/decomposition/*` | Legacy capabilities, operator session, uploads, jobs, reviews, and artifacts; requires decomposition configuration and a worker |
+| `/api/layerize-experiment/*` | Template recipes, runs, generated-image groups, resume/retry, and output downloads; mounted only with `LAYERIZE_EXPERIMENT=1` |
+
+Core AI responses include a request ID; errors use safe codes and messages. The main editor's project document is browser-local, while decomposition jobs and experiment artifacts are stored server-side.
+
+## Production Deployment
+
+**[FrameFlow on Render](https://frameflow-h7fa.onrender.com/)** uses a **single Render Web Service**. Express serves the built Vite frontend and `/api` from the same origin.
+
+```mermaid
+flowchart TD
+    Browser[Browser] --> Render[Render Web Service]
+    Render --> Frontend[Built Vite frontend]
+    Render --> API[Express /api]
+    API --> AI[OpenAI and fal]
+    API --> Disk[Persistent disk: FRAMEFLOW_DATA_DIR]
+```
+
+The repository's commands support this layout from the repository root. **[docs/DEPLOY_RENDER.md](docs/DEPLOY_RENDER.md)** has the exact dashboard settings, the persistent disk, every environment variable and the one-time data migration.
+
+| Setting | Value |
+| --- | --- |
+| Build command | `npm ci && npm run build` |
+| Start command | `npm start` |
+| Health path | `/api/health` |
+| Listen address | `0.0.0.0`, using Render's `PORT` |
+| Frontend API base | Relative `/api` |
+| Node version | 22 (`.nvmrc`) |
+| Instance type | Free: no persistent disk, so saved files are temporary |
+| Access | Open: no sign-in, so anyone with the address can use it |
+
+The current same-origin setup does **not** require `VITE_API_BASE_URL`; leave it unset so the built client uses `/api`. Configure provider credentials in Render's server environment, not in a frontend bundle:
+
+```dotenv
+NODE_ENV=production
+LAYERIZE_EXPERIMENT=1
+TRUST_PROXY_HOPS=1
+OPENAI_API_KEY=<secret>
+FAL_KEY=<secret>
+# Optional, only for the editor's older "generate artwork" feature:
+# AI_PROVIDER=cloudflare, CLOUDFLARE_ACCOUNT_ID=<secret>, CLOUDFLARE_API_TOKEN=<secret>
+```
+
+`CLIENT_ORIGIN` is the **allowed browser/frontend origin**. Here it equals the Render origin because the frontend and API share that origin. Without it, the server uses the address Render gives the service (`RENDER_EXTERNAL_URL`), so leave it unset unless you use a custom domain. `TRUST_PROXY_HOPS=1` accounts for the Render proxy; direct local access uses `0`. Let Render supply its listening port.
+
+For the legacy pipeline in production, use a persistent `DECOMP_DATA_DIR`, `DECOMP_AUTH_MODE=local-operator`, configured operator credentials, and a separate built worker (`npm run worker -w @frameflow/server`) sharing that storage. Production rejects development authentication and mock mode. A default single web-service deployment does not start this worker.
+
+The layerize experiment has **no user accounts and no sign-in**, and its origin checks are not authentication: anyone who opens the address can use every feature, including paid AI work charged to the server's OpenAI and fal keys. Leave those keys unset when the service needn't run paid work, and keep spending limits on the provider accounts. On Render Free there is no persistent disk: templates, uploads, creatives and runs are temporary and are lost on every restart, redeploy or spin-down. With a paid disk, set `FRAMEFLOW_DATA_DIR=/var/data/frameflow`.
+
+## Verification and Testing
+
+Run the commands above against the current checkout. This documentation update is based on source inspection; it does not claim a new full test run or new live-provider verification.
+
+The following historical core-editor verification was recorded on **22 September 2026** for the **New design/reset implementation**, produced:
+
+| Check | Verified result |
+| --- | --- |
+| Full Unit/API suite | **342 passed across 27 files** |
+| Development browser suite | **134 passed** |
+| Built production browser suite | **134 passed** |
+| Typecheck | Passed |
+| Lint | Passed |
+| Build | Passed |
+| Focused design-title checks | **3 store + 8 browser tests passed**; also included in full suites |
+
+Browser suites and visual review cover **1366×768** and **1440×900**. Coverage includes canvas sizing, real text rendering and pointer interactions, Auto Layout, save/recovery, history, mocked generation/adaptation, stale results, variants, exact PNG output, title editing, and confirmed project reset with pending-save/late-AI protection.
+
+To run browser verification:
+
+```sh
+npx playwright install chromium
+npm run test:e2e
+npm run build
+PLAYWRIGHT_PRODUCTION=1 npm run test:e2e
+```
+
+Use `PLAYWRIGHT_CHANNEL=chrome` with either test command when using installed Chrome instead of bundled Chromium. Stop an independently running development backend before production verification so the suite starts the built Express server. Screenshots and traces are ignored test artifacts.
+
+**Automated provider operations are mocked.** The built production count is against the locally built app. The preceding AI release (`02c8850`) also passed a separate full run of **124 tests** against the deployed Render service, with every AI provider call mocked. The hosted page and `/api/health` returned HTTP 200; health reported `provider=cloudflare`, `aiConfigured=true`, and `aiAvailable=true`. Final screenshot review covered both desktop sizes, including long document titles, inspector/Auto Layout, AI forms, loading/error states, composed comparison and version switching.
+
+## Historical Real AI Verification
+
+The final release check exercised the deployed Render UI and Cloudflare
+`@cf/black-forest-labs/flux-2-klein-4b` with **FitnessHUB Opening**:
+
+| Operation | Observed result |
+| --- | --- |
+| Generation | **HTTP 200**, **JPEG 816×1024**, for a **1080×1350** logical poster |
+| Adaptation input | Actual source artwork thumbnail: **PNG 407×511**, **255,351 bytes**; the tested server adapter sends binary `input_image_0` |
+| Adaptation output | **HTTP 200**, **JPEG 1024×576**, for a **1600×900** logical landscape |
+| Exact editable text | **Grand Opening** and **FitnessHUB** preserved in source and target TextElements and composed comparison |
+| PNG export | Poster **1080×1350** and landscape **1600×900**, without editor controls |
+| Request discipline | **One live generation + one live adaptation; no provider retries** |
+
+Preview-before-Apply, source preservation and atomic Undo/Redo passed in the live
+flow. A browser-session closure interrupted the subsequent adaptation download
+check. Recovery verification replayed the already returned adaptation locally,
+with all live AI requests blocked, then passed Apply/history, inspector editing,
+source/target switching, refresh, a fresh browser restart and landscape export. The original artwork's
+SHA-256 remained unchanged. This recovery did not regenerate artwork.
+
+Visual review found black/gold geometric identity preserved in a recomposed
+landscape with more open space on the right, rather than stretched source pixels.
+Neither raw image contained readable lettering. Decoration still crosses part of
+the default title position in both results; manual repositioning can improve
+contrast. The no-text/quiet-space prompt is best effort, while exact text preservation
+is controlled by FrameFlow.
+
+Provider artwork resolution is separate from the document's logical dimensions.
+FrameFlow records actual returned dimensions and fits/crops artwork proportionally
+without stretching; PNG export uses the exact logical canvas size. The
+[generation](docs/AI_GENERATION.md) and [adaptation](docs/AI_ADAPTATION.md) notes
+retain detailed earlier milestone checks.
+
+## Security
+
+- **Server-only credentials:** Provider keys stay in the server environment. Real `.env` files are ignored; examples contain placeholders.
+- **Explicit API origins:** CORS uses an exact allowlist of local development origins plus `CLIENT_ORIGIN`, without wildcard credential access. CORS is not user authentication.
+- **Runtime validation:** Shared handwritten validators check API inputs; saved documents are validated on recovery. Request sizes, dimensions, style fields, and image metadata are bounded.
+- **Image checks:** The backend checks image signatures, decoded byte sizes, and dimensions; the browser fully decodes artwork before storage/preview. Generation JSON is limited to 24 KiB and adaptation JSON to 3 MiB.
+- **Bounded core provider work:** Core artwork generation and adaptation share three requests per IP per minute and a maximum of two active requests per server process, with timeout/abort handling.
+- **Safe failures:** Normalized errors and request IDs avoid exposing provider payloads or credentials. Logs omit full prompts and image bytes. No automatic provider retry loop consumes quota after ambiguous failures.
+- **Stale-result protection:** Cancelled, superseded, or obsolete responses cannot silently replace current work.
+
+## Trade-offs and Limitations
+
+- **Generative continuity:** Palette, motifs, and mood are preserved best-effort. Inspect previews for unwanted lettering or decoration near text; custom layouts can need manual adjustment.
+- **Provider allocation:** Cloudflare quota and availability are bounded. Rate limiting is per process, not a distributed budget system. Cancelling does not guarantee remote processing or charging stops.
+- **Local storage:** One project per browser origin, without accounts, cloud backup, or cross-device sync. Clearing/evicting storage removes recovery data; history and selected-version preference do not persist. Multiple tabs use the last successful save.
+- **Layout scope:** Up to 30 variants and 50 text elements per variant, with 5,000 characters per element. Single-element Auto Layout is not a general collision-solving design engine.
+- **Experimental decomposition:** Generated layers and reconstructed backgrounds need visual review. Source lettering may remain rasterized; generation and decomposition use provider calls independent of the core artwork tools.
+- **Reusable-template scope:** One normalized layout across ratios, without per-ratio rearrangement, cross-browser sharing, or template-editor Undo. Export through the main editor.
+- **Desktop-first editing:** Both supported desktop sizes are verified. Narrow screens show a desktop-editing notice rather than a full mobile editor.
+- **Rendering and export:** Provider dimensions can differ from logical dimensions, so proportional cover may crop. Large PNGs depend on browser memory; downloads can also be limited by browser or disk policies. Emoji and scripts outside the bundled Latin fonts use platform fallbacks.
+
+## Documentation
+
+- [AI generation](docs/AI_GENERATION.md) — provider contracts, asset flow, and real generation evidence
+- [AI adaptation](docs/AI_ADAPTATION.md) — source reference processing, exact text, variants, and live comparison
+- [Auto Layout](docs/AUTO_LAYOUT.md) — measurement, fitting policy, and invariants
+- [Persistence and history](docs/PERSISTENCE_AND_HISTORY.md) — recovery, snapshots, and IndexedDB lifecycle
+- [Template A/B/C generators](docs/TEMPLATE_GENERATION.md) — recipe-specific forms, ratio groups, and decomposition handoff
+- [Template A generation](docs/TEMPLATE_A_GENERATION.md) — focused generation design notes
+- [Decomposition progress](docs/DECOMPOSITION_PROGRESS.md) — legacy pipeline implementation history
+- [Reusable templates](docs/REUSABLE_TEMPLATES.md) — normalized layout, creatives, versions, and the element model shared with the editor
+
+Detailed notes preserve historical milestone decisions and deployment plans. This README describes current source behavior and the base single-service deployment; historical test counts and live-provider evidence apply only to their recorded milestones.
+
+## Live Demo / Repository
+
+**[Open FrameFlow](https://frameflow-h7fa.onrender.com/)** · **[Browse the source](https://github.com/rohitpokhariya10/frameflow)**

@@ -1,0 +1,121 @@
+import { useLayoutEffect, useRef, useState } from 'react';
+import { Layer, Rect, Stage } from 'react-konva/lib/ReactKonvaCore';
+import 'konva/lib/shapes/Rect';
+import { Maximize, Minus, Plus, Sparkles, Type } from 'lucide-react';
+import { selectActiveVariant, useAppDispatch, useAppSelector } from '../../store';
+import { fitRequested, tabChanged, zoomChanged, variantSelected } from '../../store/uiSlice';
+import { calculateFitZoom, VIEWPORT } from './viewport';
+import { hasExplicitOrder, paintOrder } from '@frameflow/shared';
+import { StaticText, TextElementNode } from './TextElementNode';
+import { DesignLayerNode } from './DesignLayerNode';
+import { focusCanvas, useTextActions } from '../text/useTextActions';
+import { BackgroundArtwork } from './BackgroundArtwork';
+
+import { VariantComparison } from '../variants/VariantComparison';
+import { formatLabel, variantLabel } from '../variants/variantLabel';
+import { useDesigns } from '../editor/designs';
+
+const versionCount = (count: number) => `${count} version${count === 1 ? '' : 's'}`;
+
+export function CanvasWorkspace() {
+  const dispatch = useAppDispatch();
+  const variants = useAppSelector((state) => state.editor.document.variants);
+  const [compare, setCompare] = useState(false);
+  // The other designs on this device (a decomposed template result opens as one): read once per open design, since the
+  // editor is mounted again whenever another design opens.
+  const library = useDesigns(), documentId = useAppSelector((state) => state.editor.document.id), documentName = useAppSelector((state) => state.editor.document.name);
+  const [others] = useState(() => library?.designs() ?? []);
+  const [designError, setDesignError] = useState('');
+  const current = useAppSelector(selectActiveVariant);
+  const preview = useAppSelector((state) => state.ui.activeLeftTab === 'ai' ? state.ai.preview : null);
+  const relative = current.sourceVariantId ? variants.find((item) => item.id === current.sourceVariantId) : variants.find((item) => item.sourceVariantId === current.id);
+  const pair = preview?.adaptation ? { source: preview.adaptation.source, target: preview.variant }
+    : compare && !preview && relative ? current.sourceVariantId ? { source: relative, target: current } : { source: current, target: relative } : null;
+  const comparing = Boolean(pair);
+  const { canvas, elements, id, background, layers } = preview?.variant ?? current;
+  const [artworkError, setArtworkError] = useState('');
+  const interleaved = hasExplicitOrder(current);
+  const { zoom, fitRequest, selectedElementId } = useAppSelector((state) => state.ui);
+  const actions = useTextActions();
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const displayWidth = canvas.width * zoom;
+  const displayHeight = canvas.height * zoom;
+  const showEmptyState = !background && !layers?.length && !preview && elements.length === 0 && displayWidth >= 220 && displayHeight >= 230;
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const fit = () => dispatch(zoomChanged(calculateFitZoom(canvas, { width: viewport.clientWidth, height: viewport.clientHeight })));
+    fit();
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(fit);
+    });
+    observer.observe(viewport);
+    return () => { observer.disconnect(); cancelAnimationFrame(frame); };
+  }, [canvas, dispatch, fitRequest, comparing]);
+
+  return (
+    <main className="canvas-workspace" aria-label="Canvas workspace" id="canvas-interaction" tabIndex={0} data-selection-owner>
+      <div className="workspace-heading"><span>{preview ? preview.adaptation ? 'Adapted preview' : 'Generated preview' : formatLabel(canvas)}<span className="workspace-heading-separator">/</span><span className="muted">{preview ? 'Review, then apply' : layers?.length ? `${layers.length} layers` : elements.length ? `${elements.length} text ${elements.length === 1 ? 'element' : 'elements'}` : background ? 'Artwork' : 'Blank canvas'}</span></span><span className="workspace-unit">{canvas.width} × {canvas.height} px</span></div>
+      {(variants.length > 1 || others.length > 0) && <div className="variant-switcher">{others.length > 0 && <label>Design<select aria-label="Open design" value={documentId} onChange={(event) => {
+        try { library?.openDesign(event.target.value); } catch (error) { setDesignError(error instanceof Error ? error.message : 'That design could not be opened.'); }
+      }}><option value={documentId}>{documentName} · {versionCount(variants.length)}</option>{others.map((entry) => <option key={entry.id} value={entry.id}>{entry.name} · {versionCount(entry.versions)}</option>)}</select></label>}
+        {variants.length > 1 && <label>Version<select aria-label="Active version" value={current.id} onChange={(event) => { dispatch(variantSelected(event.target.value)); setCompare(false); }}>{variants.map((variant, index) => <option key={variant.id} value={variant.id}>{variantLabel(variant, index)}</option>)}</select></label>}{variants.length > 1 && relative && !preview && <button className="button" aria-pressed={compare} onClick={() => setCompare(!compare)}>{compare ? 'Back to editing' : 'Compare versions'}</button>}</div>}
+      {designError && <div className="artwork-error" role="alert">{designError}</div>}
+      {background && artworkError && <div className="artwork-error" role="alert">{artworkError}</div>}
+      {pair ? <VariantComparison source={pair.source} target={pair.target} /> : <div className="canvas-viewport" ref={viewportRef} data-testid="canvas-viewport" onMouseDown={(event) => { if (event.target === event.currentTarget) { actions.select(null); focusCanvas(); } }}>
+        <div className="canvas-scroll-content" onMouseDown={(event) => { if (event.target === event.currentTarget) { actions.select(null); focusCanvas(); } }}>
+          <div className={`canvas-frame ${canvas.transparent ? 'is-transparent-canvas' : ''}`} data-testid="canvas-frame" data-transparent={canvas.transparent ? 'true' : undefined} data-logical-width={canvas.width} data-logical-height={canvas.height}
+            style={{ width: displayWidth, height: displayHeight }}>
+            <div role="img" aria-label={`${canvas.width} by ${canvas.height} pixel canvas, ${elements.length} text elements. Use the Text panel to select and edit.`}>
+              <Stage width={displayWidth} height={displayHeight} scaleX={zoom} scaleY={zoom}
+                onMouseDown={(event) => { if (event.target === event.target.getStage()) { actions.select(null); focusCanvas(); } }}
+                onTouchStart={(event) => { if (event.target === event.target.getStage()) { actions.select(null); focusCanvas(); } }}>
+                <Layer listening={false} clipWidth={canvas.width} clipHeight={canvas.height}>{!canvas.transparent && <Rect width={canvas.width} height={canvas.height} fill={canvas.backgroundColor} />}
+                  {background && <BackgroundArtwork background={background} canvas={canvas} onError={setArtworkError} />}
+                </Layer>
+                {!preview && interleaved
+                  // Elements that carry a zIndex (a design opened from a template) are drawn in that one order, text and layers interleaved.
+                  ? <Layer clipWidth={canvas.width} clipHeight={canvas.height}>{paintOrder(current).map((item) => item.kind === 'layer'
+                    ? <DesignLayerNode key={item.layer.id} layer={item.layer} selected={selectedElementId === item.layer.id} variantId={id} raiseHandles />
+                    : <TextElementNode key={item.element.id} element={item.element} selected={selectedElementId === item.element.id} canvas={canvas} variantId={id} zoom={zoom} raiseHandles />)}</Layer>
+                  // Every other design: its layers, then all its text, exactly as before.
+                  : <>
+                    {!preview && layers?.length ? <Layer clipWidth={canvas.width} clipHeight={canvas.height}>{layers.map((layer) => <DesignLayerNode key={layer.id} layer={layer} selected={selectedElementId === layer.id} variantId={id} />)}</Layer> : null}
+                    <Layer>{elements.map((element) => preview
+                      ? <StaticText key={element.id} name="preview-text" element={element} />
+                      : <TextElementNode key={element.id} element={element} selected={selectedElementId === element.id} canvas={canvas} variantId={id} zoom={zoom} />)}</Layer>
+                  </>}
+              </Stage>
+            </div>
+            {showEmptyState && <div className={`canvas-empty ${displayWidth < 310 || displayHeight < 350 ? 'canvas-empty-compact' : ''}`}>
+              <span className="empty-art" aria-hidden="true"><span /><span /><Plus size={18} strokeWidth={1} /></span>
+              <span className="eyebrow">A FRESH START</span>
+              <h1>Something good<br />starts here.</h1>
+              <p>Add text or generate artwork to get started.</p>
+              <div className="empty-actions">
+                <button className="button empty-primary" onClick={() => actions.add('heading')}><Type size={15} />Add heading</button>
+                <span className="action-hint">Edit text, then try Auto Layout</span>
+                <button className="button empty-secondary" onClick={() => dispatch(tabChanged('ai'))}><Sparkles size={14} />Create with AI</button>
+                <span className="action-hint">Generate artwork → adapt → export</span>
+              </div>
+            </div>}
+          </div>
+        </div>
+      </div>
+      }
+      <div className="workspace-footer"><span className="workspace-caption">ROOM TO CREATE</span>
+        {!comparing && <div className="zoom-controls" aria-label="Canvas zoom">
+          <button aria-label="Zoom out" title="Zoom out" disabled={zoom <= VIEWPORT.minZoom} onClick={() => dispatch(zoomChanged(zoom / VIEWPORT.zoomStep))}><Minus size={15} /></button>
+          <output aria-label="Current zoom">{Math.round(zoom * 100)}%</output>
+          <button aria-label="Zoom in" title="Zoom in" disabled={zoom >= VIEWPORT.maxZoom} onClick={() => dispatch(zoomChanged(zoom * VIEWPORT.zoomStep))}><Plus size={15} /></button>
+          <span className="zoom-divider" /><button className="fit-button" title="Fit the whole design in the workspace" onClick={() => dispatch(fitRequested())}><Maximize size={14} />Fit</button>
+        </div>
+        }
+        <span className="workspace-footer-label">{comparing ? 'Source / Target' : `Version ${variants.findIndex((item) => item.id === current.id) + 1}`}</span>
+      </div>
+    </main>
+  );
+}
