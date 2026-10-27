@@ -2,7 +2,7 @@
 
 A browser-based design editor for event artwork, reusable templates, format adaptation, and AI-assisted image decomposition.
 
-**[Live Demo](https://frameflow-h7fa.onrender.com/)** · **[Source Code](https://github.com/rohitpokhariya10/frameflow)**
+**[Live Demo](https://frameflow-h7fa.onrender.com/)** · **[Source Code](https://github.com/rohitpokhariya10/FreshFolks-PL-Testing-V1)**
 
 **[Run locally](#run-frameflow-on-your-computer)** · [Features](#key-features) · [How to use](#how-to-use-the-features) · [Architecture](#architecture) · [Deployment](#production-deployment) · [Testing](#verification-and-testing)
 
@@ -32,8 +32,8 @@ The standard editor and Offer Templates flow do not require a separately install
 Run these commands in Terminal, PowerShell, or Git Bash:
 
 ```sh
-git clone https://github.com/rohitpokhariya10/frameflow.git
-cd frameflow
+git clone https://github.com/rohitpokhariya10/FreshFolks-PL-Testing-V1.git
+cd FreshFolks-PL-Testing-V1
 npm ci
 ```
 
@@ -71,6 +71,8 @@ DECOMPOSITION_ENABLED=false
 ```
 
 The editor, text tools, Auto Layout, browser-local templates and PNG export work without provider keys. AI operations report unavailable until their relevant provider is configured. Configure only the features you intend to use; see [optional AI setup](#optional-ai-configuration).
+
+> **Seeing only the basic editor?** Offer Templates, Protected Templates, product reuse, Saved Runs and AI Template Studio are served only when `server/.env` has `LAYERIZE_EXPERIMENT=1`; it is empty in the example file, so a fresh checkout answers their `/api/layerize-experiment` and `/api/template-studio` requests with 404. Set it to `1` and restart `npm run dev`. It needs no keys to load: generation and decomposition report unavailable until `OPENAI_API_KEY` and `FAL_KEY` are set, and each paid call is an explicit action you approve. A fresh checkout's template and run lists start empty, because saved templates, runs and Template Studio data live in the ignored `artifacts/` folder. The legacy worker flags (`DECOMPOSITION_ENABLED`, `DECOMP_PROVIDER_MODE`) are not needed for these workflows; see [legacy Image to layers](#optional-legacy-image-to-layers-setup).
 
 **Which `.env` file should I use?**
 
@@ -734,4 +736,4 @@ Detailed notes preserve historical milestone decisions and deployment plans. Thi
 
 ## Live Demo / Repository
 
-**[Open FrameFlow](https://frameflow-h7fa.onrender.com/)** · **[Browse the source](https://github.com/rohitpokhariya10/frameflow)**
+**[Open FrameFlow](https://frameflow-h7fa.onrender.com/)** · **[Browse the source](https://github.com/rohitpokhariya10/FreshFolks-PL-Testing-V1)**
