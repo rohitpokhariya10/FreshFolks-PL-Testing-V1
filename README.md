@@ -72,7 +72,7 @@ DECOMPOSITION_ENABLED=false
 
 The editor, text tools, Auto Layout, browser-local templates and PNG export work without provider keys. AI operations report unavailable until their relevant provider is configured. Configure only the features you intend to use; see [optional AI setup](#optional-ai-configuration).
 
-> **Seeing only the basic editor?** Offer Templates, Protected Templates, product reuse, Saved Runs and AI Template Studio are served only when `server/.env` has `LAYERIZE_EXPERIMENT=1`; it is empty in the example file, so a fresh checkout answers their `/api/layerize-experiment` and `/api/template-studio` requests with 404. Set it to `1` and restart `npm run dev`. It needs no keys to load: generation and decomposition report unavailable until `OPENAI_API_KEY` and `FAL_KEY` are set, and each paid call is an explicit action you approve. A fresh checkout's template and run lists start empty, because saved templates, runs and Template Studio data live in the ignored `artifacts/` folder. The legacy worker flags (`DECOMPOSITION_ENABLED`, `DECOMP_PROVIDER_MODE`) are not needed for these workflows; see [legacy Image to layers](#optional-legacy-image-to-layers-setup).
+> **Offer Templates, Protected Templates, product reuse, Saved Runs and AI Template Studio** are on by default in development: `npm run dev` serves their `/api/layerize-experiment` and `/api/template-studio` routes when `LAYERIZE_EXPERIMENT` is unset or empty, as it is in a fresh checkout and in the example file (`LAYERIZE_EXPERIMENT=0` turns them off). Production (`NODE_ENV=production`) serves them only with `LAYERIZE_EXPERIMENT=1`. They need no keys to load: generation and decomposition report unavailable until `OPENAI_API_KEY` and `FAL_KEY` are set, and each paid call is an explicit action you approve. A fresh checkout's template and run lists start empty, because saved templates, runs and Template Studio data live in the ignored `artifacts/` folder. The legacy worker flags (`DECOMPOSITION_ENABLED`, `DECOMP_PROVIDER_MODE`) are not needed for these workflows; see [legacy Image to layers](#optional-legacy-image-to-layers-setup).
 
 **Which `.env` file should I use?**
 
@@ -142,7 +142,7 @@ OPENAI_API_KEY=your_openai_api_key
 FAL_KEY=your_fal_key
 ```
 
-Open **OpenAI + Seedream test → Offer Templates** for the product-template workflow. The launcher can be visible even when backend routes are disabled; `LAYERIZE_EXPERIMENT=1` enables those routes.
+Open **OpenAI + Seedream test → Offer Templates** for the product-template workflow. Development serves those routes unless `LAYERIZE_EXPERIMENT=0`; production needs `LAYERIZE_EXPERIMENT=1`.
 
 This work runs inside the API process. It does **not** require `DECOMPOSITION_ENABLED=true` or the legacy worker. Model selection lives in [aiModels.ts](server/src/decomposition/aiModels.ts): the product decomposition planner defaults to `gpt-5.6-sol`, the older general planner helper to `gpt-5-mini`, and image generation to `gpt-image-2`. `OPENAI_DECOMPOSITION_MODEL` and `OPENAI_IMAGE_MODEL` override the relevant defaults. These are repository defaults, not guarantees of access for your account. Template Studio has separate `STUDIO_*` settings in [server/.env.example](server/.env.example).
 
@@ -219,7 +219,7 @@ Some specialist tests use private reference images/manifests that are not includ
 | Frontend loads but `/api` requests fail | Ensure both dev processes are running. Changing server `PORT` also requires updating Vite's API target; keep the defaults for first setup. |
 | Port 3001 shows no editor during development | Open port **5173**. To use port 3001 for the UI, run `npm run build` followed by `npm start`. |
 | Core AI says it is not configured | Match `AI_PROVIDER` to its credentials in `server/.env`, then restart. Core `/api/health` does not check OpenAI/fal configuration. |
-| Experiment launcher opens but its API returns 404 | Set exactly `LAYERIZE_EXPERIMENT=1`, then restart the API. |
+| Experiment launcher opens but its API returns 404 | Set exactly `LAYERIZE_EXPERIMENT=1` (required with `NODE_ENV=production`; in development, check it is not `0`), then restart the API. |
 | Planner/image request fails with 429 or a connection error | Read the failure reason. Credit exhaustion, rate limiting and transport errors are different. Check the relevant account; do not repeatedly submit paid attempts. |
 | Image to layers button is missing | Enable `VITE_LEGACY_IMAGE_TO_LAYERS=1` in the client env and restart Vite/rebuild. |
 | Legacy job remains queued | Start the worker with the same `DECOMP_DATA_DIR` as the API. |
@@ -587,7 +587,7 @@ docs/               Engineering notes and controlled live evidence
 | `POST /api/ai/generate` | Validate a visual brief, target size, style, and text-space region; return normalized artwork metadata and image data |
 | `POST /api/ai/adapt` | Validate a bounded source reference and target intent; return recomposed artwork for the new variant |
 | `/api/decomposition/*` | Legacy capabilities, operator session, uploads, jobs, reviews, and artifacts; requires decomposition configuration and a worker |
-| `/api/layerize-experiment/*` | Template recipes, runs, generated-image groups, resume/retry, and output downloads; mounted only with `LAYERIZE_EXPERIMENT=1` |
+| `/api/layerize-experiment/*` | Template recipes, runs, generated-image groups, resume/retry, and output downloads; mounted in development unless `LAYERIZE_EXPERIMENT=0`, in production only with `LAYERIZE_EXPERIMENT=1` |
 
 Core AI responses include a request ID; errors use safe codes and messages. The main editor's project document is browser-local, while decomposition jobs and experiment artifacts are stored server-side.
 

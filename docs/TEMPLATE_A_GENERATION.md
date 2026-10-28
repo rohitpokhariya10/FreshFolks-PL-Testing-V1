@@ -1,7 +1,7 @@
 # Template A test generator: one creative, three aspect ratios
 
 A test/admin harness inside the **OpenAI + Seedream test** panel (button **Create Template A**). It is served only by
-the layerize experiment router, mounted only when `LAYERIZE_EXPERIMENT=1` (who may use it: "Access" in
+the layerize experiment router, mounted in development unless `LAYERIZE_EXPERIMENT=0` and in production only with `LAYERIZE_EXPERIMENT=1` (who may use it: "Access" in
 [TEMPLATE_GENERATION.md](TEMPLATE_GENERATION.md)).
 
 Templates B and C have the same capability, each with its own fields, prompt and decomposition controls. What the

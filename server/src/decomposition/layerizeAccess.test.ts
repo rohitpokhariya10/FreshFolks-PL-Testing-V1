@@ -68,12 +68,18 @@ const PROXIED = { 'X-Forwarded-For': '203.0.113.7' };
 const EXECUTIONS = '/api/layerize-experiment/template-executions';
 const png = () => sharp({ create: { width: 512, height: 512, channels: 3, background: '#446688' } }).png().toBuffer();
 
-describe('the layerize experiment is mounted only when LAYERIZE_EXPERIMENT=1', () => {
-  it('follows the flag alone: on in production and in development when set to 1, off otherwise', () => {
+describe('the layerize experiment: opt-in in production, on by default in development', () => {
+  it('production needs LAYERIZE_EXPERIMENT=1; development is on unless the flag says otherwise', () => {
     expect(layerizeExperimentEnabled({ LAYERIZE_EXPERIMENT: '1', NODE_ENV: 'production' })).toBe(true);
     expect(layerizeExperimentEnabled({ LAYERIZE_EXPERIMENT: '1', NODE_ENV: 'development' })).toBe(true);
     expect(layerizeExperimentEnabled({ LAYERIZE_EXPERIMENT: '1' })).toBe(true);
     for (const off of [undefined, '', '0', 'true', 'on', 'yes', ' 1']) expect(layerizeExperimentEnabled({ LAYERIZE_EXPERIMENT: off, NODE_ENV: 'production' })).toBe(false);
+    // A fresh checkout (no .env, or the example's empty value) runs `npm run dev` without NODE_ENV.
+    for (const unset of [undefined, '']) {
+      expect(layerizeExperimentEnabled({ LAYERIZE_EXPERIMENT: unset })).toBe(true);
+      expect(layerizeExperimentEnabled({ LAYERIZE_EXPERIMENT: unset, NODE_ENV: 'development' })).toBe(true);
+    }
+    for (const off of ['0', 'true', 'on', 'yes', ' 1']) expect(layerizeExperimentEnabled({ LAYERIZE_EXPERIMENT: off, NODE_ENV: 'development' })).toBe(false);
   });
 
   it('production with the flag: /runs and /templates answer the app; the rest of the app is as it was', async () => {
@@ -105,7 +111,7 @@ describe('the layerize experiment is mounted only when LAYERIZE_EXPERIMENT=1', (
   });
 
   it('flag missing or off: both routes are unavailable, and the app still serves', async () => {
-    for (const env of [{ NODE_ENV: 'production' }, { NODE_ENV: 'production', LAYERIZE_EXPERIMENT: '0' }, { NODE_ENV: 'production', LAYERIZE_EXPERIMENT: '' }, { NODE_ENV: 'development' }]) {
+    for (const env of [{ NODE_ENV: 'production' }, { NODE_ENV: 'production', LAYERIZE_EXPERIMENT: '0' }, { NODE_ENV: 'production', LAYERIZE_EXPERIMENT: '' }, { NODE_ENV: 'development', LAYERIZE_EXPERIMENT: '0' }]) {
       const s = await app(env);
       try {
         for (const path of ['/runs', '/templates', '/template-executions/x']) expect((await s.call('GET', `/api/layerize-experiment${path}`, READ)).status).toBe(404);

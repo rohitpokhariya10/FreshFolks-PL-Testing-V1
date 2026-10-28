@@ -91,7 +91,7 @@ paid).
 | `AI_BUDGET_USD_INR` | 90 | Rupee display rate |
 | `FAL_KEY`, `CREATIVE_CUTOUT_PROVIDER` | – , `sam3` | Only for Make exact cutout (and FrameFlow's own decomposition) |
 
-The routes are mounted only with `LAYERIZE_EXPERIMENT=1`, behind the same access guard as the experiment.
+The routes are mounted with the experiment (in development unless `LAYERIZE_EXPERIMENT=0`, in production only with `LAYERIZE_EXPERIMENT=1`), behind the same access guard.
 
 The earlier Create Template wizard's code, API and saved executions are untouched. Its tab is hidden; a saved execution
 still opens from Saved Runs, and the tab returns with `VITE_LEGACY_CREATIVE_TEMPLATES=1` (build) or localStorage

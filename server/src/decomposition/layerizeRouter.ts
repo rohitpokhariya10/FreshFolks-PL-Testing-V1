@@ -2,8 +2,8 @@ import { createProductLayerizer, liveDecompositionPlanner, type ProductLayerizer
 import { liveProductAnalyzer } from './protectedTemplates/product/analyzer.js';
 /**
  * HTTP surface for OpenAI → Seedream decomposition: direct test runs (Decompose/Test), reference creatives
- * (imageTemplates.ts) and creative templates (creativeTemplates/). Mounted only with LAYERIZE_EXPERIMENT=1, in
- * development and in production alike. It spends paid API credit and has no login, so it only answers its own
+ * (imageTemplates.ts) and creative templates (creativeTemplates/). Mounted in development unless LAYERIZE_EXPERIMENT=0,
+ * and in production only with LAYERIZE_EXPERIMENT=1. It spends paid API credit and has no login, so it only answers its own
  * frontend: a direct request on this machine in development, or, behind a proxy, a request the browser marks as coming
  * from the app's own origin (see experimentAccess). One decomposition at a time; runs execute in-process, no worker.
  *
@@ -48,8 +48,15 @@ import { appOrigin } from '../deployment.js';
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 const FILE = /^[a-z0-9-]+\.(png|jpg|webp|json|txt)$/;
 
-/** Off unless explicitly turned on, whatever the environment. */
-export function layerizeExperimentEnabled(env = process.env) { return env.LAYERIZE_EXPERIMENT === '1'; }
+/**
+ * 1 turns it on everywhere. Unset or empty: on in development, so a fresh checkout's `npm run dev` serves the same
+ * panels as a configured one (no AI call is made until the user asks for one), and off in production (NODE_ENV=production),
+ * which still has to opt in. Any other value (0) turns it off.
+ */
+export function layerizeExperimentEnabled(env = process.env) {
+  const flag = env.LAYERIZE_EXPERIMENT;
+  return flag === '1' || (!flag && env.NODE_ENV !== 'production');
+}
 
 /** clientOrigin: the deployed app's own origin (CLIENT_ORIGIN, else Render's RENDER_EXTERNAL_URL). production: NODE_ENV is production. */
 export type ExperimentAccess = { clientOrigin?: string; production?: boolean };
