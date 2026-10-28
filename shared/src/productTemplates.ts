@@ -212,6 +212,8 @@ export interface ProductInfo {
    * detection's answer. Native layers are reference data; explicit AI preparation obtains new object masks (product/variationTemplate.ts).
    */
   variation?: { decompositionEngine?: 'ai'; templateId: string; revision: number; jobId: string; index: number; title: string; background: string; clean: string; cleanSha256?: string;
+    /** The format the creative was made in (absent on templates made before it was recorded: their own canvas says it). */
+    aspectRatio?: ReuseAspectRatio;
     layers: { label: string; kind: ProductObjectKind; box: PixelRect; file: string }[]; plates?: { box: PixelRect; file: string }[]; answer: string; words: string };
   /** The administrator saw the prepared template and its checks and accepted it (with the issues listed then). */
   approved?: { at: string; objectsRevision: number; baseSha256: string; acknowledged: string[]; /** Saved as a draft with blocking quality warnings, as the person chose. */ draft?: boolean };
@@ -332,7 +334,13 @@ export type ProductCreativeOrigin = { kind: 'template' } | { kind: 'duplicate'; 
  */
 export interface ProductCreativeBackground {
   file: string; sha256: string; width: number; height: number;
-  method: 'template' | 'plain-bands' | 'letterbox' | 'ai-artwork' | 'local-backdrop' | 'slice' | 'mirror-extend'; restyled: boolean;
+  method: 'template' | 'plain-bands' | 'letterbox' | 'ai-artwork' | 'local-backdrop' | 'slice' | 'mirror-extend' | 'recompose'; restyled: boolean;
+  /**
+   * Recompose (Reuse Template, a common ratio): the template's artwork block placed whole at one scale; where it does not
+   * reach, the canvas is continued — by an approved AI edit of only those areas (`ai`) or on this computer (`local`, a soft
+   * continuation of its own edge artwork). `percent`: that share of the canvas.
+   */
+  extension?: ReuseExtension;
   /** Share of the canvas that is new fill (letterbox margins), percent. */
   filledPercent: number;
   /** Made from the template's stage with its painted display stands rebuilt away (Reuse Template; a cached file of its own). */
@@ -405,10 +413,32 @@ export const PRODUCT_VARIATION_LABELS: Record<ProductVariationKind, { title: str
   premium: { title: 'Premium spotlight', hint: 'Muted, calmer artwork, dark text and an elegant serif headline.' },
   minimal: { title: 'Minimal brand-forward', hint: 'Lighter artwork, fewer products, clean sans-serif text.' },
 };
+/**
+ * The common offer-creative aspect ratios: the one list every Product with Text flow offers (Create Offer Creative, Reuse
+ * Template, AI variations) and the editor's own presets (Square, Poster 4:5, Story, Landscape).
+ */
+export const OFFER_ASPECT_RATIOS = ['1:1', '4:5', '9:16', '16:9'] as const;
+export type OfferAspectRatio = typeof OFFER_ASPECT_RATIOS[number];
+export const OFFER_ASPECT_LABELS: Record<OfferAspectRatio, string> = { '1:1': 'Square 1:1', '4:5': 'Portrait 4:5', '9:16': 'Story 9:16', '16:9': 'Landscape 16:9' };
+/** One common ratio as width / height. */
+export const offerAspectValue = (ratio: OfferAspectRatio) => { const [w, h] = ratio.split(':').map(Number); return w / h; };
+/** The common ratio a canvas already has (within 1 %), if any: a template made in 9:16 says so. */
+export function offerAspectRatioOf(size: SourceSize): OfferAspectRatio | undefined {
+  const have = size.width / Math.max(1, size.height);
+  return OFFER_ASPECT_RATIOS.find(r => Math.abs(have - offerAspectValue(r)) / offerAspectValue(r) < 0.01);
+}
+/**
+ * A canvas of exactly `ratio` (w·k × h·k for a whole k) whose long side is at most `longSide`: a 4:5 creative is 4:5 to
+ * the pixel, never off by a rounding.
+ */
+export function exactRatioCanvas(ratio: OfferAspectRatio, longSide: number): SourceSize {
+  const [w, h] = ratio.split(':').map(Number), k = Math.max(1, Math.floor(longSide / Math.max(w, h)));
+  return { width: w * k, height: h * k };
+}
 /** The aspect ratios a variation can be made in ('original': the template's own canvas). */
-export const PRODUCT_ASPECT_RATIOS = ['original', '1:1', '4:5', '9:16', '16:9'] as const;
+export const PRODUCT_ASPECT_RATIOS = ['original', ...OFFER_ASPECT_RATIOS] as const;
 export type ProductAspectRatio = typeof PRODUCT_ASPECT_RATIOS[number];
-export const PRODUCT_ASPECT_LABELS: Record<ProductAspectRatio, string> = { original: 'Original size', '1:1': 'Square 1:1', '4:5': 'Portrait 4:5', '9:16': 'Story 9:16', '16:9': 'Landscape 16:9' };
+export const PRODUCT_ASPECT_LABELS: Record<ProductAspectRatio, string> = { original: 'Original size', ...OFFER_ASPECT_LABELS };
 /**
  * The canvas of a template in an aspect ratio: the template's own size along the side it keeps (its width for a taller
  * ratio, its height for a wider one), the other side lengthened. Never smaller than the template, never stretched.
@@ -448,13 +478,21 @@ export const PRODUCT_LIMITS = { maxObjects: 60, maxName: 120, maxUpload: 25 * 10
 // ---------------------------------------------------------------------------------------------------------------------
 // Reuse Template: a saved revision reused with the person's own product set, copy and formats (separate from variations)
 // ---------------------------------------------------------------------------------------------------------------------
-/** The output formats of the Reuse Template studio ('original': the template's own canvas). */
-export const REUSE_ASPECT_RATIOS = ['original', '3:9', '4:9', '16:9'] as const;
-export type ReuseAspectRatio = typeof REUSE_ASPECT_RATIOS[number];
-export const REUSE_ASPECT_LABELS: Record<ReuseAspectRatio, string> = { original: 'Original size', '3:9': 'Portrait 3:9', '4:9': 'Portrait 4:9', '16:9': 'Landscape 16:9' };
 /**
- * A reused creative's canvas: the template's own for 'original'; otherwise exactly the ratio, a portrait one as tall as
- * the template, a landscape one as wide (at most 4096 px), so the template's artwork is never enlarged.
+ * The output formats of the Reuse Template studio ('original': the template's own canvas). The offered ones are the
+ * common ratios; 3:9 and 4:9 were offered before them and stay valid, so a draft made with them still opens, composes
+ * and saves exactly as it did (they are no longer offered for new choices).
+ */
+export const REUSE_OFFERED_RATIOS = PRODUCT_ASPECT_RATIOS;
+export const LEGACY_REUSE_RATIOS = ['3:9', '4:9'] as const;
+export const REUSE_ASPECT_RATIOS = [...REUSE_OFFERED_RATIOS, ...LEGACY_REUSE_RATIOS] as const;
+export type ReuseAspectRatio = typeof REUSE_ASPECT_RATIOS[number];
+export const REUSE_ASPECT_LABELS: Record<ReuseAspectRatio, string> = { ...PRODUCT_ASPECT_LABELS, '3:9': 'Portrait 3:9', '4:9': 'Portrait 4:9' };
+export const isOfferAspectRatio = (ratio: unknown): ratio is OfferAspectRatio => (OFFER_ASPECT_RATIOS as readonly unknown[]).includes(ratio);
+/**
+ * A legacy reused creative's canvas (3:9, 4:9; the common ratios are planned on the server from the template's own
+ * structure): the template's own for 'original'; otherwise exactly the ratio, a portrait one as tall as the template, a
+ * landscape one as wide (at most 4096 px), so the template's artwork is never enlarged.
  */
 export function reuseCanvasFor(canvas: SourceSize, ratio: ReuseAspectRatio): SourceSize {
   if (ratio === 'original') return { ...canvas };
@@ -489,11 +527,43 @@ export interface ReuseAiPlan { ratio: ReuseAspectRatio; at: string; model: strin
 export interface ReuseOverride { x?: number; y?: number; width?: number; height?: number; dx?: number; dy?: number }
 export interface ReuseOutput {
   ratio: ReuseAspectRatio; generatedAt: string; draftRevision: number; preview: string; previewSha256: string; canvas: SourceSize;
-  placement: ReusePlacementMode; background: { method: ProductCreativeBackground['method']; filledPercent: number; note?: string };
+  placement: ReusePlacementMode; background: { method: ProductCreativeBackground['method']; filledPercent: number; note?: string; extension?: ReuseExtension };
+  /** Recompose: how this format was laid out (the approved AI plan, or the rules on this computer). Absent on earlier outputs. */
+  composition?: { source: 'ai' | 'rules'; layout: string };
+  /** What was verified before saving (absent on outputs generated before it was recorded). */
+  validation?: ReuseValidation;
   checks: { status: 'ready' | 'needs-review' | 'failed'; issues: ProductVariationCheck[] };
   creativeId?: string; creativeRevision?: number; savedAt?: string; savedDraftRevision?: number;
   /** Decompose & Edit: the layer template made from the saved creative (which revision), so it is never made (and paid) twice. */
   decomposition?: { templateId: string; creativeId: string; creativeRevision: number; at: string };
+}
+/**
+ * The checks a format passes before it can be saved, by what they protect: its exact size, the protected elements (every
+ * logo, text group and product the person kept is shown, whole and unchanged), readability (text size and contrast) and
+ * clipping (nothing cut by the canvas). `ok: false` with a blocking issue keeps it from being saved.
+ */
+export interface ReuseValidation {
+  size: { ok: boolean; width: number; height: number; ratio: string; message: string };
+  protected: { ok: boolean; logos: number; texts: number; products: number; issues: string[] };
+  readability: { ok: boolean; issues: string[] };
+  clipping: { ok: boolean; issues: string[] };
+}
+/** How the canvas beyond the template's artwork was continued (Recompose). */
+export interface ReuseExtension { method: 'ai' | 'local'; percent: number; model?: string; operationId?: string; note?: string }
+/**
+ * An approved AI layout of one common-ratio format (Recompose): where the template's artwork block sits (its top-left and
+ * one scale: never stretched) and where each element that left the artwork goes (header and footer logos and text: `i:<logo>`,
+ * `g:<text group>`), in canvas pixels. Every box was checked before it was kept; refused ones are listed with the reason and
+ * laid out by the rules instead. `extension`: the approved AI continuation of the background, when one was made.
+ */
+export interface ReuseComposePlan {
+  ratio: OfferAspectRatio; at: string; model: string; offline: boolean; operationId: string; responseId?: string;
+  /** 'stacked' | 'split-left' | 'split-right' (the scene's side); `summary`: the planner's own words for it. */
+  layout: string; summary?: string; canvas: SourceSize; art: { x: number; y: number; scale: number }; boxes: Record<string, PixelRect>;
+  /** Decorations its artwork placement leaves out (wholly outside the canvas). */
+  excluded: string[];
+  notes: string[]; rejected: { key: string; reason: string }[];
+  extension?: { file: string; sha256: string; model: string; offline: boolean; operationId: string; requestId?: string; percent: number } | { failed: string; operationId: string };
 }
 export interface ReuseDraft {
   schemaVersion: 1; id: string; templateId: string; templateRevision: number; name: string; createdAt: string; updatedAt: string; revision: number;
@@ -506,4 +576,6 @@ export interface ReuseDraft {
   ai: { requests: number; costUsd: number; plans: Partial<Record<ReuseAspectRatio, ReuseAiPlan>>; failures: { at: string; operationId: string; message: string }[] };
   overrides: Partial<Record<ReuseAspectRatio, Record<string, ReuseOverride>>>;
   outputs: Partial<Record<ReuseAspectRatio, ReuseOutput>>;
+  /** Approved AI compositions per common-ratio format (absent on drafts made before them: laid out by the rules). */
+  compose?: Partial<Record<OfferAspectRatio, ReuseComposePlan>>;
 }

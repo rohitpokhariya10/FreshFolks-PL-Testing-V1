@@ -4,7 +4,7 @@
  * vision request), `paid` (the cut-out service, one request per object) and `ai` (the variation planner, one request)
  * are only sent when the person chose them after seeing the cost.
  */
-import type { MasterCategory, PixelRect, ProductAspectRatio, ReuseAspectRatio, ReuseDraft, ReuseOverride, ReuseTextEdit, ProductVariationCheck, CreativeTextStyle, ProductDecompositionPlan, ProductGenerationBrief, ProductCreative, ProductInfo, ProductObjectKind, ProductSnapshot, ProductStage, ProductVariationInfo, ProductVariationKind, ProtectedTemplate } from '@frameflow/shared';
+import type { MasterCategory, PixelRect, ProductAspectRatio, ReuseAspectRatio, ReuseDraft, ReuseValidation, ReuseOverride, ReuseTextEdit, ProductVariationCheck, CreativeTextStyle, ProductDecompositionPlan, ProductGenerationBrief, ProductCreative, ProductInfo, ProductObjectKind, ProductSnapshot, ProductStage, ProductVariationInfo, ProductVariationKind, ProtectedTemplate } from '@frameflow/shared';
 import { ProtectedApiError, protectedFileUrl } from '../protectedTemplates/api';
 
 const BASE = '/api/layerize-experiment/product-templates';
@@ -140,7 +140,7 @@ export const productApi = {
   removeVariation: (id: string, jid: string, n: number) => call<VariationJob>(`/${id}/variations/${jid}/results/${n}`, { method: 'DELETE' }),
   // Reuse Template studio (separate from variations).
   reuseDrafts: (id: string) => call<{ drafts: ReuseDraftSummary[] }>(`/${id}/reuse`),
-  createReuseDraft: (id: string, input: { revision?: number; name?: string; simple?: boolean } = {}) => call<ReuseDraft>(`/${id}/reuse`, json('POST', input)),
+  createReuseDraft: (id: string, input: { revision?: number; name?: string; simple?: boolean; ratios?: ReuseAspectRatio[] } = {}) => call<ReuseDraft>(`/${id}/reuse`, json('POST', input)),
   reuseDraft: (id: string, did: string) => call<ReuseStudioView>(`/${id}/reuse/${did}`),
   updateReuseDraft: (id: string, did: string, input: ReuseDraftChange) => call<ReuseDraft>(`/${id}/reuse/${did}`, json('PUT', input)),
   reuseUpload: (id: string, did: string, file: Blob, fields: { kind: 'product' | 'character' | 'logo'; target?: string; label?: string; category?: string; expectedRevision: number }, name?: string) =>
@@ -148,6 +148,8 @@ export const productApi = {
   reusePreview: (id: string, did: string, ratio: ReuseAspectRatio) => call<ReusePreview>(`/${id}/reuse/${did}/preview?ratio=${ratio.replace(':', 'x')}`),
   reuseGenerate: (id: string, did: string, ratios?: ReuseAspectRatio[]) => call<ReuseDraft>(`/${id}/reuse/${did}/generate`, json('POST', { ratios })),
   reusePlaceWithAi: (id: string, did: string, input: { ratios?: ReuseAspectRatio[]; approveUsd: number }) => call<ReuseDraft>(`/${id}/reuse/${did}/placement`, json('POST', input)),
+  /** AI composition of common-ratio sizes (layout plan + background continuation where needed); paid only with `approveUsd`. */
+  reuseCompose: (id: string, did: string, input: { ratios?: ReuseAspectRatio[]; approveUsd: number; extend?: boolean }) => call<ReuseDraft>(`/${id}/reuse/${did}/compose`, json('POST', input)),
   reuseSave: (id: string, did: string, ratios?: ReuseAspectRatio[]) => call<ReuseDraft>(`/${id}/reuse/${did}/save`, json('POST', { ratios })),
   reuseOpen: (id: string, did: string, ratio: ReuseAspectRatio) => call<{ runId: string; creativeId: string }>(`/${id}/reuse/${did}/outputs/${ratio.replace(':', 'x')}/open`, { method: 'POST' }),
   reuseDecompose: (id: string, did: string, ratio: ReuseAspectRatio) => call<{ templateId: string; creativeId: string; reused?: boolean }>(`/${id}/reuse/${did}/outputs/${ratio.replace(':', 'x')}/decomposition`, { method: 'POST' }),
@@ -158,7 +160,9 @@ export interface ReuseStudioView {
   draft: ReuseDraft; sourceIssues: string[]; canvas: { width: number; height: number }; stageFound: boolean;
   texts: { groupId: string; label: string; category: string; text: string; style?: CreativeTextStyle }[];
   logos: { id: string; label: string; category: string; file: string }[];
-  formats: { ratio: ReuseAspectRatio; label: string; canvas: { width: number; height: number }; method: 'template' | 'slice' | 'mirror-extend'; note?: string }[];
+  formats: { ratio: ReuseAspectRatio; label: string; canvas: { width: number; height: number }; method: 'template' | 'slice' | 'mirror-extend' | 'recompose'; composed?: 'ai' | 'rules'; note?: string }[];
+  /** AI composition of the common ratios (layout planner and background continuation), when the server offers it. */
+  composition?: { ai: boolean; model: string; offline: boolean; extend: boolean; planCostUsd: number; extendCostUsd: number };
   /** `slots`: the template's own product places (as many products or fewer stand in them, never arranged anew). */
   placement: { ai: boolean; model: string; offline: boolean; costUsd: number; slots?: number }; knownCategories: string[];
 }
@@ -168,5 +172,5 @@ export interface ReuseDraftChange {
   texts?: Record<string, ReuseTextEdit | null>; logos?: Record<string, { hidden?: boolean; restore?: boolean }>;
   overrides?: Partial<Record<ReuseAspectRatio, Record<string, ReuseOverride | null> | null>>;
 }
-export interface ReusePreview { ratio: ReuseAspectRatio; creative: ProductCreative; mode: 'original' | 'geometry' | 'ai'; frame: { method: string; canvas: { width: number; height: number }; note?: string; excluded: string[] }; checks: { status: 'ready' | 'needs-review' | 'failed'; issues: ProductVariationCheck[] }; notes: string[] }
+export interface ReusePreview { ratio: ReuseAspectRatio; creative: ProductCreative; mode: 'original' | 'geometry' | 'ai'; frame: { method: string; canvas: { width: number; height: number }; note?: string; excluded: string[] }; checks: { status: 'ready' | 'needs-review' | 'failed'; issues: ProductVariationCheck[] }; notes: string[]; validation?: ReuseValidation; composition?: { source: 'ai' | 'rules'; layout: string } }
 

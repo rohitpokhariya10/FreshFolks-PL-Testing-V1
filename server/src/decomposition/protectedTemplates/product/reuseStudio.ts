@@ -17,8 +17,8 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import {
-  isOfferFont, offerWeights, REUSE_ASPECT_LABELS, REUSE_ASPECT_RATIOS, rewriteGroup, CREATIVE_SCHEMA_VERSION,
-  type CreativeInstance, type OfferWeight, type ProductCreative, type ProductCreativeObject, type ProductSlot, type ProductSnapshot, type ProductVariationCheck, type ReuseAiPlan, type ReuseAspectRatio,
+  isOfferAspectRatio, isOfferFont, offerWeights, REUSE_ASPECT_LABELS, REUSE_ASPECT_RATIOS, REUSE_OFFERED_RATIOS, rewriteGroup, CREATIVE_SCHEMA_VERSION,
+  type CreativeInstance, type OfferAspectRatio, type ReuseComposePlan, type ReuseValidation, type OfferWeight, type ProductCreative, type ProductCreativeObject, type ProductSlot, type ProductSnapshot, type ProductVariationCheck, type ReuseAiPlan, type ReuseAspectRatio,
   type ReuseDraft, type ReuseItem, type ReuseOutput, type ReuseOverride, type ReusePlacementBox, type ReusePlacementMode, type ReuseTextEdit,
 } from '@frameflow/shared';
 import { RunError } from '../../layerizeExperiment.js';
@@ -38,7 +38,9 @@ import { fitGroup } from './composition.js';
 import { inferAlign, restyleGroup } from './variations.js';
 import { variationComposition, type VariationComposition } from './variationTemplate.js';
 import { reuseCategory, shapeMismatch, sizeUnit } from './reusePlacement.js';
-import { artRows, frameBackground, groupBounds, mapBox, mapCreative, mapX, planFrame, reanchor, type Box, type Decoration, type ReuseFrame } from './reuseLayout.js';
+import { artRows, frameBackground, groupBounds, mapBox, mapCreative, mapX, mapY, planFrame, reanchor, type Box, type Decoration, type ReuseFrame } from './reuseLayout.js';
+import { applyPlan, checkComposePlan, contrastIssues, extensionPercent, COMPOSE_PLAN_COST_USD, composeBackground, composeRequest, EXTEND_COST_USD, extendWithAi, planRules, readStructure, type Plan, type ReuseComposer, type Structure } from './reuseCompose.js';
+import type { WordRecognizer } from '../../../textRecognition/recognizer.js';
 import { checkPlacement, geometryPlacement, KNOWN_KINDS, PLACEMENT_COST_USD, type PlacementInput, type ReusePlacementPlanner, type Stage } from './reusePlacement.js';
 
 const nowIso = () => new Date().toISOString();
@@ -46,6 +48,10 @@ const hex = (n: number) => randomBytes(n).toString('hex');
 function fail(code: string, message: string, details?: Record<string, unknown>): never { throw new RunError(code, message, details); }
 const DRAFT_ID = /^pr-[a-f0-9]{8}$/, fileOf = (did: string) => `prd-${did.slice(3)}.json`;
 const ratioKey = (r: ReuseAspectRatio) => (r === 'original' ? 'original' : r.replace(':', 'x'));
+/** Each format's number in a derived template's name and id (stable: the formats offered first keep theirs). */
+const FORMAT_INDEX: Record<ReuseAspectRatio, number> = { original: 0, '3:9': 1, '4:9': 2, '16:9': 3, '1:1': 4, '4:5': 5, '9:16': 6 };
+/** Bumped when reuseCompose.ts changes what a recomposed background looks like (a new cached file). */
+const RECOMPOSE_VERSION = 1;
 const isRatio = (r: unknown): r is ReuseAspectRatio => (REUSE_ASPECT_RATIOS as readonly string[]).includes(r as string);
 const asInstance = (c: ProductCreative) => ({ ...c, schemaVersion: CREATIVE_SCHEMA_VERSION, masterId: c.templateId, masterRevision: c.templateRevision, origin: { kind: 'master' }, editor: null, exports: [], history: [] }) as unknown as CreativeInstance;
 const area = (b: Box) => Math.max(0, b.width) * Math.max(0, b.height);
@@ -71,6 +77,8 @@ interface Context {
   emptyStage: { file: string; png: Buffer } | { reason: string };
   /** What creatives are drawn on: the template's base, and the empty stage when there is one (each `Ground`). */
   grounds: { base: Ground; empty?: Ground };
+  /** Recompose: the template's structure (artwork block, bands and what sits in them) and the rules' plan per common ratio. */
+  structure: Structure; rules: Map<OfferAspectRatio, Plan>;
 }
 /**
  * A background with what the template's text removal left of its letters cleared (its own cached file), and each text
@@ -86,6 +94,10 @@ export interface Composed {
   checks: { status: 'ready' | 'needs-review' | 'failed'; issues: ProductVariationCheck[] };
   /** Every product stands in a place of the template's own products (slot-anchored), not arranged anew. */
   anchored: boolean;
+  /** What is verified before saving (size, protected elements, readability, clipping). */
+  validation: ReuseValidation;
+  /** A recomposed common ratio: laid out by the approved AI plan or by the rules. */
+  composition?: { source: 'ai' | 'rules'; layout: string };
 }
 
 /**
@@ -138,9 +150,14 @@ export function createReuseStudio(deps: {
   /** The AI placement planner (only with the person's approval of its cost). */
   placement?: () => ReusePlacementPlanner | undefined;
   /** "Decompose & Edit": a template of its own from a saved reused creative (service.createFromVariation). */
-  toTemplate?: (input: { templateId: string; revision: number; jobId: string; index: number; title: string; name: string; composition: VariationComposition }) => Promise<string>;
+  toTemplate?: (input: { templateId: string; revision: number; jobId: string; index: number; title: string; name: string; composition: VariationComposition; aspectRatio?: ReuseAspectRatio }) => Promise<string>;
+  /** Recompose with AI: the layout planner and the background continuation (only with the person's approval of their cost). */
+  composer?: () => ReuseComposer | undefined;
+  /** The local word reader: an AI background continuation is read back for lettering before it is used. */
+  recognizer?: () => WordRecognizer;
 }) {
   const { store, locked } = deps;
+  const filesOf = (id: string) => ({ has: (f: string) => store.has(id, f), read: (f: string) => store.read(id, f), write: (f: string, b: Buffer) => store.write(id, f, b) });
   const contexts = new Map<string, Promise<Context>>();
   const read = (id: string, did: string): ReuseDraft => {
     deps.requireProduct(id);
@@ -239,7 +256,8 @@ export function createReuseStudio(deps: {
           template.texts = template.texts.map(t => { const ink = t.wordId ? inkOf.get(t.wordId) : undefined; return ink && far(ink, t.style.color) ? { ...t, style: { ...t.style, color: ink } } : t; });
         }
         const grounds: Context['grounds'] = { base: await groundOf(baseFile, basePng), ...('file' in emptyStage ? { empty: await groundOf(emptyStage.file, emptyStage.png) } : {}) };
-        return { snapshot, baseFile, basePng, art, decorations, avoid, stage, stageFound, template, emptyStage, grounds };
+        const structureOf = await readStructure(filesOf(id), basePng, template, art, decorations, podium ? [podium.box] : []);
+        return { snapshot, baseFile, basePng, art, decorations, avoid, stage, stageFound, template, emptyStage, grounds, structure: structureOf, rules: new Map() };
       })();
       contexts.set(key, ctx);
       ctx.catch(() => contexts.delete(key));
@@ -273,6 +291,25 @@ export function createReuseStudio(deps: {
     return sizes.get(key)!;
   }
 
+  // --- Formats: legacy frames and recomposed common ratios ----------------------------------------------------------------
+  /** The rules' plan of a common ratio (once per revision and ratio). */
+  const rulesOf = (ctx: Context, ratio: OfferAspectRatio) => { let p = ctx.rules.get(ratio); if (!p) { p = planRules(ctx.structure, ratio); ctx.rules.set(ratio, p); } return p; };
+  /** A common ratio's plan for a draft: its approved AI composition (checked when it was made), else the rules'. */
+  const planOf = (ctx: Context, d: ReuseDraft, ratio: OfferAspectRatio): { plan: Plan; ai?: ReuseComposePlan } => {
+    const ai = d.compose?.[ratio], rules = rulesOf(ctx, ratio);
+    if (ai && ai.canvas.width === rules.canvas.width && ai.canvas.height === rules.canvas.height)
+      return { ai, plan: { ratio, canvas: ai.canvas, layout: ai.layout as Plan['layout'], art: ai.art, boxes: { ...rules.boxes, ...ai.boxes }, excluded: ai.excluded } };
+    return { plan: rules };
+  };
+  /** A format's frame: legacy (3:9, 4:9: reuseLayout.ts), the template's own, or recomposed (a common ratio: reuseCompose.ts). */
+  const frameOf = (ctx: Context, d: ReuseDraft, ratio: ReuseAspectRatio): { frame: ReuseFrame; plan?: Plan; ai?: ReuseComposePlan } => {
+    if (!isOfferAspectRatio(ratio)) return { frame: planFrame(ctx.snapshot.canvas, ratio, ctx.decorations, ctx.avoid) };
+    const { plan, ai } = planOf(ctx, d, ratio);
+    return { plan, ai, frame: { ratio, source: ctx.snapshot.canvas, canvas: plan.canvas, method: 'recompose', scale: plan.art.scale, x0: 0, pad: 0, strip: 0, stripRight: 0, excluded: plan.excluded,
+      filledPercent: extensionPercent(ctx.structure, plan), place: { x: plan.art.x, y: plan.art.y, top: ctx.structure.art.top } } };
+  };
+  const layoutWords = (plan: Plan, percent: number) => `${plan.layout === 'stacked' ? 'Header, artwork and footer re-spaced for this size' : `The scene on the ${plan.layout === 'split-left' ? 'left' : 'right'}, the offer details in a column beside it`}${percent >= 1 ? ` · ${percent} % of the background continued` : ''}.`;
+
   // --- Drafts -----------------------------------------------------------------------------------------------------------
   const list = (id: string) => {
     deps.requireProduct(id);
@@ -281,7 +318,7 @@ export function createReuseStudio(deps: {
         ratios: d.ratios, saved: Object.values(d.outputs).filter(o => o?.creativeId).length, preview: d.outputs[d.ratios[0]]?.preview })).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   };
   /** A new draft of the revision; `simple` (Upload Products → Generate My Creative): the template's own products start left out. */
-  const create = (id: string, input: { revision?: unknown; name?: unknown; simple?: unknown }) => locked(`${id}:reuse`, async () => {
+  const create = (id: string, input: { revision?: unknown; name?: unknown; simple?: unknown; ratios?: unknown }) => locked(`${id}:reuse`, async () => {
     deps.requireProduct(id);
     const revision = typeof input.revision === 'number' ? input.revision : deps.latestRevision(id) ?? fail('NOT_READY', 'Save the template first.');
     const { snapshot, template } = await contextOf(id, revision);
@@ -291,7 +328,7 @@ export function createReuseStudio(deps: {
       category: reuseCategory(o.label), included: o.kind === 'character' || input.simple !== true, hidden: false, removed: false, order, asset: { kind: 'template', file: o.asset.file }, original: { file: o.asset.file, label: o.label } }));
     const at = nowIso(), did = `pr-${hex(4)}`;
     return write(id, { schemaVersion: 1, id: did, templateId: id, templateRevision: snapshot.revision, name: typeof input.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 120) : `${snapshot.name} · reuse`,
-      createdAt: at, updatedAt: at, revision: 1, items, texts: {}, logos: {}, ratios: ['original'], placement: { mode: input.simple === true ? 'geometry' : 'original', keepStands: true, hero: null, variant: 0 }, ...(input.simple === true ? { simple: true } : {}),
+      createdAt: at, updatedAt: at, revision: 1, items, texts: {}, logos: {}, ratios: Array.isArray(input.ratios) && input.ratios.some(isRatio) ? REUSE_ASPECT_RATIOS.filter(r => (input.ratios as unknown[]).includes(r)) : ['original'], placement: { mode: input.simple === true ? 'geometry' : 'original', keepStands: true, hero: null, variant: 0 }, ...(input.simple === true ? { simple: true } : {}),
       ai: { requests: 0, costUsd: 0, plans: {}, failures: [] }, overrides: {}, outputs: {} });
   });
   /** A draft with what the studio shows beside it: the template's text groups and logos, formats and source issues. */
@@ -302,7 +339,12 @@ export function createReuseStudio(deps: {
       // (A decoration's own lettering — a badge — is its artwork, not offered for editing here.)
       texts: t.groups.filter(g => !t.texts.filter(x => x.groupId === g.id).every(x => x.hidden)).map(g => { const w = t.texts.find(x => x.groupId === g.id); return { groupId: g.id, label: g.label, category: g.category, text: textOf(g.id), style: w?.style }; }).filter(g => g.text.trim()),
       logos: t.images.map(i => ({ id: i.id, label: i.label, category: i.category, file: i.asset.file })),
-      formats: REUSE_ASPECT_RATIOS.map(r => { const f = planFrame(ctx.snapshot.canvas, r, ctx.decorations, ctx.avoid); return { ratio: r, label: REUSE_ASPECT_LABELS[r], canvas: f.canvas, method: f.method, note: f.note }; }),
+      // The offered formats, and a legacy one this draft still has (3:9, 4:9: shown so it can be kept or removed).
+      formats: [...REUSE_OFFERED_RATIOS, ...d.ratios.filter(r => !(REUSE_OFFERED_RATIOS as readonly string[]).includes(r))].map(r => {
+        if (isOfferAspectRatio(r)) { const { plan, ai } = planOf(ctx, d, r), percent = extensionPercent(ctx.structure, plan); return { ratio: r, label: REUSE_ASPECT_LABELS[r], canvas: plan.canvas, method: 'recompose' as const, composed: ai ? 'ai' as const : 'rules' as const, note: layoutWords(plan, percent) }; }
+        const f = planFrame(ctx.snapshot.canvas, r, ctx.decorations, ctx.avoid); return { ratio: r, label: REUSE_ASPECT_LABELS[r], canvas: f.canvas, method: f.method, note: f.note };
+      }),
+      composition: (() => { const p = deps.composer?.(); return { ai: !!p, model: p?.model ?? '', offline: p?.offline ?? true, extend: !!p?.editor, planCostUsd: COMPOSE_PLAN_COST_USD, extendCostUsd: EXTEND_COST_USD }; })(),
       // `slots`: the template's own product places; as many products as that (or fewer) stand in them, never arranged anew.
       placement: (() => { const p = deps.placement?.(); return { ai: !!p, model: p?.model ?? '', offline: p?.offline ?? true, costUsd: PLACEMENT_COST_USD, slots: productPlaces(ctx.snapshot).length }; })(), knownCategories: KNOWN_KINDS };
   }
@@ -453,7 +495,7 @@ export function createReuseStudio(deps: {
   }
   /** One format of a draft composed (free, on this computer). `withoutProducts`: the stage empty (the AI planner's picture). */
   async function compose(id: string, d: ReuseDraft, ratio: ReuseAspectRatio, opts: { geometryOnly?: boolean; withoutProducts?: boolean } = {}): Promise<Composed> {
-    const ctx = await contextOf(id, d.templateRevision), { snapshot } = ctx, frame = planFrame(snapshot.canvas, ratio, ctx.decorations, ctx.avoid), notes: string[] = [];
+    const ctx = await contextOf(id, d.templateRevision), { snapshot } = ctx, framed = frameOf(ctx, d, ratio), frame = framed.frame, notes: string[] = [];
     let c = edited(ctx, d);
     const items = [...d.items].sort((a, b) => a.order - b.order), products = items.filter(i => i.kind === 'product' && i.included && !i.removed);
     const added = products.some(i => !i.objectId);
@@ -463,7 +505,13 @@ export function createReuseStudio(deps: {
     // Slot-anchored replacement first: in the template's own format, when every product has a place of the template's
     // own products, each stands in it (whatever the placement mode); neither the arrangement by rule nor an AI plan
     // moves it. (Other formats reframe the artwork — characters and text move in — so their products are arranged.)
-    const anchors = opts.geometryOnly || ratio !== 'original' ? undefined : slotAnchors(snapshot, products, d.placement.hero);
+    // A recomposed common ratio moves the artwork as one (one scale), so the template's product places move with it: products
+    // that fit them stand in them there too — unless the format's canvas cuts a place (then they are arranged anew).
+    let anchors = opts.geometryOnly || !(ratio === 'original' || framed.plan) ? undefined : slotAnchors(snapshot, products, d.placement.hero);
+    if (anchors && framed.plan) for (const a of anchors.values()) {
+      const place = a.slot?.box ?? snapshot.objects.find(o => o.id === a.objectId)?.box, b = place && mapBox(frame, place);
+      if (b && (b.x < -1 || b.y < -1 || b.x + b.width > frame.canvas.width + 1 || b.y + b.height > frame.canvas.height + 1)) { anchors = undefined; break; }
+    }
     if (anchors) {
       const taking = products.filter(i => !i.objectId).length;
       if (taking) notes.push(`${taking === 1 ? 'Your product stands' : `Your ${taking} products stand`} in the template’s own product ${taking === 1 ? 'place' : 'places'}: centred on ${taking === 1 ? 'it' : 'them'}, on the same base line, at most as large as the original.`);
@@ -512,11 +560,13 @@ export function createReuseStudio(deps: {
     // Each text group's own area in the template (where its copy may sit), and how its lines were aligned there.
     const areas = new Map(ctx.template.groups.map(g => [g.id, groupBounds(ctx.template, g.id)] as const).filter((x): x is readonly [string, Box] => !!x[1]).map(([gid, box]) => [gid, { box, align: (d.texts[gid]?.align ?? (inferAlign(ctx.template, gid, fontMeasure) === 'left' ? 'left' : 'center')) as 'left' | 'center' }]));
     const dropped: string[] = [];
-    c = reanchor(mapCreative(c, frame), frame, ctx.art, ctx.decorations, areas, dropped);
+    // A common ratio: every element that left the artwork placed in its box (logos, text, plates), the rest moved with it.
+    if (framed.plan) { const applied = await applyPlan(filesOf(id), mapCreative(c, frame), ctx.structure, framed.plan); c = applied.creative; notes.push(...applied.notes, ...(framed.ai?.notes ?? [])); }
+    else c = reanchor(mapCreative(c, frame), frame, ctx.art, ctx.decorations, areas, dropped);
     if (dropped.length) notes.push(`Not shown in this format (outside its part of the artwork): ${[...new Set(dropped)].join(', ')}.`);
     const W = frame.canvas.width, H = frame.canvas.height, s = frame.scale;
     // The stage in this format, the room the products have and what they must not cover.
-    const stage = { cx: mapX(frame, ctx.stage.cx), cy: ctx.stage.cy * s, a: ctx.stage.a * s, b: ctx.stage.b * s }, m = W * 0.03;
+    const stage = { cx: mapX(frame, ctx.stage.cx), cy: mapY(frame, ctx.stage.cy), a: ctx.stage.a * s, b: ctx.stage.b * s }, m = W * 0.03;
     const lane = { x0: Math.max(m, stage.cx - stage.a * 0.98), x1: Math.min(W - m, stage.cx + stage.a * 0.98) };
     const character = c.objects.filter(o => o.kind === 'character' && !o.hidden).map(o => o.box)[0];
     if (character && character.x < lane.x1 && character.x + character.width > lane.x0 && character.y + character.height > stage.cy - stage.b) {
@@ -577,8 +627,8 @@ export function createReuseStudio(deps: {
     // Products arranged anew stand on the empty stage (the template's painted stands rebuilt away), when that was reliable.
     // Else the base, with the footprints of the template's products that do not stand in their own places cleaned
     // (left out, hidden, replaced by a photo, their place taken by the person's product, moved, or arranged anew).
-    const own = (o: ProductCreativeObject) => { const t = ctx.template.objects.find(x => x.objectId === o.objectId && x.kind === 'product'); return !!t && o.asset.kind === 'template' && o.asset.file === t.asset.file && ['x', 'y', 'width', 'height'].every(k => Math.abs(o.box[k as keyof Box] - t.box[k as keyof Box]) <= 1); };
-    const standing = new Set(mode === 'original' && frame.method === 'template' ? c.objects.filter(o => o.kind === 'product' && !o.hidden && o.objectId && own(o)).map(o => o.objectId!) : []);
+    const own = (o: ProductCreativeObject) => { const t = ctx.template.objects.find(x => x.objectId === o.objectId && x.kind === 'product'), tb = t && (frame.method === 'recompose' ? mapBox(frame, t.box) : t.box); return !!t && !!tb && o.asset.kind === 'template' && o.asset.file === t.asset.file && ['x', 'y', 'width', 'height'].every(k => Math.abs(o.box[k as keyof Box] - tb[k as keyof Box]) <= 1); };
+    const standing = new Set(mode === 'original' && (frame.method === 'template' || frame.method === 'recompose') ? c.objects.filter(o => o.kind === 'product' && !o.hidden && o.objectId && own(o)).map(o => o.objectId!) : []);
     const ground = mode !== 'original' && ctx.grounds.empty ? ctx.grounds.empty : await cleanedGround(id, ctx, d.templateRevision, snapshot.objects.filter(o => o.kind === 'product' && !standing.has(o.id)));
     // Copy left as it is keeps the template's own lettering (a layer of its own, where its words are, scaled with them);
     // its editable words stay in the creative, hidden. Changed copy is set as live text.
@@ -599,7 +649,17 @@ export function createReuseStudio(deps: {
     }
     // The format's background: the ground as it is, or made from it (sliced / mirrored sides; cached per revision and format).
     const cleaned = ground === ctx.grounds.empty ? { stageCleaned: true } : {};
-    if (frame.method !== 'template') {
+    if (framed.plan) {
+      // Recomposed: band colours, the artwork block at its scale, and its continuation (the approved AI edit, else local).
+      const ext = framed.ai?.extension && 'file' in framed.ai.extension && store.has(id, framed.ai.extension.file) ? framed.ai.extension : undefined, percent = frame.filledPercent;
+      const file = `prb-${d.templateRevision}-${ratioKey(ratio)}-${sha256(Buffer.from(JSON.stringify([ground.file, framed.plan.canvas, framed.plan.art, framed.plan.layout, ext?.sha256 ?? null, RECOMPOSE_VERSION]))).slice(0, 12)}.png`;
+      if (!store.has(id, file)) store.write(id, file, (await composeBackground(ground.png, ctx.structure, framed.plan, ext ? store.read(id, ext.file) : undefined)).png);
+      if (percent >= 1) frame.note = ext ? `${percent} % of the canvas continues the template's artwork beyond its edges (approved AI edit of only that area; no text, logo or product was sent or redrawn).`
+        : `${percent} % of the canvas continues the template's own edge artwork softly (made on this computer): check it, or compose this size with AI.`;
+      c = { ...c, background: { file, sha256: sha256(store.read(id, file)), width: W, height: H, method: 'recompose', restyled: false, filledPercent: percent, ...cleaned,
+        extension: { method: ext ? 'ai' : 'local', percent, ...(ext ? { model: ext.model, operationId: ext.operationId } : {}) } } };
+      delete c.backgroundSource;
+    } else if (frame.method !== 'template') {
       const file = `prb-${d.templateRevision}-${ratioKey(ratio)}-${sha256(Buffer.from(JSON.stringify([ground.file, frame]))).slice(0, 12)}.png`;
       if (!store.has(id, file)) store.write(id, file, await frameBackground(ground.png, frame));
       c = { ...c, background: { file, sha256: sha256(store.read(id, file)), width: W, height: H, method: frame.method, restyled: false, filledPercent: frame.filledPercent, ...cleaned } };
@@ -609,7 +669,11 @@ export function createReuseStudio(deps: {
       delete c.backgroundSource;
     }
     const placement = { input, boxes, notes, rejected, places: Object.fromEntries(Object.entries(places).map(([pid, b]) => [pid, mapBox(frame, b)])) };
-    return { creative: c, frame, mode, placement, checks: checksOf(id, ctx, c, frame, mode, placement, products.length > 0), anchored: !!anchors };
+    const checks = checksOf(id, ctx, c, frame, mode, placement, products.length > 0), validation = validationOf(ctx, d, c, ratio, checks);
+    // A recomposed format must show every kept element whole and unchanged at its exact size before it can be saved.
+    if (framed.plan) for (const message of [...(validation.size.ok ? [] : [validation.size.message]), ...validation.protected.issues]) checks.issues.unshift({ code: 'MISSING_ASSET', message, blocking: true });
+    if (checks.issues.some(i => i.blocking)) checks.status = 'failed';
+    return { creative: c, frame, mode, placement, checks, anchored: !!anchors, validation, ...(framed.plan ? { composition: { source: framed.ai ? 'ai' as const : 'rules' as const, layout: framed.ai?.summary ?? layoutWords(framed.plan, frame.filledPercent) } } : {}) };
   }
   /** What to look at before using a format: blocking problems first. */
   function checksOf(id: string, ctx: Context, c: ProductCreative, frame: ReuseFrame, mode: ReusePlacementMode, placement: Composed['placement'], hadProducts: boolean): Composed['checks'] {
@@ -619,6 +683,7 @@ export function createReuseStudio(deps: {
     for (const o of visible) if (!store.has(id, o.asset.file)) issues.push({ code: 'MISSING_ASSET', message: `${o.label}: its picture is missing.`, blocking: true });
     for (const o of visible) if (area(o.box) - inter(o.box, canvasBox) > area(o.box) * 0.03) issues.push({ code: 'OUT_OF_CANVAS', message: `${o.label} is partly outside the canvas.`, blocking: o.kind === 'product' });
     for (const g of c.groups) { const b = groupBounds(c, g.id); if (b && area(b) - inter(b, canvasBox) > area(b) * 0.02) issues.push({ code: 'OUT_OF_CANVAS', message: `The text “${g.label.slice(0, 40)}” runs off the canvas.`, blocking: true }); }
+    for (const i of c.images.filter(x => !x.hidden)) if (area(i.box) - inter(i.box, canvasBox) > area(i.box) * 0.02) issues.push({ code: 'OUT_OF_CANVAS', message: `${i.label} is cut by the canvas.`, blocking: true });
     const products = visible.filter(o => o.kind === 'product');
     // (A product in a template product's place may cover what that product covered: only more than that counts.)
     for (const p of products) for (const k of placement.input.keepOut) { const was = placement.places?.[p.id]; if (inter(p.box, k) - (was ? inter(was, k) : 0) > area(k) * 0.08) issues.push({ code: 'OVERLAP', message: `${p.label} covers ${k.label}.`, blocking: true }); }
@@ -638,10 +703,47 @@ export function createReuseStudio(deps: {
     for (const n of placement.notes.filter(x => !x.startsWith('AI:'))) issues.push({ code: 'STAGE', message: n, blocking: false });
     return { status: issues.some(i => i.blocking) ? 'failed' : issues.length ? 'needs-review' : 'ready', issues: issues.slice(0, 40) };
   }
+  /**
+   * What is verified before a format is saved: its exact size; every logo, text group and product the person kept shown,
+   * whole and unchanged (its own picture, its exact words); readability and clipping (from the checks; generate adds the
+   * contrast measured on the finished poster).
+   */
+  function validationOf(ctx: Context, d: ReuseDraft, c: ProductCreative, ratio: ReuseAspectRatio, checks: Composed['checks']): ReuseValidation {
+    const W = c.canvas.width, H = c.canvas.height, canvasBox = { x: 0, y: 0, width: W, height: H }, whole = (b: Box) => inter(b, canvasBox) >= area(b) * 0.98;
+    const [rw, rh] = isOfferAspectRatio(ratio) || ratio === '3:9' || ratio === '4:9' ? ratio.split(':').map(Number) : [ctx.snapshot.canvas.width, ctx.snapshot.canvas.height];
+    const exact = ratio === 'original' ? W === ctx.snapshot.canvas.width && H === ctx.snapshot.canvas.height : isOfferAspectRatio(ratio) ? W * rh === H * rw : true;
+    const label = REUSE_ASPECT_LABELS[ratio], issues: string[] = [], norm = (t: string) => t.replace(/\s+/g, ' ').trim();
+    const logos = ctx.template.images.filter(i => !d.logos[i.id]?.hidden);
+    for (const l of logos) {
+      const i = c.images.find(x => x.id === l.id);
+      if (!i || i.hidden) issues.push(`${l.label} is not shown.`);
+      else if (!whole(i.box)) issues.push(`${l.label} is cut by the canvas.`);
+      else if (i.asset.file !== (d.logos[l.id]?.asset?.file ?? l.asset.file)) issues.push(`${l.label} is not its own picture.`);
+    }
+    const groups = ctx.template.groups.filter(g => !d.texts[g.id]?.hidden && ctx.template.texts.some(t => t.groupId === g.id && !t.hidden && t.text.trim()));
+    for (const g of groups) {
+      const typed = d.texts[g.id]?.text, expected = norm(typed?.trim() ? typed : copyOf(ctx.template, g.id));
+      if (norm(copyOf(c, g.id)) !== expected) issues.push(`The text “${g.label.slice(0, 40)}” is not its exact words.`);
+      if (!c.texts.some(t => t.groupId === g.id && !t.hidden && t.text.trim()) && !c.objects.some(o => o.id === letteringId(g.id) && !o.hidden)) issues.push(`The text “${g.label.slice(0, 40)}” is not shown.`);
+    }
+    const products = d.items.filter(i => i.kind === 'product' && i.included && !i.removed && !i.hidden);
+    for (const p of products) {
+      const o = c.objects.find(x => x.id === p.id);
+      if (!o || o.hidden) issues.push(`${p.label} is not shown.`);
+      else if (o.asset.file !== p.asset.file) issues.push(`${p.label} is not its own picture.`);
+    }
+    const of = (codes: string[]) => checks.issues.filter(i => codes.includes(i.code)).map(i => i.message);
+    return {
+      size: { ok: exact, width: W, height: H, ratio: ratio === 'original' ? `${W}:${H}` : ratio, message: exact ? `${W} × ${H} px — ${ratio === 'original' ? 'the template\'s own size' : `exactly ${label.replace(/^\S+ /, '')}`}.` : `${W} × ${H} px is not exactly ${label}.` },
+      protected: { ok: !issues.length, logos: logos.length, texts: groups.length, products: products.length, issues },
+      readability: { ok: !of(['FONT', 'LOW_CONTRAST']).length, issues: of(['FONT', 'LOW_CONTRAST']) },
+      clipping: { ok: !of(['OUT_OF_CANVAS']).length, issues: of(['OUT_OF_CANVAS']) },
+    };
+  }
   /** The live preview of one format: the composed creative (its files are the template's), drawn by the client. */
   async function preview(id: string, did: string, ratio: unknown) {
     const d = read(id, did), r = isRatio(ratio) ? ratio : d.ratios[0], out = await compose(id, d, r);
-    return { ratio: r, creative: out.creative, mode: out.mode, frame: { method: out.frame.method, canvas: out.frame.canvas, note: out.frame.note, excluded: out.frame.excluded }, checks: out.checks, notes: out.placement.notes };
+    return { ratio: r, creative: out.creative, mode: out.mode, frame: { method: out.frame.method, canvas: out.frame.canvas, note: out.frame.note, excluded: out.frame.excluded }, checks: out.checks, notes: out.placement.notes, validation: out.validation, ...(out.composition ? { composition: out.composition } : {}) };
   }
   /** Every chosen format drawn as one complete poster, with its checks. */
   const generate = (id: string, did: string, input: { ratios?: unknown }) => locked(`${id}:reuse:${did}`, async () => {
@@ -651,9 +753,15 @@ export function createReuseStudio(deps: {
     for (const r of ratios) {
       const out = await compose(id, d, r), png = await renderProductCreative(f => store.read(id, f), ctx.snapshot, out.creative, 1200), hash = sha256(png), file = `prp-${did.slice(3)}-${ratioKey(r)}-${hash.slice(0, 12)}.png`;
       if (!store.has(id, file)) store.write(id, file, png);
+      // Readability measured on the finished poster: text against what is really behind it (plates and panels included).
+      const contrast = await contrastIssues(png, out.creative);
+      for (const message of contrast) out.checks.issues.push({ code: 'LOW_CONTRAST', message, blocking: false });
+      if (contrast.length && out.checks.status === 'ready') out.checks.status = 'needs-review';
+      const validation = { ...out.validation, readability: { ok: out.validation.readability.ok && !contrast.length, issues: [...out.validation.readability.issues, ...contrast] } };
       const prev = d.outputs[r];
       outputs[r] = { ratio: r, generatedAt: nowIso(), draftRevision: d.revision, preview: file, previewSha256: hash, canvas: out.creative.canvas, placement: out.mode,
-        background: { method: out.creative.background?.method ?? 'template', filledPercent: out.frame.filledPercent, ...(out.frame.note && out.frame.method !== 'template' ? { note: out.frame.note } : {}) }, checks: out.checks,
+        background: { method: out.creative.background?.method ?? 'template', filledPercent: out.frame.filledPercent, ...(out.frame.note && out.frame.method !== 'template' ? { note: out.frame.note } : {}), ...(out.creative.background?.extension ? { extension: out.creative.background.extension } : {}) }, checks: out.checks,
+        validation, ...(out.composition ? { composition: out.composition } : {}),
         ...(prev?.creativeId ? { creativeId: prev.creativeId, creativeRevision: prev.creativeRevision, savedAt: prev.savedAt, savedDraftRevision: prev.savedDraftRevision } : {}),
         ...(prev?.decomposition ? { decomposition: prev.decomposition } : {}) } as ReuseOutput;
     }
@@ -697,6 +805,54 @@ export function createReuseStudio(deps: {
     if (Object.keys(next.ai.plans).length) next.placement.mode = 'ai';
     // The formats AI arranged just now start without the old manual product corrections.
     next.overrides = dropProductFixes(next, next.overrides, ratios.filter(r => next.ai.plans[r]?.operationId !== d.ai.plans[r]?.operationId));
+    return write(id, { ...next, revision: d.revision + 1, updatedAt: nowIso() });
+  });
+  /**
+   * Recompose with AI, per common-ratio format of the draft (one approval for all): one layout request (the template's
+   * picture, its structure and the rules' proposal; every box checked, refused ones laid out by the rules) and, where the
+   * plan leaves canvas the template's artwork does not cover, one masked background edit of only that area (the
+   * product-, logo- and text-free ground; read back for lettering). Never retried; a failure keeps the rules' layout.
+   */
+  const composeWithAi = (id: string, did: string, input: { ratios?: unknown; approveUsd?: unknown; extend?: unknown }) => locked(`${id}:reuse:${did}`, async () => {
+    const d = read(id, did), composer = deps.composer?.() ?? fail('NOT_CONFIGURED', 'AI composition is not configured on this server (no OpenAI key). Each size is laid out on this computer instead (free).');
+    const asked = Array.isArray(input.ratios) && input.ratios.length ? d.ratios.filter(r => (input.ratios as unknown[]).includes(r)) : d.ratios, ratios = asked.filter(isOfferAspectRatio);
+    if (!ratios.length) fail('INVALID_REQUEST', 'Choose a size of this draft to compose with AI: Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9.');
+    const ctx = await contextOf(id, d.templateRevision), issues = sourceIssues(id, ctx.snapshot);
+    if (issues.length) fail('SOURCE_NOT_READY', `Repair the master template before any paid request: ${issues.join(' ')}`);
+    const editor = input.extend === false ? undefined : composer.editor, each = (composer.offline ? 0 : COMPOSE_PLAN_COST_USD) + (editor && !editor.offline ? EXTEND_COST_USD : 0);
+    const estimate = Math.round(ratios.length * each * 100) / 100, requests = ratios.length * (editor ? 2 : 1);
+    if (estimate && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= estimate)) fail('APPROVAL_REQUIRED', `Composing ${ratios.length} size(s) with AI sends up to ${requests} request(s) (${composer.model}${editor ? ` and ${editor.model}` : ''}), about $${estimate.toFixed(2)}. Approve the cost first.`, { estimateUsd: estimate, requests });
+    const next: ReuseDraft = structuredClone(d), composed: ReuseAspectRatio[] = [], cents = (v: number) => Math.round(v * 100) / 100;
+    next.compose ??= {};
+    const picture = await sharp(await renderProductCreative(f => store.read(id, f), ctx.snapshot, ctx.template, 768)).flatten({ background: '#ffffff' }).jpeg({ quality: 80 }).toBuffer();
+    for (const r of ratios) {
+      const rules = rulesOf(ctx, r), operationId = randomUUID(), save = (f: string, v: object) => store.write(id, `prd-${did.slice(3)}-${ratioKey(r)}-${operationId.slice(0, 8)}-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`, Buffer.from(JSON.stringify(v, null, 2)));
+      next.ai.requests += 1; next.ai.costUsd = cents(next.ai.costUsd + (composer.offline ? 0 : COMPOSE_PLAN_COST_USD));
+      let plan: ReuseComposePlan;
+      try {
+        const answer = await composer.plan(composeRequest(ctx.structure, rules), picture, save, operationId), checked = checkComposePlan(answer.raw, ctx.structure, rules);
+        const summary = (answer.raw as { layout?: unknown } | null)?.layout;
+        plan = { ratio: r, at: nowIso(), model: composer.model, offline: composer.offline, operationId, ...(answer.responseId ? { responseId: answer.responseId } : {}), layout: checked.layout,
+          ...(checked.source === 'ai' && typeof summary === 'string' && summary.trim() ? { summary: summary.trim().slice(0, 120) } : {}), canvas: checked.canvas, art: checked.art, boxes: checked.boxes, excluded: checked.excluded, notes: checked.notes, rejected: checked.rejected };
+      } catch (error) { next.ai.failures.push({ at: nowIso(), operationId, message: (error instanceof Error ? error.message : String(error)).slice(0, 300) }); break; }
+      const planned: Plan = { ratio: r, canvas: plan.canvas, layout: plan.layout as Plan['layout'], art: plan.art, boxes: plan.boxes, excluded: plan.excluded };
+      if (editor && extensionPercent(ctx.structure, planned) >= 0.5) {
+        const op = randomUUID();
+        next.ai.requests += 1; next.ai.costUsd = cents(next.ai.costUsd + (editor.offline ? 0 : EXTEND_COST_USD));
+        try {
+          const out = await extendWithAi(editor, (ctx.grounds.empty ?? ctx.grounds.base).png, ctx.structure, planned, deps.recognizer?.());
+          if ('refused' in out) plan.extension = { failed: out.refused, operationId: op };
+          else {
+            const png = await sharp(out.image).png().toBuffer(), hash = sha256(png), file = `prx-${did.slice(3)}-${ratioKey(r)}-${hash.slice(0, 12)}.png`;
+            if (!store.has(id, file)) store.write(id, file, png);
+            plan.extension = { file, sha256: hash, model: editor.model, offline: editor.offline, operationId: op, ...(out.requestId ? { requestId: out.requestId } : {}), percent: out.percent };
+          }
+        } catch (error) { const message = (error instanceof Error ? error.message : String(error)).slice(0, 300); plan.extension = { failed: message, operationId: op }; next.ai.failures.push({ at: nowIso(), operationId: op, message }); }
+      }
+      next.compose[r] = plan; composed.push(r);
+    }
+    // The sizes composed just now start without their old manual product corrections (the stage moved).
+    next.overrides = dropProductFixes(next, next.overrides, composed);
     return write(id, { ...next, revision: d.revision + 1, updatedAt: nowIso() });
   });
   /**
@@ -760,13 +916,14 @@ export function createReuseStudio(deps: {
     const ctx = await contextOf(id, d.templateRevision), inside = (b: Box, k: Box) => b.x >= k.x - 4 && b.y >= k.y - 4 && b.x + b.width <= k.x + k.width + 4 && b.y + b.height <= k.y + k.height + 4;
     const badge = new Set([...(creative.background?.stageCleaned ? ctx.grounds.empty ?? ctx.grounds.base : ctx.grounds.base).lettering].filter(([, cut]) => ctx.decorations.some(dec => inside(cut.box, dec.box))).map(([gid]) => gid));
     const snapshot = deps.snapshot(id, d.templateRevision), composition = await variationComposition(f => store.read(id, f), snapshot, await withShadowsJoined(id, withLiveText(creative, badge)));
-    const templateId = await deps.toTemplate({ templateId: id, revision: d.templateRevision, jobId: `reuse-${d.id}`, index: REUSE_ASPECT_RATIOS.indexOf(r), title: `${d.name} · ${REUSE_ASPECT_LABELS[r]}`, name: `${d.name} · ${REUSE_ASPECT_LABELS[r]}`, composition });
+    // The new master template records its format: reusing it later starts from it (its own canvas is that ratio).
+    const templateId = await deps.toTemplate({ templateId: id, revision: d.templateRevision, jobId: `reuse-${d.id}`, index: FORMAT_INDEX[r], title: `${d.name} · ${REUSE_ASPECT_LABELS[r]}`, name: `${d.name} · ${REUSE_ASPECT_LABELS[r]}`, composition, aspectRatio: r });
     // Recorded with the format (not a change of the draft: its revision stays, its preview stays current).
     const latest = read(id, did), out = latest.outputs[r];
     if (out) write(id, { ...latest, outputs: { ...latest.outputs, [r]: { ...out, decomposition: { templateId, creativeId: creative.id, creativeRevision: creative.revision, at: nowIso() } } } });
     return { templateId, creativeId: creative.id, reused: false };
   });
-  return { list, create, get, update, upload, preview, generate, placeWithAi, save, open, decompose, compose: (id: string, did: string, ratio: ReuseAspectRatio) => compose(id, read(id, did), ratio) };
+  return { list, create, get, update, upload, preview, generate, placeWithAi, composeWithAi, save, open, decompose, compose: (id: string, did: string, ratio: ReuseAspectRatio) => compose(id, read(id, did), ratio) };
 }
 export type ReuseStudio = ReturnType<typeof createReuseStudio>;
 

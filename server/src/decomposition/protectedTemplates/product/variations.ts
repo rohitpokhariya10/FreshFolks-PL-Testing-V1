@@ -612,7 +612,7 @@ export function createProductVariations(deps: { store: ProtectedStore; creatives
   /** New AI artwork (the image model; only with the person's approval of its cost) and the word reader that checks it for text. */
   artwork?: () => ArtworkGenerator | undefined; recognizer?: () => WordRecognizer; imageTimeoutMs?: number;
   /** A template of its own from a variation (service.createFromVariation). */
-  toTemplate?: (input: { templateId: string; revision: number; jobId: string; index: number; title: string; name: string; composition: VariationComposition }) => Promise<string> }) {
+  toTemplate?: (input: { templateId: string; revision: number; jobId: string; index: number; title: string; name: string; composition: VariationComposition; aspectRatio?: ProductAspectRatio }) => Promise<string> }) {
   const { store, locked } = deps;
   const jobFile = (jid: string) => `pvar-${jid.slice(3)}.json`, JOB_ID = /^pv-[a-f0-9]{8}$/;
   const readJob = (id: string, jid: string): VariationJob => { deps.requireProduct(id); if (!JOB_ID.test(jid) || !store.has(id, jobFile(jid))) fail('NOT_FOUND', 'Those variations were not found.'); return JSON.parse(store.read(id, jobFile(jid)).toString('utf8')) as VariationJob; };
@@ -1102,7 +1102,7 @@ export function createProductVariations(deps: { store: ProtectedStore; creatives
     if (r.templateId) { try { deps.requireProduct(r.templateId); return { templateId: r.templateId }; } catch { /* removed: made again */ } }
     const snapshot = deps.snapshot(id, job.revision), composition = await variationComposition(f => store.read(id, f), snapshot, r.creative!);
     const title = r.plan?.title ?? `Variation ${n + 1}`;
-    const templateId = await deps.toTemplate({ templateId: id, revision: job.revision, jobId: jid, index: n, title, name: `${snapshot.name} · ${title} · ${PRODUCT_ASPECT_LABELS[r.creative!.variation?.aspectRatio ?? 'original']}`, composition });
+    const templateId = await deps.toTemplate({ templateId: id, revision: job.revision, jobId: jid, index: n, title, name: `${snapshot.name} · ${title} · ${PRODUCT_ASPECT_LABELS[r.creative!.variation?.aspectRatio ?? 'original']}`, composition, aspectRatio: r.creative!.variation?.aspectRatio ?? 'original' });
     writeJob(id, { ...readJob(id, jid), results: readJob(id, jid).results.map(x => (x.index === n ? { ...x, templateId } : x)) });
     return { templateId };
   });

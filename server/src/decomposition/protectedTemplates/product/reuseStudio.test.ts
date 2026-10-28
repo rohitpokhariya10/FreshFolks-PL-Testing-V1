@@ -206,16 +206,18 @@ describe('Reuse Template studio (HTTP, temporary store, fake planner)', { timeou
       expect(d.placement.mode).toBe('geometry');
       for (const r of ['original', '3x9', '4x9', '16x9']) {
         const p = (await s.call<ReusePreview>(`/${id}/reuse/${d.id}/preview?ratio=${r}`)).body;
-        expect(p.creative.canvas).toEqual(reuseCanvasFor(canvas, p.ratio));
+        // 16:9 is a common ratio (recomposed: exactly 16:9); 3:9 and 4:9 keep their earlier (legacy) frames.
+        if (p.ratio === '16:9') expect(p.creative.canvas.width * 9).toBe(p.creative.canvas.height * 16); else expect(p.creative.canvas).toEqual(reuseCanvasFor(canvas, p.ratio));
         expect(p.creative.objects.filter(o => o.kind === 'product').map(o => o.id).sort()).toEqual([products[0].id, added.id].sort());
         for (const o of p.creative.objects.filter(x => x.kind === 'product')) expect(inter(o.box, { x: 0, y: 0, ...p.creative.canvas })).toBeCloseTo(o.box.width * o.box.height, -2);
         expect(p.checks.status).not.toBe('failed');
       }
-      // AI placement: the cost must be approved; one request per format; never retried. In the template's own format the
-      // dishwasher takes the removed product's place (slot-anchored), so that format is not sent.
+      // AI placement: the cost must be approved; one request per format; never retried. In the template's own format (and a
+      // recomposed common ratio) the dishwasher takes the removed product's place (slot-anchored), so those are not sent.
       expect((await s.send('POST', `/${id}/reuse/${d.id}/placement`, {})).status).toBe(400); expect(calls).toEqual([]);
       d = (await s.send<ReuseDraft>('POST', `/${id}/reuse/${d.id}/placement`, { approveUsd: 0.32 })).body;
-      expect(calls).toEqual(['3:9', '4:9', '16:9']); expect(d.placement.mode).toBe('ai'); expect(d.ai).toMatchObject({ requests: 3, costUsd: 0.24 });
+      // (16:9 is recomposed with the artwork moved as one: the dishwasher stands in the removed product's mapped place there too.)
+      expect(calls).toEqual(['3:9', '4:9']); expect(d.placement.mode).toBe('ai'); expect(d.ai).toMatchObject({ requests: 2, costUsd: 0.16 });
       // Text: the person's own headline, set where the template's was.
       const headline = (await s.call<{ texts: { groupId: string; category: string }[] }>(`/${id}/reuse/${d.id}`)).body.texts.find(t => t.category === 'headline');
       if (headline) d = (await s.send<ReuseDraft>('PUT', `/${id}/reuse/${d.id}`, { expectedRevision: d.revision, texts: { [headline.groupId]: { text: 'Golden days call for golden deals' } } })).body;

@@ -15,6 +15,7 @@ import sharp from 'sharp';
 import {
   decomposesObject, estimateAdvance, isMasterCategory, isOverlayKind, normalizeBox, orderProductObjects, PRODUCT_ELEMENT_KINDS, PRODUCT_LIMITS, PRODUCT_OBJECT_KINDS, PRODUCT_PREPARE_VERSION, PRODUCT_SCHEMA_VERSION, PROTECTED_SCHEMA_VERSION, withHistory,
   type DetectedWord, type LogoSlot, type MasterCategory, type PixelRect, type ProductHistoryEntry, type ProductInfo, type ProductObject, type ProductObjectKind, type ProductPrepared, type ProductSnapshot, type ProductGenerationBrief, type ProductStage, type ProtectedTemplate, type SourceBox,
+  type ReuseAspectRatio,
 } from '@frameflow/shared';
 import { RunError } from '../../layerizeExperiment.js';
 import { decodeRgba, ingestImage, ProtectedImageError, sha256 } from '../pixels.js';
@@ -37,6 +38,7 @@ import { compositionAnalyzer, variationClean, type VariationComposition } from '
 import { paletteOf } from './artwork.js';
 import { createReuseStudio } from './reuseStudio.js';
 import type { ReusePlacementPlanner } from './reusePlacement.js';
+import type { ReuseComposer } from './reuseCompose.js';
 import { measureWord } from '../../../textRecognition/measure.js';
 
 const nowIso = () => new Date().toISOString();
@@ -82,6 +84,8 @@ export interface ProductTemplateOptions {
   artwork?: () => ArtworkGenerator | undefined;
   /** Reuse Template: the AI product placement planner (one request per format, only with approval of its cost). */
   placement?: () => ReusePlacementPlanner | undefined;
+  /** Reuse Template: AI composition of a common-ratio format (layout planner and background continuation; only with approval of their cost). */
+  composer?: () => ReuseComposer | undefined;
 }
 /** One element of the review as the client sends it (the whole state each time). */
 export interface ReviewInput {
@@ -201,14 +205,14 @@ export function createProductTemplates(options: ProductTemplateOptions) {
    * "Decompose & Edit" of a generated variation: a template of its own (product/variationTemplate.ts), detected from its
    * composition (free), then reviewed, chosen, decomposed, inspected and saved like an upload. Returns its id.
    */
-  async function createFromVariation(input: { templateId: string; revision: number; jobId: string; index: number; title: string; name: string; composition: VariationComposition }) {
+  async function createFromVariation(input: { templateId: string; revision: number; jobId: string; index: number; title: string; name: string; composition: VariationComposition; aspectRatio?: ReuseAspectRatio }) {
     const c = input.composition, meta = await sharp(c.png).metadata(), hash = sha256(c.png), now = nowIso(), id = newProtectedTemplateId();
     const files: Record<string, Buffer> = { 'source.png': c.png, 'variation-background.png': c.background, 'variation-clean.png': await variationClean(c, { width: meta.width!, height: meta.height! }),
       'variation-answer.json': Buffer.from(JSON.stringify(c.answer)), 'variation-words.json': Buffer.from(JSON.stringify(c.words)) };
     const layers = c.layers.map((l, k) => { const file = `variation-layer-${String(k).padStart(2, '0')}.png`; files[file] = l.png; return { label: l.label, kind: l.kind, box: { ...l.box }, file }; });
     const plates = c.plates.map((p, k) => { const file = `variation-plate-${String(k).padStart(2, '0')}.png`; files[file] = p.png; return { box: { ...p.box }, file }; });
     const product: ProductInfo = { version: PRODUCT_SCHEMA_VERSION, type: 'product-text', objects: [], objectsRevision: 0, revisions: [], activity: { scans: 0, aiCalls: 0, segmentRequests: 0, costUsd: 0 },
-      variation: { decompositionEngine: 'ai', templateId: input.templateId, revision: input.revision, jobId: input.jobId, index: input.index, title: input.title, background: 'variation-background.png', clean: 'variation-clean.png', cleanSha256: sha256(files['variation-clean.png']), layers, plates, answer: 'variation-answer.json', words: 'variation-words.json' },
+      variation: { decompositionEngine: 'ai', templateId: input.templateId, revision: input.revision, jobId: input.jobId, index: input.index, title: input.title, ...(input.aspectRatio ? { aspectRatio: input.aspectRatio } : {}), background: 'variation-background.png', clean: 'variation-clean.png', cleanSha256: sha256(files['variation-clean.png']), layers, plates, answer: 'variation-answer.json', words: 'variation-words.json' },
       history: [{ at: now, action: 'created', detail: `From the variation “${input.title}” of template ${input.templateId} (version ${input.revision}).` }] };
     store.create({ schemaVersion: PROTECTED_SCHEMA_VERSION, id, name: input.name.slice(0, PRODUCT_LIMITS.maxName), createdAt: now, updatedAt: now, revision: 1, coordinateSystem: 'source-pixels', elements: [], elementsRevision: 0, layerInstructions: '', runs: [],
       source: { file: 'source.png', inputFile: 'source.png', sha256: hash, mime: 'image/png', width: meta.width!, height: meta.height!, bytes: c.png.length, orientationNormalized: false, origin: { kind: 'upload', filename: `variation-${input.jobId}-${input.index}.png` } },
@@ -912,7 +916,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
   });
   const variations = createProductVariations({ store, creatives, requireProduct, snapshot, locked, toTemplate: input => createFromVariation(input), latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, planner: options.planner, artwork: options.artwork, recognizer: options.recognizer });
   // Reuse Template (separate from variations): the person's own product set, copy and formats.
-  const reuse = createReuseStudio({ store, creatives, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, placement: options.placement, toTemplate: input => createFromVariation(input) });
+  const reuse = createReuseStudio({ store, creatives, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, placement: options.placement, composer: options.composer, recognizer: options.recognizer, toTemplate: input => createFromVariation(input) });
 
   return { list, view, sheetOf, create, createFromVariation, startDetect, review, fitText, select, brief, editBrief, uploadReviewAsset, estimate, startPrepare, approve, publish, openEditor, saveEditorMaster, snapshot, creatives, variations, reuse, isDetecting: (id: string) => detecting.has(id), isPreparing: (id: string) => preparing.has(id), requireProduct, kinds: PRODUCT_ELEMENT_KINDS, isOverlayKind };
 }

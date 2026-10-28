@@ -1,7 +1,7 @@
 import { test, expect, type Page, type APIRequestContext } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import sharp from 'sharp';
-import { reuseCanvasFor, type ProductCreative, type ProjectDocument, type ReuseDraft } from '@frameflow/shared';
+import { exactRatioCanvas, type ProductCreative, type ProjectDocument, type ReuseDraft } from '@frameflow/shared';
 import type { ProductView, ReusePreview } from '../../client/src/features/productTemplates/api';
 
 const API = '/api/layerize-experiment/product-templates', OUT = 'test-results/reuse-studio', NAME = 'LG reuse studio proof';
@@ -55,7 +55,7 @@ test('Reuse Template: choose, replace, add and remove products, AI placement, 4 
   mkdirSync(OUT, { recursive: true });
   const id = await savedMaster(page, request);
   const masterBefore = await (await request.get(`${API}/${id}/revisions/1`)).text(), masterCanvas = JSON.parse(masterBefore).canvas as { width: number; height: number };
-  const wide = reuseCanvasFor(masterCanvas, '16:9');
+  const wide = exactRatioCanvas('16:9', Math.max(masterCanvas.width, masterCanvas.height));
   // 1–3. Product Templates → Reuse Template → the reviewed objects load (no new detection).
   let panel = await openReuse(page, id);
   // The simple flow opens first; the detailed studio is one click away.
@@ -94,9 +94,9 @@ test('Reuse Template: choose, replace, add and remove products, AI placement, 4 
   expect(original.creative.objects.filter(o => o.kind === 'product').map(o => o.id).sort()).toEqual(chosen);
   expect(original.creative.objects.some(o => /microwave/i.test(o.label))).toBe(false);
   expect(original.creative.objects.find(o => o.kind === 'character')!.asset.kind).toBe('template');
-  // Formats: 3:9, 4:9 and 16:9 as well as the original.
-  for (const f of ['Portrait 3:9', 'Portrait 4:9', 'Landscape 16:9']) await panel.getByRole('checkbox', { name: `Format ${f}` }).check();
-  await expect.poll(async () => (await draft()).ratios).toEqual(['original', '3:9', '4:9', '16:9']);
+  // Formats: the common ratios 4:5, 9:16 and 16:9 (each recomposed for its shape) as well as the original.
+  for (const f of ['Portrait 4:5', 'Story 9:16', 'Landscape 16:9']) await panel.getByRole('checkbox', { name: `Format ${f}` }).check();
+  await expect.poll(async () => (await draft()).ratios).toEqual(['original', '4:5', '9:16', '16:9']);
   // 11. AI Smart Placement with the mocked planner: one approval, one request per format, every box checked.
   await panel.getByRole('button', { name: 'Arrange with AI…' }).click();
   const confirm = panel.getByRole('group', { name: 'Confirm AI placement' });
@@ -105,7 +105,7 @@ test('Reuse Template: choose, replace, add and remove products, AI placement, 4 
   await confirm.getByRole('button', { name: 'Yes, spend $0.32' }).click();
   await expect(panel.getByRole('radio', { name: /AI Smart Placement/ })).toBeChecked({ timeout: 60000 });
   const calls = (await (await request.get('/__test__/placement-calls')).json()).calls as { format: string; products: string[]; imageBytes: number }[];
-  expect(calls.map(c => c.format)).toEqual(['original', '3:9', '4:9', '16:9']);
+  expect(calls.map(c => c.format)).toEqual(['original', '4:5', '9:16', '16:9']);
   expect(calls.every(c => c.products.slice().sort().join() === chosen.join() && c.imageBytes > 1000)).toBe(true);
   d = await draft();
   expect(d.placement.mode).toBe('ai'); expect(d.ai.requests).toBe(4); expect(d.ai.costUsd).toBeCloseTo(0.32, 6);
@@ -130,9 +130,9 @@ test('Reuse Template: choose, replace, add and remove products, AI placement, 4 
   // 14–17. Generate: four complete posters (background, Ganesh, decorations, chosen products, text, logos).
   await panel.getByRole('button', { name: 'Generate Reused Creative' }).click();
   const results = panel.getByRole('region', { name: 'Reused creatives' });
-  for (const f of ['Original size', 'Portrait 3:9', 'Portrait 4:9', 'Landscape 16:9']) await expect(results.getByRole('img', { name: `${f} creative` })).toBeVisible({ timeout: 120000 });
+  for (const f of ['Original size', 'Portrait 4:5', 'Story 9:16', 'Landscape 16:9']) await expect(results.getByRole('img', { name: `${f} creative` })).toBeVisible({ timeout: 120000 });
   d = await draft();
-  const sizes: Record<string, [number, number]> = { original: [4096, 4096], '3:9': [1365, 4096], '4:9': [1820, 4096], '16:9': [4096, 2304] };
+  const sizes: Record<string, [number, number]> = { original: [4096, 4096], '4:5': [3276, 4095], '9:16': [2304, 4096], '16:9': [4096, 2304] };
   for (const [ratio, o] of Object.entries(d.outputs)) {
     expect(o!.checks.status, `${ratio}: ${JSON.stringify(o!.checks.issues)}`).not.toBe('failed');
     const png = await (await request.get(`/api/layerize-experiment/protected-templates/${id}/files/${o!.preview}`)).body();
@@ -163,7 +163,7 @@ test('Reuse Template: choose, replace, add and remove products, AI placement, 4 
   await expect(panel.getByRole('list', { name: 'Product list' }).getByRole('listitem')).toHaveCount(8);
   await expect(panel.getByRole('region', { name: 'Removed products' })).toContainText(/microwave/i);
   await expect(panel.getByLabel('headline text')).toHaveValue('Golden days call for golden deals');
-  for (const f of ['Portrait 3:9', 'Portrait 4:9', 'Landscape 16:9']) await expect(panel.getByRole('checkbox', { name: `Format ${f}` })).toBeChecked();
+  for (const f of ['Portrait 4:5', 'Story 9:16', 'Landscape 16:9']) await expect(panel.getByRole('checkbox', { name: `Format ${f}` })).toBeChecked();
   await expect(panel.getByRole('radio', { name: /AI Smart Placement/ })).toBeChecked();
   const reopened = panel.getByRole('region', { name: 'Reused creatives' });
   await expect(reopened.getByText('Saved', { exact: true })).toHaveCount(4);

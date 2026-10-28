@@ -14,10 +14,10 @@
  * Every change is saved in the draft as it is made: a reload continues where the person left off.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ArrowLeft, Check, ChevronDown, Columns2, ImagePlus, LayoutGrid, Maximize2, Pencil, RefreshCw, Save, Sparkles, Star, Trash2, UploadCloud, X } from 'lucide-react';
-import { REUSE_ASPECT_RATIOS, type ReuseAspectRatio, type ReuseDraft } from '@frameflow/shared';
+import { ArrowLeft, Check, Columns2, ImagePlus, LayoutGrid, Maximize2, Pencil, RefreshCw, Save, Sparkles, Star, Trash2, UploadCloud, X } from 'lucide-react';
+import { isOfferAspectRatio, REUSE_ASPECT_LABELS, REUSE_OFFERED_RATIOS, type ReuseAspectRatio, type ReuseDraft, type ReuseValidation } from '@frameflow/shared';
 import { productApi, productFileUrl, type ProductView, type ReuseDraftChange, type ReuseStudioView } from './api';
-import { CreativeSteps } from './TemplateGallery';
+import { CreativeSteps, formatName } from './TemplateGallery';
 import { EditYourCreative } from './MakeEditable';
 
 const KIND_CHOICES = ['washing machine', 'refrigerator', 'television', 'dishwasher', 'microwave oven', 'air conditioner', 'coffee machine', 'cooker', 'air fryer', 'water purifier', 'mixer grinder', 'speaker', 'smart speaker', 'soundbar', 'phone', 'computer', 'tablet', 'headphones', 'kettle', 'vacuum cleaner', 'fan'];
@@ -36,6 +36,28 @@ const FRIENDLY: Record<string, string> = {
   BUSY: 'FrameFlow is still working on your creative. Please wait a moment and try again.',
   HTTP_ERROR: 'We couldn’t reach FrameFlow. Check your connection and try again.',
 };
+/**
+ * The creative's size, chosen before it is made (and again on every reuse): the template's own, or one of the common
+ * offer-creative ratios. Each is composed for its shape — never stretched — and saved with the creative.
+ */
+function SizePicker({ value, onChange, original, disabled }: { value: ReuseAspectRatio; onChange: (r: ReuseAspectRatio) => void; original?: { width: number; height: number }; disabled?: boolean }) {
+  const shape = (r: ReuseAspectRatio) => (r === 'original' ? (original ? `${original.width} / ${original.height}` : '1 / 1') : r.replace(':', ' / '));
+  return <div className="sr-formats" role="radiogroup" aria-label="Creative size">{REUSE_OFFERED_RATIOS.map(r => <button key={r} type="button" role="radio" aria-checked={value === r} className={`sr-format${value === r ? ' is-on' : ''}`} disabled={disabled} onClick={() => onChange(r)}>
+    <span className="sr-shape" style={{ aspectRatio: shape(r) }} aria-hidden="true" />{r === 'original' ? `Original${original ? ` · ${formatName(original.width, original.height)}` : ''}` : REUSE_ASPECT_LABELS[r]}</button>)}</div>;
+}
+/** What was verified before saving: the exact size, the protected elements, readability and clipping. */
+const count = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+function PreSaveChecks({ v }: { v?: ReuseValidation }) {
+  if (!v) return null;
+  const rows: [string, boolean, string][] = [
+    ['Size', v.size.ok, v.size.message],
+    ['Logos, text & products', v.protected.ok, v.protected.ok ? `${count(v.protected.logos, 'logo')}, ${count(v.protected.texts, 'text block')} and ${count(v.protected.products, 'product')} — all shown, exact and unchanged.` : v.protected.issues.join(' ')],
+    ['Readability', v.readability.ok, v.readability.ok ? 'Every text is large enough and stands out from what is behind it.' : v.readability.issues.join(' ')],
+    ['Edges', v.clipping.ok, v.clipping.ok ? 'Nothing is cut off by the edges.' : v.clipping.issues.join(' ')],
+  ];
+  return <ul className="sr-checks" aria-label="Checked before saving">{rows.map(([title, ok, text]) => <li key={title} className={ok ? 'is-ok' : 'is-warn'}>
+    <span className="sr-check-mark" aria-hidden="true">{ok ? <Check size={12} /> : '!'}</span><span><strong>{title}</strong> {text}</span></li>)}</ul>;
+}
 const friendly = (e: unknown) => ({ message: FRIENDLY[(e as { code?: string })?.code ?? ''] ?? 'Something went wrong. Please try again.', detail: e instanceof Error ? e.message : String(e) });
 type Pending = { key: string; name: string; url: string; file: File; error?: string };
 type Step = 'upload' | 'generating' | 'result';
@@ -47,8 +69,8 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
   const [template, setTemplate] = useState<ProductView>(), [view, setView] = useState<ReuseStudioView>(), [draft, setDraft] = useState<ReuseDraft>();
   const [pending, setPending] = useState<Pending[]>([]), [step, setStep] = useState<Step>('upload'), [saving, setSaving] = useState(false);
   const [progress, setProgress] = useState<{ stages: string[]; at: number }>({ stages: [], at: 0 });
-  const [error, setError] = useState<{ message: string; detail?: string }>(), [note, setNote] = useState(''), [askAi, setAskAi] = useState<'generate' | 'regenerate'>(), [regenMenu, setRegenMenu] = useState(false);
-  const [ratio, setRatio] = useState<ReuseAspectRatio>('original'), [moreSizes, setMoreSizes] = useState(false), [dragOver, setDragOver] = useState(false);
+  const [error, setError] = useState<{ message: string; detail?: string }>(), [note, setNote] = useState(''), [askAi, setAskAi] = useState<'generate' | 'regenerate' | 'compose'>(), [regenMenu, setRegenMenu] = useState(false);
+  const [ratio, setRatio] = useState<ReuseAspectRatio>('original'), [dragOver, setDragOver] = useState(false);
   const [full, setFull] = useState(false), [compare, setCompare] = useState(false), [removing, setRemoving] = useState<string>();
   const draftRef = useRef<ReuseDraft | undefined>(undefined), input = useRef<HTMLInputElement>(null);
   useEffect(() => { draftRef.current = draft; }, [draft]);
@@ -73,7 +95,8 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
   /** The draft, made on first use (its template products left out). */
   const ensure = async () => {
     if (draftRef.current) return draftRef.current;
-    const d = await productApi.createReuseDraft(templateId, { simple: true, name: `${template?.template.name ?? 'Creative'} · new products` });
+    // The size chosen before the first photo is part of the draft from the start.
+    const d = await productApi.createReuseDraft(templateId, { simple: true, name: `${template?.template.name ?? 'Creative'} · new products`, ratios: [ratio] });
     const v = await load(d.id); return v.draft;
   };
   /** A change saved to the draft (shown at once). */
@@ -113,22 +136,30 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
   const chosen = products.filter(i => i.included), hero = draft?.placement.hero ?? null;
   const output = draft?.outputs[ratio], fresh = !!output && output.draftRevision === draft?.revision;
   const plan = draft?.ai.plans[ratio], aiUsed = output?.placement === 'ai' && !!plan && !plan.notes.some(n => n.startsWith('Some AI positions'));
-  const ai = view?.placement, aiCost = ai && !ai.offline ? Math.round((draft?.ratios.length ?? 1) * ai.costUsd * 100) / 100 : 0;
+  const ai = view?.placement, composer = view?.composition;
+  // A common-ratio size not yet composed with AI: its layout and background can be (one approval with the arranging).
+  const composeRatios = (draft?.ratios ?? [ratio]).filter(r => isOfferAspectRatio(r) && !draft?.compose?.[r as keyof NonNullable<ReuseDraft['compose']>]);
+  const composeCost = composer?.ai && !composer.offline ? Math.round(composeRatios.length * (composer.planCostUsd + (composer.extend ? composer.extendCostUsd : 0)) * 100) / 100 : 0;
   const blocked = (view?.sourceIssues.length ?? 0) > 0;
-  /** Generate: each progress line is shown while its real request runs. */
-  const run = async (useAi: boolean, nextVariant?: number) => {
+  /** Generate: each progress line is shown while its real request runs. `compose`: the size's layout and background by AI first. */
+  const run = async (useAi: boolean, nextVariant?: number, compose = false) => {
     const d = draftRef.current; if (!d) return;
-    const stages = useAi ? ['Preparing your products', 'Planning the best arrangement', 'Creating your offer creative'] : ['Preparing your products', 'Arranging and creating your offer creative'];
+    const stages = [...(compose ? [`Designing the ${REUSE_ASPECT_LABELS[ratio]} layout`] : []), ...(useAi ? ['Preparing your products', 'Planning the best arrangement', 'Creating your offer creative'] : ['Preparing your products', 'Arranging and creating your offer creative'])];
     setAskAi(undefined); setRegenMenu(false); setError(undefined); setNote(''); setStep('generating'); setProgress({ stages, at: 0 });
     try {
       let current = await change({ placement: { mode: 'geometry', ...(nextVariant !== undefined ? { variant: nextVariant } : {}) } });
       if (!current) throw new Error('Could not prepare the draft.');
-      setProgress({ stages, at: 1 });
+      if (compose && composeRatios.length) {
+        try { current = await productApi.reuseCompose(templateId, current.id, { ratios: composeRatios, approveUsd: composeCost }); setDraft(current); draftRef.current = current; }
+        catch (e) { setNote(friendly(e).message === FRIENDLY.NOT_CONFIGURED ? 'AI composition isn’t available right now, so this size was composed automatically.' : 'AI couldn’t compose this size this time, so it was composed automatically. Nothing was retried.'); }
+        setProgress({ stages, at: 1 });
+      }
+      setProgress({ stages, at: compose ? 2 : 1 });
       if (useAi) {
         try { current = await productApi.reusePlaceWithAi(templateId, current.id, { approveUsd: aiCost }); setDraft(current); draftRef.current = current; }
         catch (e) { setNote(`${friendly(e).message === FRIENDLY.NOT_CONFIGURED ? FRIENDLY.NOT_CONFIGURED : 'AI couldn’t arrange your products this time, so they were arranged automatically.'}`); }
         if (current.ai.failures.length && current.placement.mode !== 'ai') setNote('AI couldn’t arrange your products this time, so they were arranged automatically. Nothing was retried or charged again.');
-        setProgress({ stages, at: 2 });
+        setProgress({ stages, at: compose ? 3 : 2 });
       }
       const done = await productApi.reuseGenerate(templateId, current.id);
       setDraft(done); draftRef.current = done; setRatio(r => (done.ratios.includes(r) ? r : done.ratios[0]));
@@ -137,8 +168,18 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
   };
   // Products that fit in the template's own product places stand in them (its own format): no arrangement to plan, so
   // no AI request.
-  const anchored = chosen.length > 0 && chosen.length <= (ai?.slots ?? 0) && !!draft?.ratios.every(r => r === 'original');
-  const generate = () => { if (anchored) void run(false); else if (ai?.ai && aiCost > 0) setAskAi('generate'); else void run(!!ai?.ai); };
+  // (A common ratio moves the template's artwork as one, so its product places move with it.)
+  const anchored = chosen.length > 0 && chosen.length <= (ai?.slots ?? 0) && !!draft?.ratios.every(r => r === 'original' || isOfferAspectRatio(r));
+  const placeAi = !anchored && !!ai?.ai, composeAi = !!composer?.ai && composeRatios.length > 0;
+  const aiCost = Math.round(((placeAi && ai && !ai.offline ? (draft?.ratios.length ?? 1) * ai.costUsd : 0) + (composeAi ? composeCost : 0)) * 100) / 100;
+  const generate = () => { if (!placeAi && !composeAi) void run(false); else if (aiCost > 0) setAskAi('generate'); else void run(placeAi, undefined, composeAi); };
+  /** The size, chosen before generating and changeable afterwards (saved with the draft; a new size is composed free at once). */
+  const pickSize = async (r: ReuseAspectRatio) => {
+    setRatio(r);
+    if (!draftRef.current) return;
+    const next = await change({ ratios: [r] }, d => ({ ...d, ratios: [r] }));
+    if (next && step === 'result') await refresh();
+  };
   /** The preview drawn again with every change kept (free: nothing is re-arranged, no AI request). */
   const refresh = async () => {
     const d = draftRef.current; if (!d) return;
@@ -146,6 +187,14 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
     setError(undefined); setStep('generating'); setProgress({ stages, at: 0 });
     try { const done = await productApi.reuseGenerate(templateId, d.id); setDraft(done); draftRef.current = done; setProgress({ stages, at: 1 }); setStep('result'); }
     catch (e) { setError(friendly(e)); setStep('result'); }
+  };
+  /** The current size's layout and background designed by AI (approved), keeping the products' arrangement; then drawn again. */
+  const composeNow = async () => {
+    const d = draftRef.current; if (!d) return;
+    setAskAi(undefined); setError(undefined); setNote(''); setStep('generating'); setProgress({ stages: [`Designing the ${REUSE_ASPECT_LABELS[ratio]} layout`, 'Updating your offer creative'], at: 0 });
+    try { const next = await productApi.reuseCompose(templateId, d.id, { ratios: [ratio], approveUsd: composeCost }); setDraft(next); draftRef.current = next; }
+    catch (e) { setNote(friendly(e).message === FRIENDLY.NOT_CONFIGURED ? 'AI composition isn’t available right now; this size stays composed automatically.' : 'AI couldn’t design this size this time; it stays composed automatically. Nothing was retried.'); }
+    await refresh();
   };
   const save = async () => {
     const d = draftRef.current; if (!d) return;
@@ -209,13 +258,13 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
         </>}
       </section>
       <aside className="sr-aside" aria-label="Your template">
+        <section className="sr-size-card" aria-label="Choose your size"><h3>Choose your size</h3>
+          <p className="sr-hint">Each size is designed for its shape — never stretched — and saved with your creative.</p>
+          <SizePicker value={ratio} onChange={r => void pickSize(r)} original={template?.template.source} disabled={saving} />
+          {!REUSE_OFFERED_RATIOS.includes(ratio as typeof REUSE_OFFERED_RATIOS[number]) && <p className="sr-hint">This creative uses {REUSE_ASPECT_LABELS[ratio]} (an earlier size). Choose another to change it.</p>}
+          {formats.find(f => f.ratio === ratio)?.note && <p className="sr-hint">{formats.find(f => f.ratio === ratio)!.note}</p>}</section>
         {masterPreview && <figure className="sr-template"><img src={masterPreview} alt={`Template ${template?.template.name ?? ''}`} /><figcaption><span>Your template</span><strong>{template?.template.name}</strong></figcaption></figure>}
         <p className="sr-aside-links"><button type="button" className="ws-btn ws-btn-quiet prt-inline" onClick={onBack}>Choose another template</button><br /><button type="button" className="ws-btn ws-btn-quiet prt-inline" onClick={onAllDrafts}>All creatives from this template</button></p>
-        {draft && <div className="sr-size"><span>Size</span><strong>{formats.filter(f => draft.ratios.includes(f.ratio)).map(f => f.label).join(', ') || 'Original size'}</strong>
-          <button type="button" className="ws-btn ws-btn-quiet" aria-expanded={moreSizes} onClick={() => setMoreSizes(v => !v)}>{moreSizes ? 'Done' : 'More sizes'}<ChevronDown size={14} aria-hidden="true" /></button></div>}
-        {moreSizes && <div className="sr-formats" role="group" aria-label="Sizes">{formats.map(f => { const on = !!draft?.ratios.includes(f.ratio);
-          return <button key={f.ratio} type="button" className={`sr-format${on ? ' is-on' : ''}`} aria-pressed={on} onClick={() => { const next = REUSE_ASPECT_RATIOS.filter(r => (r === f.ratio ? !on : draft?.ratios.includes(r))); if (next.length) void change({ ratios: next }, d => ({ ...d, ratios: next })); }}>
-            <span className="sr-shape" style={{ aspectRatio: `${f.canvas.width} / ${f.canvas.height}` }} aria-hidden="true" />{f.label}</button>; })}</div>}
       </aside>
       {(products.length > 0 || pending.length > 0) && <div className="sr-cta-bar">
         <p><strong>{chosen.length} product{chosen.length === 1 ? '' : 's'}</strong> ready to arrange{pending.some(p => !p.error) ? ' · finishing uploads…' : ''}</p>
@@ -237,6 +286,8 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
       <div className="sr-stage">
         <div className="sr-stage-bar">
           {output && <span className={`sr-chip${aiUsed ? ' is-ai' : ''}`}>{aiUsed ? <><Sparkles size={13} aria-hidden="true" />Products arranged by AI</> : 'Products arranged automatically'}</span>}
+          {output?.composition && <span className={`sr-chip${output.composition.source === 'ai' ? ' is-ai' : ''}`} title={output.composition.layout}>{output.composition.source === 'ai' ? <><Sparkles size={13} aria-hidden="true" />Layout designed by AI</> : 'Layout composed automatically'}</span>}
+          {output?.background.extension && output.background.extension.percent >= 1 && <span className="sr-chip" title={output.background.note}>{output.background.extension.method === 'ai' ? `Background extended by AI · ${output.background.extension.percent} %` : `Background continued · ${output.background.extension.percent} %`}</span>}
           {draft.ratios.length > 1 && <div className="sr-tabs" role="tablist" aria-label="Sizes">{draft.ratios.map(r => <button key={r} type="button" role="tab" aria-selected={ratio === r} onClick={() => setRatio(r)}>{formats.find(f => f.ratio === r)?.label ?? r}</button>)}</div>}
           <span className="sr-spacer" />
           {masterPreview && output && <button type="button" className="ws-btn ws-btn-quiet" aria-pressed={compare} onClick={() => setCompare(v => !v)}><Columns2 size={15} aria-hidden="true" />{compare ? 'Hide template' : 'Compare with template'}</button>}
@@ -250,6 +301,10 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
       </div>
       <aside className="sr-panel">
         <h3>{failed ? 'Almost there' : 'Your creative is ready!'}</h3>
+        <label className="sr-size-row"><span>Size</span><select aria-label="Creative size" value={ratio} disabled={saving} onChange={e => void pickSize(e.target.value as ReuseAspectRatio)}>
+          {[...REUSE_OFFERED_RATIOS, ...(REUSE_OFFERED_RATIOS.includes(ratio as typeof REUSE_OFFERED_RATIOS[number]) ? [] : [ratio])].map(r => <option key={r} value={r}>{r === 'original' && template ? `Original · ${formatName(template.template.source.width, template.template.source.height)}` : REUSE_ASPECT_LABELS[r]}</option>)}</select></label>
+        {output?.composition?.source === 'rules' && composer?.ai && isOfferAspectRatio(ratio) && <button type="button" className="ws-btn" onClick={() => (composeCost > 0 ? setAskAi('compose') : void run(false, undefined, true))}><Sparkles size={15} aria-hidden="true" />Design this size with AI</button>}
+        {output && fresh && <PreSaveChecks v={output.validation} />}
         <p className="sr-panel-lead">{failed ? FRIENDLY.NOT_READY : saved ? 'It’s saved to your creatives — you can use it as it is.' : 'Take a look. Save it when you’re happy, or adjust it first.'}</p>
         <button type="button" className={`ws-btn ws-btn-large sr-save${saved ? ' is-saved' : ' ws-btn-primary'}`} disabled={saving || saved || !fresh || failed} onClick={() => void save()}>{saved ? <><Check size={17} aria-hidden="true" />Saved</> : <><Save size={17} aria-hidden="true" />{saving ? 'Saving…' : 'Save Creative'}</>}</button>
         {!saved && !failed && <p className="sr-hint sr-center">After saving, you can turn it into editable layers.</p>}
@@ -271,16 +326,19 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
     {askAi && <div className="sr-modal-backdrop" onClick={() => setAskAi(undefined)}>
       <div className="sr-modal" role="dialog" aria-modal="true" aria-labelledby="sr-cost-title" onClick={e => e.stopPropagation()}>
         <span className="sr-modal-icon" aria-hidden="true"><Sparkles size={22} /></span>
-        <h3 id="sr-cost-title">{askAi === 'generate' ? 'Arrange Products with AI' : 'Ask AI for a New Arrangement'}</h3>
-        <p>AI will analyze your products and create a professional layout{askAi === 'regenerate' ? ' — a new one, with your photos reused' : ''}.</p>
+        <h3 id="sr-cost-title">{askAi === 'compose' ? `Design ${REUSE_ASPECT_LABELS[ratio]} with AI` : askAi === 'generate' ? (composeAi ? 'Design Your Creative with AI' : 'Arrange Products with AI') : 'Ask AI for a New Arrangement'}</h3>
+        <p>{askAi === 'regenerate' ? 'AI will analyze your products and create a new professional layout, with your photos reused.' : askAi === 'compose' || composeAi
+          ? `AI plans the ${REUSE_ASPECT_LABELS[ratio]} layout from your template — where the artwork, logos, offer and terms go — and continues the background only where the template's own artwork does not reach. Your products, logos, text, prices and dates are placed exactly as they are; the AI never redraws them.`
+          : 'AI will analyze your products and create a professional layout.'}</p>
         <dl className="sr-cost">
-          <div><dt>Estimated cost</dt><dd><strong>{cost}</strong></dd></div>
-          <div><dt>What runs</dt><dd>{draft && draft.ratios.length > 1 ? `${draft.ratios.length} new paid OpenAI requests (one per size)` : 'One new paid OpenAI request'}</dd></div>
-          <div><dt>You get</dt><dd>Your products arranged on the template, ready to review. Nothing is saved until you click Save.</dd></div>
+          {(askAi === 'compose' || (askAi === 'generate' && composeAi)) && <div><dt>Layout & background</dt><dd>{`$${composeCost.toFixed(2)}`} · {composer?.extend ? 'one layout request and at most one background edit per size' : 'one layout request per size'}</dd></div>}
+          {(askAi === 'regenerate' || (askAi === 'generate' && placeAi)) && <div><dt>Arranging products</dt><dd>{`$${(ai && !ai.offline ? (draft?.ratios.length ?? 1) * ai.costUsd : 0).toFixed(2)}`} · {draft && draft.ratios.length > 1 ? `${draft.ratios.length} requests (one per size)` : 'one request'}</dd></div>}
+          <div><dt>Estimated total</dt><dd><strong>{askAi === 'compose' ? `$${composeCost.toFixed(2)}` : askAi === 'regenerate' ? `$${(ai && !ai.offline ? (draft?.ratios.length ?? 1) * ai.costUsd : 0).toFixed(2)}` : cost}</strong> · paid OpenAI requests, never retried</dd></div>
+          <div><dt>You get</dt><dd>A preview to review with its checks. Nothing is saved until you click Save.</dd></div>
         </dl>
         <div className="sr-modal-actions">
-          <button type="button" className="ws-btn ws-btn-primary ws-btn-large" autoFocus onClick={() => void run(true)}><Sparkles size={16} aria-hidden="true" />{askAi === 'generate' ? 'Approve & Generate' : 'Approve & Regenerate'}</button>
-          {askAi === 'generate' && <button type="button" className="ws-btn ws-btn-large" onClick={() => void run(false)}>Arrange Automatically (Free)</button>}
+          <button type="button" className="ws-btn ws-btn-primary ws-btn-large" autoFocus onClick={() => void (askAi === 'compose' ? composeNow() : askAi === 'regenerate' ? run(true) : run(placeAi, undefined, composeAi))}><Sparkles size={16} aria-hidden="true" />{askAi === 'regenerate' ? 'Approve & Regenerate' : 'Approve & Generate'}</button>
+          {askAi === 'generate' && <button type="button" className="ws-btn ws-btn-large" onClick={() => void run(false)}>Generate Automatically (Free)</button>}
           <button type="button" className="ws-btn ws-btn-quiet" onClick={() => setAskAi(undefined)}>Cancel</button>
         </div>
       </div>

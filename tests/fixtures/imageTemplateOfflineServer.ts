@@ -4,6 +4,7 @@ import { failingResponsesClient, recordedResponsesClient, type FailingKind } fro
 import { replayArtworkGenerator } from '../../server/src/decomposition/protectedTemplates/product/artwork.js';
 import { standInProductLayerizer } from '../../server/src/decomposition/protectedTemplates/product/aiDecompose.js';
 import type { ReusePlacementPlanner } from '../../server/src/decomposition/protectedTemplates/product/reusePlacement.js';
+import type { composeRequest, ReuseComposer } from '../../server/src/decomposition/protectedTemplates/product/reuseCompose.js';
 import { findSheetCreatives } from '../../server/src/decomposition/protectedTemplates/product/sheet.js';
 import { decodeRgba } from '../../server/src/decomposition/protectedTemplates/pixels.js';
 /** Local-only reviewer fixture: real routes/storage/planner adaptation/import, deterministic providers, no credentials. */
@@ -232,6 +233,17 @@ const reusePlacement: ReusePlacementPlanner = { model: 'test placement planner (
     return { ...b, role: 'supporting' };
   }) } };
 } };
+/**
+ * Reuse Template's AI composition, as a test double (offline:false, so the cost approval is exercised; NEVER contacts a
+ * provider): the layout planner answers with the rules' own proposal, and the image editor hands back the picture it was
+ * given (the free continuation), so the approved path runs end to end with nothing generated.
+ */
+const composeCalls: { format: string; elements: number }[] = [];
+const reuseComposer: ReuseComposer = { model: 'test layout planner (no network or charges)', offline: false, async plan(input, _image, save) {
+  const i = input as ReturnType<typeof composeRequest>;
+  composeCalls.push({ format: i.format, elements: i.elements.length }); save('compose.test-request.json', { format: i.format, elements: i.elements.length, testOnly: true });
+  return { responseId: `fixture-compose-${composeCalls.length}`, raw: { layout: `${i.proposal.layout} (test double)`, art: i.proposal.art, boxes: i.proposal.boxes, safeArea: { x: 0, y: 0, ...i.canvas }, notes: ['Test double: the rules\' proposal, unchanged.'] } };
+}, editor: { model: 'test image editor (no network or charges)', offline: false, async edit(r) { return { image: r.image, requestId: 'fixture-edit' }; } } };
 const productLayerizer = process.env.FRAMEFLOW_PRODUCT_LAYERIZE === 'off' ? undefined : reuseProof?.layerizer ?? standInProductLayerizer();
 // FRAMEFLOW_PRODUCT_RECORDED=1 (with FRAMEFLOW_PRODUCT_REFERENCE=1): the LG creative gets the RECORDED real answer of the one
 // approved live detection (gpt-5.6-sol, 2026-10-22), replayed without network; otherwise the handmade manifest.
@@ -457,7 +469,7 @@ const router = createLayerizeRouter({
   },
   runsDir: join(root, 'runs'), imageTemplatesDir: join(root, 'templates'), protectedDir: join(root, 'protected'), wordRecognizer: () => variationRecognizer, masterRecognizer: () => masterRecognizer,
   // Product with Text templates: the fixture poster's words (no OCR), the fixture's vision answer and a fake cut-out service, each counted.
-  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productArtwork: () => productArtwork,
+  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, productArtwork: () => productArtwork,
   templatesDir: join(root, 'creative-templates'), executionsDir: join(root, 'executions'),
   inspector: () => ({ model: 'gpt-5.6-luna', inspect: async (_bytes, _mime, save) => {
     callCounts.openai++;

@@ -20,9 +20,14 @@ import { fontMeasure } from './ratioLayout.js';
 
 export type Box = { x: number; y: number; width: number; height: number };
 export interface ReuseFrame {
-  ratio: ReuseAspectRatio; source: SourceSize; canvas: SourceSize; method: 'template' | 'slice' | 'mirror-extend';
+  ratio: ReuseAspectRatio; source: SourceSize; canvas: SourceSize; method: 'template' | 'slice' | 'mirror-extend' | 'recompose';
   /** Template pixels to canvas pixels: x' = (x - x0) * scale + pad, y' = y * scale. */
   scale: number; x0: number; pad: number;
+  /**
+   * Recompose (reuseCompose.ts): the artwork block's top-left in the canvas instead — x' = place.x + x * scale,
+   * y' = place.y + (y - place.top) * scale (`top`: the template row the block starts at).
+   */
+  place?: { x: number; y: number; top: number };
   /** Mirror-extend: the widths of the outer strips (left, right) of the scaled artwork mirrored outwards. */
   strip: number; stripRight: number;
   /** Decorations of the background left outside a slice (their labels). */
@@ -85,8 +90,9 @@ export async function frameBackground(basePng: Buffer, frame: ReuseFrame): Promi
   return sharp({ create: { width: canvas.width, height: canvas.height, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } } }).composite(clipped).png().toBuffer();
 }
 
-export const mapX = (f: ReuseFrame, x: number) => (x - f.x0) * f.scale + f.pad;
-export const mapBox = (f: ReuseFrame, b: Box): Box => ({ x: mapX(f, b.x), y: b.y * f.scale, width: b.width * f.scale, height: b.height * f.scale });
+export const mapX = (f: ReuseFrame, x: number) => (f.place ? f.place.x + x * f.scale : (x - f.x0) * f.scale + f.pad);
+export const mapY = (f: ReuseFrame, y: number) => (f.place ? f.place.y + (y - f.place.top) * f.scale : y * f.scale);
+export const mapBox = (f: ReuseFrame, b: Box): Box => ({ x: mapX(f, b.x), y: mapY(f, b.y), width: b.width * f.scale, height: b.height * f.scale });
 export const backgroundOf = (f: ReuseFrame): Pick<ProductCreativeBackground, 'method' | 'filledPercent'> => ({ method: f.method, filledPercent: f.filledPercent });
 
 /** A creative in template coordinates moved into the frame (every element through the same transform). */
@@ -94,7 +100,7 @@ export function mapCreative(c: ProductCreative, f: ReuseFrame): ProductCreative 
   if (f.method === 'template') return c;
   const s = f.scale;
   return { ...c, canvas: { ...f.canvas },
-    texts: c.texts.map(t => ({ ...t, x: mapX(f, t.x), baselineY: t.baselineY * s, style: { ...t.style, fontSize: t.style.fontSize * s, letterSpacing: t.style.letterSpacing * s } })),
+    texts: c.texts.map(t => ({ ...t, x: mapX(f, t.x), baselineY: mapY(f, t.baselineY), style: { ...t.style, fontSize: t.style.fontSize * s, letterSpacing: t.style.letterSpacing * s } })),
     images: c.images.map(i => ({ ...i, box: { ...i.box, ...mapBox(f, i.box) } })),
     shapes: c.shapes.map(sh => ({ ...sh, box: { ...sh.box, ...mapBox(f, sh.box) }, radius: sh.radius * s, ...(sh.stroke ? { stroke: { ...sh.stroke, width: sh.stroke.width * s } } : {}) })),
     objects: c.objects.map(o => ({ ...o, box: { ...o.box, ...mapBox(f, o.box) } })) };

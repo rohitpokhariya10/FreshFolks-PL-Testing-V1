@@ -131,6 +131,7 @@ export function registerProductTemplateRoutes(router: Router, ctx: { products: P
   });
   router.get(`${base}/:id/reuse/:did/preview`, async (req, res, next) => { try { noStore(res); res.json(await rv.preview(idOf(req), did(req), String(req.query.ratio ?? '').replace('x', ':'))); } catch (error) { next(error); } });
   router.post(`${base}/:id/reuse/:did/generate`, json, async (req, res, next) => { try { res.json(await rv.generate(idOf(req), did(req), req.body ?? {})); } catch (error) { next(error); } });
+  router.post(`${base}/:id/reuse/:did/compose`, json, async (req, res, next) => { try { res.json(await rv.composeWithAi(idOf(req), did(req), req.body ?? {})); } catch (error) { next(error); } });
   router.post(`${base}/:id/reuse/:did/placement`, json, async (req, res, next) => { try { res.json(await rv.placeWithAi(idOf(req), did(req), req.body ?? {})); } catch (error) { next(error); } });
   router.post(`${base}/:id/reuse/:did/save`, json, async (req, res, next) => { try { res.json(await rv.save(idOf(req), did(req), req.body ?? {})); } catch (error) { next(error); } });
   router.post(`${base}/:id/reuse/:did/outputs/:ratio/open`, async (req, res, next) => { try { res.json(await rv.open(idOf(req), did(req), ratioOf(req))); } catch (error) { next(error); } });
