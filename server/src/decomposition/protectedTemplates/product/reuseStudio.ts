@@ -77,8 +77,8 @@ interface Context {
   emptyStage: { file: string; png: Buffer } | { reason: string };
   /** What creatives are drawn on: the template's base, and the empty stage when there is one (each `Ground`). */
   grounds: { base: Ground; empty?: Ground };
-  /** Recompose: the template's structure (artwork block, bands and what sits in them) and the rules' plan per common ratio. */
-  structure: Structure; rules: Map<OfferAspectRatio, Plan>;
+  /** Recompose: the template's structure (artwork block, bands and what sits in them). */
+  structure: Structure;
 }
 /**
  * A background with what the template's text removal left of its letters cleared (its own cached file), and each text
@@ -280,7 +280,7 @@ export function createReuseStudio(deps: {
         }
         const grounds: Context['grounds'] = { base: await groundOf(baseFile, basePng), ...('file' in emptyStage ? { empty: await groundOf(emptyStage.file, emptyStage.png) } : {}) };
         const structureOf = await readStructure(filesOf(id), basePng, template, art, decorations, podium ? [podium.box] : []);
-        return { snapshot, baseFile, basePng, art, decorations, avoid, stage, stageFound, template, emptyStage, grounds, structure: structureOf, rules: new Map() };
+        return { snapshot, baseFile, basePng, art, decorations, avoid, stage, stageFound, template, emptyStage, grounds, structure: structureOf };
       })();
       contexts.set(key, ctx);
       ctx.catch(() => contexts.delete(key));
@@ -327,11 +327,30 @@ export function createReuseStudio(deps: {
   }
 
   // --- Formats: legacy frames and recomposed common ratios ----------------------------------------------------------------
-  /** The rules' plan of a common ratio (once per revision and ratio). */
-  const rulesOf = (ctx: Context, ratio: OfferAspectRatio) => { let p = ctx.rules.get(ratio); if (!p) { p = planRules(ctx.structure, ratio); ctx.rules.set(ratio, p); } return p; };
+  /**
+   * The template's structure for a draft: a product standing in a band (a footer's small product shots) is one of that
+   * band's elements only when the draft shows it — left out (Create Offer Creative leaves the template's own products
+   * out), it leaves no room in the band or the offer column.
+   */
+  const variants = new WeakMap<Structure, Map<string, Structure>>(), plans = new WeakMap<Structure, Map<OfferAspectRatio, Plan>>();
+  const structureFor = (ctx: Context, d: ReuseDraft): Structure => {
+    const shown = new Set(d.items.filter(i => i.kind === 'product' && i.included && !i.removed && !i.hidden && i.objectId).map(i => `o:${i.objectId}`));
+    const keys = ctx.structure.free.filter(f => f.kind === 'object' && shown.has(f.key)).map(f => f.key).join(',');
+    if (!ctx.structure.free.some(f => f.kind === 'object' && !shown.has(f.key))) return ctx.structure;
+    let byKey = variants.get(ctx.structure); if (!byKey) { byKey = new Map(); variants.set(ctx.structure, byKey); }
+    let st = byKey.get(keys); if (!st) { st = { ...ctx.structure, free: ctx.structure.free.filter(f => f.kind !== 'object' || shown.has(f.key)) }; byKey.set(keys, st); }
+    return st;
+  };
+  /** The rules' plan of a common ratio (once per structure and ratio). */
+  const rulesOf = (ctx: Context, d: ReuseDraft, ratio: OfferAspectRatio) => {
+    const st = structureFor(ctx, d);
+    let byRatio = plans.get(st); if (!byRatio) { byRatio = new Map(); plans.set(st, byRatio); }
+    let p = byRatio.get(ratio); if (!p) { p = planRules(st, ratio); byRatio.set(ratio, p); }
+    return p;
+  };
   /** A common ratio's plan for a draft: its approved AI composition (checked when it was made), else the rules'. */
   const planOf = (ctx: Context, d: ReuseDraft, ratio: OfferAspectRatio): { plan: Plan; ai?: ReuseComposePlan } => {
-    const ai = d.compose?.[ratio], rules = rulesOf(ctx, ratio);
+    const ai = d.compose?.[ratio], rules = rulesOf(ctx, d, ratio);
     if (ai && ai.canvas.width === rules.canvas.width && ai.canvas.height === rules.canvas.height)
       return { ai, plan: { ratio, canvas: ai.canvas, layout: ai.layout as Plan['layout'], art: ai.art, boxes: { ...rules.boxes, ...ai.boxes }, excluded: ai.excluded } };
     return { plan: rules };
@@ -545,6 +564,8 @@ export function createReuseStudio(deps: {
     // that fit them stand in them there too — unless the format's canvas cuts a place (then they are arranged anew).
     let anchors = opts.geometryOnly || !(ratio === 'original' || framed.plan) ? undefined : slotAnchors(snapshot, products, d.placement.hero);
     if (anchors && framed.plan) for (const a of anchors.values()) {
+      // (A product in a band moves with that band's elements: placed by the format's plan, not in its old place.)
+      if (ctx.structure.free.some(f => f.key === `o:${a.objectId}`)) continue;
       const place = a.slot?.box ?? snapshot.objects.find(o => o.id === a.objectId)?.box, b = place && mapBox(frame, place);
       if (b && (b.x < -1 || b.y < -1 || b.x + b.width > frame.canvas.width + 1 || b.y + b.height > frame.canvas.height + 1)) { anchors = undefined; break; }
     }
@@ -599,7 +620,7 @@ export function createReuseStudio(deps: {
     const areas = new Map(ctx.template.groups.map(g => [g.id, groupBounds(ctx.template, g.id)] as const).filter((x): x is readonly [string, Box] => !!x[1]).map(([gid, box]) => [gid, { box, align: (d.texts[gid]?.align ?? (inferAlign(ctx.template, gid, fontMeasure) === 'left' ? 'left' : 'center')) as 'left' | 'center' }]));
     const dropped: string[] = [];
     // A common ratio: every element that left the artwork placed in its box (logos, text, plates), the rest moved with it.
-    if (framed.plan) { const applied = await applyPlan(filesOf(id), mapCreative(c, frame), ctx.structure, framed.plan); c = applied.creative; notes.push(...applied.notes, ...(framed.ai?.notes ?? [])); }
+    if (framed.plan) { const applied = await applyPlan(filesOf(id), mapCreative(c, frame), structureFor(ctx, d), framed.plan); c = applied.creative; notes.push(...applied.notes, ...(framed.ai?.notes ?? [])); }
     else c = reanchor(mapCreative(c, frame), frame, ctx.art, ctx.decorations, areas, dropped);
     if (dropped.length) notes.push(`Not shown in this format (outside its part of the artwork): ${[...new Set(dropped)].join(', ')}.`);
     const W = frame.canvas.width, H = frame.canvas.height, s = frame.scale;
@@ -876,13 +897,13 @@ export function createReuseStudio(deps: {
     const pictures = new Map<number, Buffer>();
     for (const r of ratios) {
       // (Each size from the revision it is composed from: an adapted master's other sizes from its original.)
-      const rctx = await contextFor(id, d.templateRevision, r), rules = rulesOf(rctx, r);
+      const rctx = await contextFor(id, d.templateRevision, r), rules = rulesOf(rctx, d, r), rst = structureFor(rctx, d);
       if (!pictures.has(rctx.snapshot.revision)) pictures.set(rctx.snapshot.revision, await sharp(await renderProductCreative(f => store.read(id, f), rctx.snapshot, rctx.template, 768)).flatten({ background: '#ffffff' }).jpeg({ quality: 80 }).toBuffer());
       const picture = pictures.get(rctx.snapshot.revision)!, operationId = randomUUID(), save = (f: string, v: object) => store.write(id, `prd-${did.slice(3)}-${ratioKey(r)}-${operationId.slice(0, 8)}-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`, Buffer.from(JSON.stringify(v, null, 2)));
       next.ai.requests += 1; next.ai.costUsd = cents(next.ai.costUsd + (composer.offline ? 0 : COMPOSE_PLAN_COST_USD));
       let plan: ReuseComposePlan;
       try {
-        const answer = await composer.plan(composeRequest(rctx.structure, rules), picture, save, operationId), checked = checkComposePlan(answer.raw, rctx.structure, rules);
+        const answer = await composer.plan(composeRequest(rst, rules), picture, save, operationId), checked = checkComposePlan(answer.raw, rst, rules);
         const summary = (answer.raw as { layout?: unknown } | null)?.layout;
         plan = { ratio: r, at: nowIso(), model: composer.model, offline: composer.offline, operationId, ...(answer.responseId ? { responseId: answer.responseId } : {}), layout: checked.layout,
           ...(checked.source === 'ai' && typeof summary === 'string' && summary.trim() ? { summary: summary.trim().slice(0, 120) } : {}), canvas: checked.canvas, art: checked.art, boxes: checked.boxes, excluded: checked.excluded, notes: checked.notes, rejected: checked.rejected };

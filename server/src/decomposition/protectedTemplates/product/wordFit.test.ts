@@ -206,3 +206,53 @@ describe('fitting text in a template', { timeout: 120_000 }, () => {
     } finally { await s.close(); }
   });
 });
+
+describe('fitting lettering the on-device reader cannot read as it is (a badge: white words on a ribbon)', () => {
+  /** A cream badge: dark words on a line, white words on a green ribbon under it, striped sweets under the ribbon. */
+  function badge(dark: Word[], light: Word[], ribbon: Box, sweets: Box): Rgba {
+    const width = 900, height = 520, data = new Uint8Array(width * height * 4);
+    const paint = (x: number, y: number, c: number[]) => { if (x < 0 || y < 0 || x >= width || y >= height) return; const i = (y * width + x) * 4; data[i] = c[0]; data[i + 1] = c[1]; data[i + 2] = c[2]; data[i + 3] = 255; };
+    const fill = (b: Box, c: (x: number, y: number) => number[]) => { for (let y = b.y; y < b.y + b.height; y++) for (let x = b.x; x < b.x + b.width; x++) paint(x, y, c(x, y)); };
+    fill({ x: 0, y: 0, width, height }, () => [250, 240, 205]);
+    fill(ribbon, () => [16, 140, 90]);
+    // Sweets: dense diagonal stripes, more strokes than any lettering.
+    fill(sweets, (x, y) => ((x + y) % 10 < 5 ? [230, 90, 50] : [250, 200, 170]));
+    const letters = (w: Word, c: number[]) => { const n = w.text.length, pitch = w.width / n, stroke = Math.max(3, Math.round(w.height * 0.14)); for (let k = 0; k < n; k++) { const x0 = Math.round(w.x + k * pitch + pitch * 0.2); fill({ x: x0, y: Math.round(w.y + w.height * 0.15), width: stroke, height: Math.round(w.height * 0.7) }, () => c); if (k % 2) fill({ x: x0, y: Math.round(w.y + w.height * 0.15), width: Math.round(pitch * 0.6), height: stroke }, () => c); } };
+    for (const w of dark) letters(w, [20, 70, 70]);
+    for (const w of light) letters(w, [255, 255, 255]);
+    return { width, height, data } as Rgba;
+  }
+  /** Like tesseract: reads dark letters on a light ground only — what it is given must be light on the whole. */
+  const polarReader = (words: Word[]) => ({ engine: { name: 'polar', version: '1', model: 'test', modes: ['test'] }, async recognize(input: { image: Buffer; region: Box }) {
+    const { data } = await sharp(input.image).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    let sum = 0; for (let i = 0; i < data.length; i += 3) sum += data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+    const light = sum / (data.length / 3) >= 128, r = input.region;
+    return words.filter(w => light === !w.text.startsWith('light:') && w.x >= r.x && w.y >= r.y && w.x + w.width <= r.x + r.width && w.y + w.height <= r.y + r.height)
+      .map(w => ({ text: w.text.replace(/^light:/, ''), confidence: 0.95, box: { x0: w.x - r.x, y0: w.y - r.y, x1: w.x + w.width - r.x, y1: w.y + w.height - r.y } }));
+  } });
+
+  it('reads white words on a ribbon with the band inverted, and fits them there', async () => {
+    const ribbon = { x: 40, y: 150, width: 820, height: 110 }, sweets = { x: 80, y: 300, width: 740, height: 140 };
+    const golden = line(170, 70, ['golden', 120, 330], ['deals', 500, 260]);
+    // The analysis put the line a little low; the reader sees the ribbon dark as it is.
+    const given = ai(golden, w => ({ ...w, y: w.y + 40 }));
+    const reads = golden.map(w => ({ ...w, text: `light:${w.text}` }));
+    const [fit] = await fitLines(badge([], golden, ribbon, sweets), [given], polarReader(reads) as never);
+    expect(fit.method).toBe('letters');
+    fit.boxes.forEach((b, k) => expect(close(b, golden[k], 2), JSON.stringify(b)).toBe(true));
+  });
+
+  it('never moves a line it cannot read more than a line onto busy artwork, nor onto a line placed by its letters', async () => {
+    const ribbon = { x: 40, y: 150, width: 820, height: 110 }, sweets = { x: 80, y: 300, width: 740, height: 140 };
+    const title = line(40, 80, ['GANESH', 200, 500]), golden = line(170, 70, ['golden', 120, 330], ['deals', 500, 260]);
+    const picture = badge(title, golden, ribbon, sweets);
+    // Nothing can be read: the white line where the analysis put it stays (its strokes guess would be the sweets below).
+    const [white] = await fitLines(picture, [ai(golden, w => w)], polarReader([]) as never);
+    expect(Math.abs(white.dy)).toBeLessThanOrEqual(70);
+    expect(white.boxes.every(b => b.y + b.height <= sweets.y + 10)).toBe(true);
+    // A title box half a line low, unread, beside the next line read by its letters: kept, not pushed onto that line.
+    const fits = await fitLines(picture, [ai(title, w => ({ ...w, y: w.y + 60 })), ai(golden, w => w)], polarReader(golden.map(w => ({ ...w, text: `light:${w.text}` }))) as never);
+    expect(fits[1].method).toBe('letters');
+    if (fits[0].method === 'strokes') expect(fits[0].boxes[0].y + fits[0].boxes[0].height).toBeLessThanOrEqual(golden[0].y + golden[0].height * 0.25);
+  });
+});

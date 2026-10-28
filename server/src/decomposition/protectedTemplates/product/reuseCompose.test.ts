@@ -286,6 +286,19 @@ describe('Recompose: plates and lettering in the bands', () => {
     expect(Math.min(...data.subarray(row(858), row(858) + 3))).toBeLessThan(200);
   });
 
+  it('makes a product standing in a band one of that band\'s elements, never the owner of the plate it sits in', async () => {
+    // A small product shot cut from inside the pill (a detection marked part of the footer as a product).
+    const withShot = { ...template, objects: [{ id: 'po-strip', objectId: 'po-strip', kind: 'product', label: 'Smartphone · bottom', asset: { kind: 'template', file: 'x.png' }, box: { x: 230, y: 892, width: 120, height: 44 }, hidden: false, z: 1 }] } as unknown as ProductCreative;
+    const st = await readStructure(files(), await footer(false), withShot, { top: 150, bottom: 850 }, [], []);
+    expect(st.free.find(f => f.key === 'o:po-strip')).toMatchObject({ kind: 'object', zone: 'foot' });
+    expect(st.pieces).toHaveLength(1); expect(st.pieces[0].owner).toBe('g:pg-prizes');
+    // A 16:9 split: the scene at full height, the footer's elements — the product shot too — in the offer column, inside the canvas.
+    const plan = planRules(st, '16:9');
+    expect(plan.layout).not.toBe('stacked');
+    const shot = plan.boxes['o:po-strip'];
+    expect(shot).toBeDefined(); expect(inter(shot, { x: 0, y: 0, ...plan.canvas })).toBe(shot.width * shot.height);
+  });
+
   it('keeps a one-line text on a plate one line (smaller), and a cut of its lettering leaves out the rule under it', async () => {
     const zone = { x: 0, y: 0, width: 300, height: 80 }, k = oneLineScale(template, 'pg-prizes', zone)!;
     expect(k).toBeGreaterThan(0); expect(k).toBeLessThan(1);

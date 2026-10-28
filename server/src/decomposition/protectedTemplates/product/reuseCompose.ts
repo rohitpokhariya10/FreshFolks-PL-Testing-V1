@@ -36,7 +36,8 @@ import { groupBounds, type Box, type Decoration } from './reuseLayout.js';
 type Files = { has: (file: string) => boolean; read: (file: string) => Buffer; write: (file: string, bytes: Buffer) => void };
 type Save = (file: string, value: object) => void;
 export type Layout = 'stacked' | 'split-left' | 'split-right';
-export interface FreeItem { key: string; kind: 'logo' | 'text' | 'piece'; zone: 'head' | 'foot'; label: string; box: Box; order: number; align: 'left' | 'center' }
+/** `object`: a product standing in a band (a footer's own small product shots), moved like a logo, its picture's proportions kept. */
+export interface FreeItem { key: string; kind: 'logo' | 'text' | 'piece' | 'object'; zone: 'head' | 'foot'; label: string; box: Box; order: number; align: 'left' | 'center' }
 /** A plate (or other mark) painted in a band, cut out: it travels with its owner (a text group or a logo), or alone. */
 export interface Piece { id: string; file: string; sha256: string; box: Box; width: number; height: number; owner?: string; label: string }
 export interface Kept extends Box { label: string; kind: 'character' | 'stage' | 'text' | 'logo' | 'decoration' }
@@ -103,6 +104,8 @@ export async function readStructure(files: Files, base: Buffer, template: Produc
     if (z) free.push({ key: `g:${g.id}`, kind: 'text', zone: z, label: g.label, box: b, order: 0, align: Math.abs(b.x + b.width / 2 - W / 2) < W * 0.08 || g.align !== 'left' ? 'center' : 'left' });
     else keep.push({ ...b, label: `the text “${g.label.slice(0, 40)}”`, kind: 'text' });
   }
+  // A product in a band (not on the stage) belongs to that band, like its logos: it moves with the band's elements.
+  for (const o of template.objects.filter(x => x.kind === 'product' && !x.hidden)) { const z = zone(o.box); if (z) free.push({ key: `o:${o.id}`, kind: 'object', zone: z, label: o.label, box: { x: o.box.x, y: o.box.y, width: o.box.width, height: o.box.height }, order: 0, align: 'center' }); }
   for (const o of template.objects.filter(x => x.kind === 'character' && !x.hidden)) keep.push({ ...o.box, label: o.label, kind: 'character' });
   for (const d of decorations) keep.push({ ...d.box, label: d.label, kind: 'decoration' });
   for (const s of stages) keep.push({ ...s, label: 'the stage', kind: 'stage' });
@@ -138,7 +141,8 @@ export async function readStructure(files: Files, base: Buffer, template: Produc
     box.width = Math.min(W, Math.ceil((x1 + 2) / k)) - box.x; box.height = Math.min(H, Math.ceil((y1 + 2) / k)) - box.y;
     // Its owner: the logo or text it lies under (most of either inside the other); else a text whose row it frames (a
     // part of a plate round that line: as tall as the line or a little taller, across part of it).
-    const owner = free.map(f => ({ f, o: inter(box, { x: f.box.x - 6, y: f.box.y - 6, width: f.box.width + 12, height: f.box.height + 12 }) / Math.max(1, Math.min(area(box), area(f.box))) }))
+    // (A plate is a text's or a logo's, never a band product's: a product shot cut from inside a pill does not own it.)
+    const owner = free.filter(f => f.kind !== 'object').map(f => ({ f, o: inter(box, { x: f.box.x - 6, y: f.box.y - 6, width: f.box.width + 12, height: f.box.height + 12 }) / Math.max(1, Math.min(area(box), area(f.box))) }))
       .filter(x => x.o >= 0.5).sort((a, b) => b.o - a.o)[0]?.f
       ?? free.filter(f => f.kind === 'text' && box.height <= f.box.height * 2.5 && Math.min(box.y + box.height, f.box.y + f.box.height) - Math.max(box.y, f.box.y) >= f.box.height * 0.8
         && Math.min(box.x + box.width, f.box.x + f.box.width) > Math.max(box.x, f.box.x)).sort((a, b) => a.box.height - b.box.height)[0];
@@ -441,7 +445,10 @@ export async function applyPlan(files: Files, c: ProductCreative, st: Structure,
   for (const f of st.free) {
     const target = plan.boxes[f.key];
     if (!target) continue;
-    if (f.kind === 'logo') {
+    if (f.kind === 'object') {
+      const id = f.key.slice(2), o = out.objects.find(x => x.kind === 'product' && (x.id === id || x.objectId === id));
+      if (o) out = { ...out, objects: out.objects.map(x => (x === o ? { ...x, box: { ...x.box, ...contain(target, x.box.width / Math.max(1, x.box.height)) } } : x)) };
+    } else if (f.kind === 'logo') {
       const id = f.key.slice(2), i = out.images.find(x => x.id === id);
       if (!i) continue;
       const to = contain(target, i.box.width / Math.max(1, i.box.height));

@@ -976,7 +976,10 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     const drawn = (o: ProductObject) => c.objects.find(x => x.kind === o.kind && (x.objectId ?? x.id) === o.id && !x.hidden)?.box;
     const objects = previous.objects.filter(o => !excluded.has(o.label)).map(o => {
       const at = drawn(o), b = at ? { x: Math.round(at.x), y: Math.round(at.y), width: Math.round(at.width), height: Math.round(at.height) } : box(o.box);
-      return { ...o, box: b, ...(o.cutout ? { cutout: { ...o.cutout, placement: { ...b } } } : {}), ...(o.slot ? { slot: { ...o.slot, box: box(o.slot.box), contactY: Math.round(mapY(f, o.slot.contactY)), targetHeight: Math.round(o.slot.targetHeight * f.scale) } } : {}) };
+      // (A product the format moved out of the artwork — one standing in a band, now in the offer column — keeps its slot where it is drawn.)
+      const mapped = o.slot ? box(o.slot.box) : undefined, inside = (r: PixelRect) => r.x >= -1 && r.y >= -1 && r.x + r.width <= c.canvas.width + 1 && r.y + r.height <= c.canvas.height + 1;
+      const slot = o.slot && mapped ? (at && !inside(mapped) ? { ...o.slot, box: { ...b }, contactY: b.y + b.height, targetHeight: b.height } : { ...o.slot, box: mapped, contactY: Math.round(mapY(f, o.slot.contactY)), targetHeight: Math.round(o.slot.targetHeight * f.scale) }) : undefined;
+      return { ...o, box: b, ...(o.cutout ? { cutout: { ...o.cutout, placement: { ...b } } } : {}), ...(slot ? { slot } : {}) };
     });
     const latest = t.product.revisions.at(-1)!, revision = latest.revision + 1, at = nowIso();
     const adapted: ProductSnapshot = { ...previous, revision, publishedAt: at, canvas: { ...c.canvas }, objects,

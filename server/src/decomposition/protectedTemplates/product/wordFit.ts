@@ -10,10 +10,14 @@
  *    (at most half a line past the gap to it). Its words are matched to the line's words by their text; the vertical move
  *    most matches agree on is the line's, and the matched words' letter edges give the line's horizontal map (a stretch
  *    and a shift). Matched words take their letters' left and right edges; the others follow the line's map. Heights stay.
+ *    Light lettering on a dark or coloured ground (white words on a ribbon, a button, a badge) is not read by the
+ *    recognizer as it is: when too few words are read, the band is read again with its colours inverted.
  *  2 Strokes: when the letters cannot be read (artwork lettering, too few matches, matches that disagree), the line moves
  *    as one to where the picture has the most letter strokes inside its words and the fewest in the gaps between them,
  *    half a line before and after it and just above and below it; only when that is clearly better than where it is and
- *    clearly better than any place a line away (else it is ambiguous).
+ *    clearly better than any place a line away (else it is ambiguous). A guess from strokes alone moves a line at most one
+ *    line (a busy ornament beside the words — sweets, a pattern — has more strokes than the letters), and never onto a
+ *    line placed by its letters or left where it was.
  *  3 Otherwise the line stays as the analysis gave it, for a person to correct.
  * Deterministic and local; no provider is involved.
  */
@@ -75,6 +79,14 @@ export async function fitLines(source: Rgba, lines: { text: string; box: Box }[]
       out.push({ method: 'strokes', boxes: moved, dy: shift.dy, moved: furthest(boxes, moved), reason: read?.reason });
     } else out.push({ ...kept, reason: [read?.reason, shift.reason].filter(Boolean).join('; ') || undefined });
   }
+  // A line moved by its strokes alone that lands on another line (placed by its letters, or left where it was) moved onto
+  // that line's letters: it stays where the analysis put it.
+  const across = (a: Box[], b: Box[]) => { const p = extent(a), q = extent(b); return Math.min(p.right, q.right) > Math.max(p.left, q.left) ? Math.max(0, Math.min(p.bottom, q.bottom) - Math.max(p.top, q.top)) : 0; };
+  out.forEach((f, i) => {
+    if (f.method !== 'strokes') return;
+    const onto = out.findIndex((g, j) => j !== i && g.method !== 'strokes' && across(f.boxes, g.boxes) > lineHeight(f.boxes) * 0.25);
+    if (onto >= 0) out[i] = { method: 'kept', boxes: lines[i].map(w => w.box), dy: 0, moved: 0, reason: [f.reason, `its strokes lay on the line “${lines[onto].map(w => w.text).join(' ').slice(0, 40)}”`].filter(Boolean).join('; ') };
+  });
   return out;
 }
 
@@ -98,7 +110,18 @@ async function fitByLetters(source: Rgba, line: { text: string; box: Box }[], li
   const r = { ...region, width: Math.min(source.width, Math.ceil(e.right + spread)) - region.x, height: Math.min(source.height, Math.ceil(e.bottom + limit.down)) - region.y };
   if (r.width < 8 || r.height < 8) return { reason: 'too small to read' };
   const image = await sharp(Buffer.from(source.data.buffer, source.data.byteOffset, source.data.length), { raw: { width: source.width, height: source.height, channels: 4 } }).extract({ left: r.x, top: r.y, width: r.width, height: r.height }).png().toBuffer();
-  const found = (await recognizer.recognize({ image, region: r, purpose: 'template' })).map(f => ({ key: norm(f.text), x0: r.x + f.box.x0, x1: r.x + f.box.x1, y0: r.y + f.box.y0, y1: r.y + f.box.y1 })).filter(f => f.key);
+  const read = async (png: Buffer) => (await recognizer.recognize({ image: png, region: r, purpose: 'template' })).map(f => ({ key: norm(f.text), x0: r.x + f.box.x0, x1: r.x + f.box.x1, y0: r.y + f.box.y0, y1: r.y + f.box.y1 })).filter(f => f.key);
+  const first = await read(image), fit = lettersFit(source, line, limit, r, first);
+  if ('boxes' in fit) return fit;
+  // Light lettering on a dark or coloured ground (white words on a ribbon or a button): read again with its colours
+  // inverted, with what was read as it is.
+  const again = lettersFit(source, line, limit, r, [...first, ...await read(await sharp(image).negate({ alpha: false }).png().toBuffer())]);
+  return 'boxes' in again ? again : fit;
+}
+
+/** The letters' fit of a line from what was read in the band `r` (fitByLetters). A fit, or why there is none. */
+function lettersFit(source: Rgba, line: { text: string; box: Box }[], limit: { up: number; down: number }, r: Box, found: { key: string; x0: number; x1: number; y0: number; y1: number }[]): LineFit | { reason: string } {
+  const boxes = line.map(w => w.box), lh = lineHeight(boxes);
   // Candidates: a read word with the same letters, its centre within the line's allowed move.
   const options = line.map((w, k) => { const b = boxes[k], cy = b.y + b.height / 2, key = norm(w.text);
     return key ? found.filter(f => f.key === key).map(f => ({ f, dy: (f.y0 + f.y1) / 2 - cy })).filter(o => o.dy >= -limit.up && o.dy <= limit.down) : []; });
@@ -185,7 +208,8 @@ const strokeThreshold = (gradients: Float32Array) => { const s = Float32Array.fr
 export function lineShift(source: Rgba, boxes: Box[], limits: { up: number; down: number }): { dx: number; dy: number; reason?: string } {
   const { width: W, height: H, data } = source;
   if (!boxes.length) return { dx: 0, dy: 0 };
-  const lh = lineHeight(boxes), rx = Math.round(0.5 * lh), ryUp = Math.min(Math.round(1.5 * lh), limits.up), ryDown = Math.min(Math.round(1.5 * lh), limits.down);
+  // (At most one line up or down: a busy ornament a line away has more strokes than the letters.)
+  const lh = lineHeight(boxes), rx = Math.round(0.5 * lh), ryUp = Math.min(Math.round(lh), limits.up), ryDown = Math.min(Math.round(lh), limits.down);
   const { left, top, right, bottom } = extent(boxes), margin = Math.ceil(lh / 2);
   const x0 = Math.max(0, Math.floor(left) - margin - rx), x1 = Math.min(W - 1, Math.ceil(right) + margin + rx), y0 = Math.max(0, Math.floor(top) - margin - ryUp), y1 = Math.min(H, Math.ceil(bottom) + margin + ryDown);
   const ww = x1 - x0, hh = y1 - y0;
