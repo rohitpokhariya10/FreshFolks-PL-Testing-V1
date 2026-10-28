@@ -292,7 +292,8 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     const startedAt = nowIso();
     const before = requireProduct(id);
     // Keep the last successful analysis intact even while a new attempt is running or fails.
-    if (before.product.detection?.status !== 'done') await service.updateMaster(id, undefined, x => { x.product!.detection = { ...x.product!.detection, status: 'running', startedAt, sourceSha256: x.source.sha256 }; });
+    // (What this run asks of the AI is shown while it runs: a previous skipped or failed attempt's outcome is not.)
+    if (before.product.detection?.status !== 'done') await service.updateMaster(id, undefined, x => { const d = { ...x.product!.detection, status: 'running' as const, startedAt, sourceSha256: x.source.sha256 }; delete d.ai; x.product!.detection = useAi ? d : { ...d, ai: { status: 'skipped' } }; });
     try {
       const t = requireProduct(id), png = store.read(id, t.source.inputFile);
       if (sha256(png) !== t.source.sha256) fail('SOURCE_MISMATCH', 'The stored image does not match its original hash. No saved analysis or provider request was used.');
@@ -342,6 +343,10 @@ export function createProductTemplates(options: ProductTemplateOptions) {
           if (d) w.style = { ...w.style, fontFamily: d.style.fontFamily, fontMatch: 'admin', fontSize: d.style.fontSize, fontWeight: d.style.fontWeight as 400 | 600 | 700, fontStyle: d.style.fontStyle, color: d.style.color, opacity: d.style.opacity, letterSpacing: d.style.letterSpacing };
         }
       }
+      // A skipped analysis says why: not approved (no request was sent on purpose), or not available on this server.
+      if (result.ai.status === 'skipped') result.ai = useAi
+        ? { ...result.ai, code: 'NOT_CONFIGURED', error: 'AI detection is not available on this server (no OpenAI API key is configured), so no request was sent. Configure the key, then retry.' }
+        : { ...result.ai, code: 'NOT_APPROVED', error: 'AI detection was not approved for this creative, so no AI request was sent and characters and products were not looked for. Approve one AI detection request to find them.' };
       await service.updateMaster(id, undefined, x => {
         if (result.ai.status !== 'done' && t.textAnalysis) {
           x.product!.detection = before.product.detection?.status === 'done'
@@ -352,7 +357,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
         x.textAnalysis = result.analysis; x.elements = result.elements; x.elementsRevision += 1;
         const p = x.product!;
         p.objects = result.objects; p.objectsRevision += 1;
-        p.detection = { status: result.ai.status === 'done' ? 'done' : 'failed', error: result.ai.status !== 'done' ? `AI detection not completed. ${result.ai.error ?? 'Enable AI detection with an available provider and retry.'}` : undefined, startedAt, finishedAt: nowIso(), sourceSha256: x.source.sha256, local: result.local, ai: result.ai, missingText: result.missingText, ...(kept && (kept.words || kept.objects || kept.logos) ? { kept } : {}) };
+        p.detection = { status: result.ai.status === 'done' ? 'done' : 'failed', error: result.ai.status === 'skipped' ? result.ai.error : result.ai.status !== 'done' ? `AI detection not completed. ${result.ai.error ?? 'No answer was received.'}` : undefined, startedAt, finishedAt: nowIso(), sourceSha256: x.source.sha256, local: result.local, ai: result.ai, missingText: result.missingText, ...(kept && (kept.words || kept.objects || kept.logos) ? { kept } : {}) };
         p.activity = { ...p.activity, scans: p.activity.scans + 1, aiCalls: p.activity.aiCalls + (result.ai.status === 'skipped' || cached || recover || fromVariation ? 0 : 1), costUsd: p.activity.costUsd + (cached || fromVariation ? 0 : result.ai.costUsd ?? 0) };
         history(p, { action: 'detected', detail: `${result.objects.length} object(s), ${result.analysis.groups.length} text block(s), ${result.analysis.logoSlots.length} logo(s); vision analysis ${result.ai.status}${result.ai.offline ? ' (offline test analyser)' : ''}.` });
       });
@@ -980,10 +985,11 @@ export function createProductTemplates(options: ProductTemplateOptions) {
   /**
    * The person's decision on the regenerated creative. `regenerated` (they looked at it and confirm it): it becomes the
    * creative the pipeline processes — the upload kept as `original` — and the elements are found in it. `original`: the
-   * upload is processed as it is (its size is then made at the Size step).
+   * upload is processed as it is (its size is then made at the Size step). AI detection runs when it was approved at upload,
+   * or now (`useAi: true`, its cost shown with the decision); otherwise the text and logos are read without it.
    */
-  const decideRegeneration = (id: string, input: { use?: unknown; approved?: unknown; expectedRevision?: unknown }) => locked(id, async () => {
-    const t = requireProduct(id), g = t.product.regeneration;
+  const decideRegeneration = (id: string, input: { use?: unknown; approved?: unknown; useAi?: unknown; expectedRevision?: unknown }) => locked(id, async () => {
+    const t = requireProduct(id), g0 = t.product.regeneration, g = g0 && { ...g0, useAi: g0.useAi === true || input.useAi === true };
     if (input.expectedRevision !== undefined && input.expectedRevision !== t.revision) fail('STALE_REVISION', `This template changed since you opened it (revision ${t.revision}). Reload it and try again.`, { revision: t.revision });
     if (!g || regenerating.has(id) || t.product.detection || (g.status !== 'ready' && g.status !== 'failed' && g.status !== 'running')) fail('NOT_READY', 'There is no regenerated creative waiting for a decision.');
     if (input.use === 'regenerated') {

@@ -227,22 +227,29 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
     <Waiting label={view.product.preparing?.engine === 'ai' ? 'Decomposing with AI (OpenAI planner, then Seedream Layerize)… this can take a minute or two.' : view.product.preparing?.paid ? 'Preparing with the cut-out service…' : 'Preparing on this computer…'} /></div>;
   // Review: found elements to check (also when asked to change them, or when the saved template changed and is not prepared).
   const aiDone = view.product.detection?.ai?.status === 'done', added = view.counts.characters + view.counts.products;
+  // Skipped because it was not approved (no request was sent on purpose) — not a failure; unavailable on the server is one.
+  const notApproved = view.product.detection?.ai?.status === 'skipped' && view.product.detection.ai.code !== 'NOT_CONFIGURED';
+  const approveAi = () => void productApi.detect(id, { force: true, useAi: true, newRequest: true }).then(r => { setRetryAi(false); setView(r.template); }).catch((e: Error) => setError(e.message));
   // Choose what to decompose (after the review is saved).
   if (choosing && (view.stage === 'review' || view.stage === 'changed' || view.stage === 'prepared' || view.stage === 'ready')) return <div className="ot-page prt-page-wide">{head(3, 'Choose what to decompose', 'Tick each element that should become an image layer of its own. Unticked ones stay part of the background picture.')}
     <ProductSelect view={view} onBack={() => { setChoosing(false); setReviewing(true); }} onStarted={v => { setChoosing(false); setReviewing(false); setView(v); }} onError={setError} /></div>;
   if (reviewing || view.stage === 'review' || view.stage === 'changed') return <div className="ot-page prt-page-wide">{aiDone ? head(2, "Here’s what we found", 'Each box is one element. Fix anything that looks wrong, then prepare the template. Items that need a look are listed first.')
+      : notApproved ? head(2, 'Approve AI detection to find characters and products', 'Your text and logos were read on this computer. Characters and products are found by one AI request, which was not approved, so none was sent.')
       : head(2, 'AI detection did not complete', 'Local candidates are retained. Recover a saved response or approve a new AI analysis before preparation.')}
     {view.product.preparing?.status === 'failed' && <Alert>{view.product.preparing.error}</Alert>}
     {aiDone && view.counts.words > 0 && <FitText view={view} onDone={v => { setView(v); setFitted(n => n + 1); }} onError={setError} />}
     {aiDone ? <p>{view.counts.characters} Characters · {view.counts.products} Products · {view.counts.words} Text words · {view.counts.text} Text groups · {view.counts.logos} Logos
       {(view.product.detection?.ai?.costUsd ?? 0) > 0 && <> <button type="button" className="ws-btn ws-btn-quiet" onClick={useSaved}>Find the elements again from the saved AI answer (free; your corrections are kept)</button></>}</p>
       : <p data-testid="local-only-counts">Read on this computer, without AI: {view.counts.words} Text words · {view.counts.text} Text groups · {view.counts.logos} Logos. Characters and products: {added ? `${added} added by you` : 'not detected'}.</p>}
-    {!aiDone && <><AiDetectionFailed detection={view.product.detection} onUseSaved={useSaved} />{recovery}
-      <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" onClick={() => setRetryAi(true)}>Retry AI analysis…</button></div></>}
+    {!aiDone && (notApproved ? <section className="ts-card" role="group" aria-label="Approve AI detection"><div className="ts-card-body">
+      <p>AI detection was not approved for this creative, so no AI request was sent. Characters and products can only be found by it, and they are needed to decompose the creative: one request to OpenAI, for the creative shown below. {AI_REQUEST_COST}</p>
+      <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" onClick={approveAi}>Approve AI detection and continue</button></div></div></section>
+      : <><AiDetectionFailed detection={view.product.detection} onUseSaved={useSaved} />{recovery}
+      <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" onClick={() => setRetryAi(true)}>Retry AI analysis…</button></div></>)}
     {aiDone && added === 0 && <Alert>Object detection needs attention: no characters or products were found. Retry analysis or correct the result.
       <button type="button" className="ws-btn" onClick={() => setRetryAi(true)}>Retry AI analysis</button></Alert>}
     {retryAi && <section className="ts-card"><p>Authorize one new OpenAI vision analysis request if no matching saved answer exists. {AI_REQUEST_COST} An earlier timed-out request may still finish and be billed; try recovery first. Nothing is retried automatically.</p>
-      <button type="button" className="ws-btn" onClick={() => void productApi.detect(id, { force: true, useAi: true, newRequest: true }).then(r => { setRetryAi(false); setView(r.template); }).catch((e: Error) => setError(e.message))}>Approve one AI detection request</button>
+      <button type="button" className="ws-btn" onClick={approveAi}>Approve one AI detection request</button>
       <button type="button" className="ws-btn" onClick={() => setRetryAi(false)}>Cancel</button></section>}
     {view.product.detection?.ai?.offline && <p role="status">Offline fixture detections — not verified AI provider results.</p>}
     {view.product.detection?.ai?.model?.includes('(recorded answer') && <p role="status">A recorded AI answer for this exact image, replayed: no new AI request was made.</p>}
@@ -277,19 +284,22 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
  */
 function RegenerationStep({ view, onChange, onError }: { view: ProductView; onChange: (v: ProductView) => void; onError: (m: string) => void }) {
   const id = view.template.id, g = view.product.regeneration!, label = REUSE_ASPECT_LABELS[g.ratio];
-  const [approved, setApproved] = useState(false), [busy, setBusy] = useState(''), [again, setAgain] = useState(false), [info, setInfo] = useState<RegenerationInfo>();
+  const [approved, setApproved] = useState(false), [busy, setBusy] = useState(''), [again, setAgain] = useState(false), [info, setInfo] = useState<RegenerationInfo>(), [useAi, setUseAi] = useState(false);
   useEffect(() => { void productApi.regenerationInfo().then(setInfo).catch(() => undefined); }, []);
   const estimate = info?.estimates[g.ratio] ?? 0, original = productFileUrl(id, view.template.source.inputFile);
   const act = (what: string, work: () => Promise<ProductView>) => { setBusy(what); onError(''); void work().then(onChange).catch((e: Error) => onError(e.message)).finally(() => setBusy('')); };
-  const decide = (use: 'regenerated' | 'original') => act(use, () => productApi.decideRegeneration(id, { use, approved: use === 'regenerated' ? approved : undefined, expectedRevision: view.template.revision }));
+  const decide = (use: 'regenerated' | 'original') => act(use, () => productApi.decideRegeneration(id, { use, approved: use === 'regenerated' ? approved : undefined, ...(useAi ? { useAi: true } : {}), expectedRevision: view.template.revision }));
   const retry = () => act('retry', () => productApi.retryRegeneration(id, { approveUsd: estimate, expectedRevision: view.template.revision }));
-  const actions = <div className="ot-row">
+  // Characters and products are found by AI detection; not approved at upload, it can be approved here (never sent unasked).
+  const askAi = !g.useAi && <label className="ot-check" data-testid="regeneration-ai-option"><input type="checkbox" checked={useAi} onChange={e => setUseAi(e.target.checked)} />
+    <span>Also find characters and products with AI (one request) — they are needed to decompose the creative. {AI_REQUEST_COST} It was not approved at upload: nothing is sent unless you tick this.</span></label>;
+  const actions = <>{askAi}<div className="ot-row">
     {g.status === 'ready' && !g.result?.checks.blocking.length && <button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={!!busy || !approved} onClick={() => decide('regenerated')}><Check size={15} aria-hidden="true" />{busy === 'regenerated' ? 'Continuing…' : 'Use this design and continue'}</button>}
     {again ? <div className="prt-confirm" role="group" aria-label="Confirm regenerating again"><p>Regenerate again? One more request{estimate > 0 ? `, at most about $${estimate.toFixed(2)}` : ''}. Never retried automatically.</p>
       <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" disabled={!!busy} onClick={() => { setAgain(false); retry(); }}>Yes, regenerate again</button><button type="button" className="ws-btn ws-btn-quiet" onClick={() => setAgain(false)}>Cancel</button></div></div>
       : <button type="button" className="ws-btn" disabled={!!busy || !info?.available} onClick={() => setAgain(true)}><Sparkles size={14} aria-hidden="true" />{g.status === 'ready' ? 'Regenerate again…' : 'Try again…'}</button>}
     <button type="button" className="ws-btn ws-btn-quiet" disabled={!!busy} onClick={() => decide('original')}>{busy === 'original' ? 'Continuing…' : 'Continue with my original instead'}</button>
-  </div>;
+  </div></>;
   if (g.status !== 'ready' || !g.result) return <section className="ts-card"><div className="ts-card-body">
     <Alert>{g.status === 'failed' ? `The regeneration in ${label} did not complete: ${g.error ?? 'no answer was received'}. Nothing was retried.` : `The regeneration in ${label} was interrupted (the server restarted). Nothing was retried.`}</Alert>
     <p className="ot-muted">A request that failed may still have been charged by the provider.</p>{actions}</div></section>;

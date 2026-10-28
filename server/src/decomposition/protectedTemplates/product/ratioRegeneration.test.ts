@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import sharp, { type OverlayOptions } from 'sharp';
@@ -6,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { RATIO_REGEN_SIZES, ratioRegenEstimateUsd, type ReuseDraft } from '@frameflow/shared';
 import { findQrCodes, protectRegenerated, regenerationPrompt, type RatioRegenerator } from './ratioRegeneration.js';
 import { setup, savedTemplate, type View } from './productServer.fixture.js';
-import { productPosterPng } from './productPoster.fixture.js';
+import { fakeProductAnalyzer, productPosterPng } from './productPoster.fixture.js';
 
 // A creative regenerated in another ratio by the image model (ratioRegeneration.ts), with test doubles only: the "model"
 // recomposes by placing the picture somewhere else at another size, or redraws its QR code as one that scans to
@@ -106,6 +107,90 @@ describe('First-time master creation regenerated in the chosen size (HTTP, tempo
       const plain = await savedTemplate(s, await productPosterPng());
       expect(plain.product.regeneration).toBeUndefined();
     } finally { await s.close(); }
+  });
+});
+
+describe('AI detection of a regenerated creative: approved at upload, at the decision, or after; never sent unasked', { timeout: 180000 }, () => {
+  /** The test analyser, recording the size and hash of every picture it is given; it fails while `failing` is set. */
+  const recording = () => {
+    const inner = fakeProductAnalyzer(), seen: { width: number; height: number; sha: string }[] = [];
+    const a = { model: inner.model, failing: false, seen, async analyze(image: Buffer, mime: string, save: (file: string, value: object) => void) {
+      const m = await sharp(image).metadata(); seen.push({ width: m.width!, height: m.height!, sha: createHash('sha256').update(await sharp(image).raw().toBuffer()).digest('hex') });
+      if (a.failing) throw new Error('Connection error.');
+      return inner.analyze(image, mime, save);
+    } };
+    return a;
+  };
+
+  it('approved at upload: found by AI in the approved regenerated picture, with no second approval', async () => {
+    const analyzer = recording(), s = await setup({ regenerator, analyzer });
+    try {
+      const id = (await s.form<View>('', await productPosterPng(), { name: 'Approved at upload', aspectRatio: '1:1', regenerate: 'true', approveUsd: '1', useAi: 'true' })).body.template.id;
+      const waiting = await until(s, id, v => v.stage === 'regenerated');
+      expect(waiting.product.regeneration?.useAi).toBe(true); expect(analyzer.seen).toHaveLength(0);
+      await s.send('POST', `/${id}/regeneration`, { use: 'regenerated', approved: true });
+      const found = await s.detected(id);
+      expect(found.product.detection).toMatchObject({ status: 'done', ai: { status: 'done' } });
+      expect(found.counts.characters + found.counts.products).toBeGreaterThan(0);
+      // The picture the AI was given is the regenerated one (1536 × 1536), not the upload.
+      const regen = await sharp(readFileSync(join(s.protectedDir, id, waiting.product.regeneration!.result!.file))).raw().toBuffer();
+      expect(analyzer.seen).toEqual([{ width: 1536, height: 1536, sha: createHash('sha256').update(regen).digest('hex') }]);
+    } finally { await s.close(); }
+  });
+
+  it('not approved at upload: nothing sent; it says so (not a failure), and approving it — at the decision or afterwards — finds the elements', async () => {
+    const analyzer = recording(), s = await setup({ regenerator, analyzer });
+    try {
+      // Approved together with the regenerated design.
+      const a = (await s.form<View>('', await productPosterPng(), { name: 'Approved at the decision', aspectRatio: '4:5', regenerate: 'true', approveUsd: '1', useAi: 'false' })).body.template.id;
+      expect((await until(s, a, v => v.stage === 'regenerated')).product.regeneration?.useAi).toBe(false);
+      await s.send('POST', `/${a}/regeneration`, { use: 'regenerated', approved: true, useAi: true });
+      const atDecision = await s.detected(a);
+      expect(atDecision.product.detection).toMatchObject({ status: 'done', ai: { status: 'done' } }); expect(atDecision.product.regeneration).toMatchObject({ status: 'approved', useAi: true });
+      expect(analyzer.seen.at(-1)).toMatchObject({ width: 1280, height: 1600 });
+      // Not approved anywhere: no request; the reason is that, not a provider failure.
+      const b = (await s.form<View>('', await productPosterPng(), { name: 'Not approved', aspectRatio: '1:1', regenerate: 'true', approveUsd: '1', useAi: 'false' })).body.template.id;
+      const calls0 = (await until(s, b, v => v.stage === 'regenerated')).product.activity.aiCalls, sent = analyzer.seen.length;
+      await s.send('POST', `/${b}/regeneration`, { use: 'regenerated', approved: true });
+      const skipped = await s.detected(b);
+      expect(analyzer.seen.length).toBe(sent);
+      expect(skipped.stage).toBe('review');
+      expect(skipped.product.detection).toMatchObject({ status: 'failed', ai: { status: 'skipped', code: 'NOT_APPROVED' } });
+      expect(skipped.product.detection!.error).toMatch(/not approved/); expect(skipped.product.detection!.error).not.toMatch(/provider|did not complete|not completed/i);
+      expect(skipped.product.activity.aiCalls).toBe(calls0);
+      // Approved afterwards (the review's "Approve AI detection and continue"): found in the regenerated picture.
+      expect((await s.send('POST', `/${b}/detect`, { force: true, useAi: true, newRequest: true })).status).toBe(202);
+      const found = await s.detected(b);
+      expect(found.product.detection).toMatchObject({ status: 'done', ai: { status: 'done' } }); expect(found.counts.characters + found.counts.products).toBeGreaterThan(0);
+      expect(analyzer.seen.at(-1)).toMatchObject({ width: 1536, height: 1536 }); expect(found.template.source).toMatchObject({ width: 1536, height: 1536 });
+      // Original (no regeneration), not approved: the same explicit state.
+      const c = (await s.form<View>('', await productPosterPng(), { name: 'Original, not approved', useAi: 'false' })).body.template.id;
+      expect((await s.detected(c)).product.detection).toMatchObject({ status: 'failed', ai: { status: 'skipped', code: 'NOT_APPROVED' } });
+    } finally { await s.close(); }
+  });
+
+  it('a provider that fails or is not configured says why, and a retry (approved again) completes', async () => {
+    const analyzer = recording(), s = await setup({ regenerator, analyzer });
+    try {
+      analyzer.failing = true;
+      const id = (await s.form<View>('', await productPosterPng(), { name: 'Provider failure', aspectRatio: '9:16', regenerate: 'true', approveUsd: '1', useAi: 'true' })).body.template.id;
+      await until(s, id, v => v.stage === 'regenerated');
+      await s.send('POST', `/${id}/regeneration`, { use: 'regenerated', approved: true });
+      const failed = await s.detected(id);
+      expect(failed.product.detection).toMatchObject({ status: 'failed', ai: { status: 'failed', error: 'Connection error.' } });
+      expect(failed.product.detection!.error).toBe('AI detection not completed. Connection error.');
+      analyzer.failing = false;
+      await s.send('POST', `/${id}/detect`, { force: true, useAi: true, newRequest: true });
+      expect((await s.detected(id)).product.detection).toMatchObject({ status: 'done', ai: { status: 'done' } });
+      expect(analyzer.seen.map(x => `${x.width}x${x.height}`)).toEqual(['1152x2048', '1152x2048']);
+    } finally { await s.close(); }
+    const none = await setup({ regenerator, analyzer: false });
+    try {
+      const id = (await none.form<View>('', await productPosterPng(), { name: 'No provider', useAi: 'true' })).body.template.id;
+      const v = await none.detected(id);
+      expect(v.product.detection).toMatchObject({ status: 'failed', ai: { status: 'skipped', code: 'NOT_CONFIGURED' } });
+      expect(v.product.detection!.error).toMatch(/not available on this server/);
+    } finally { await none.close(); }
   });
 });
 

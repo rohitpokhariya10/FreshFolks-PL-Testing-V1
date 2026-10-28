@@ -78,6 +78,80 @@ test('first-time master: regenerated in 16:9 at upload, approved, then found, re
   await page.screenshot({ path: `${OUT}/04-editor-16x9.png` });
 });
 
+/** Upload with the regeneration in `ratio` approved and AI detection left unticked; wait for the regenerated creative. */
+async function regeneratedWithoutAi(page: Page, request: APIRequestContext, name: string, ratio: string) {
+  const panel = await lab(page);
+  await panel.getByRole('button', { name: 'New product template' }).click();
+  await panel.getByLabel('Creative to upload').setInputFiles({ name: 'poster.png', mimeType: 'image/png', buffer: await (await request.get('/__test__/product-poster.png')).body() });
+  await panel.getByLabel('Template name').fill(name);
+  await panel.getByRole('group', { name: 'Size of the master template' }).getByRole('radio', { name: new RegExp(ratio) }).click();
+  await panel.getByTestId('regenerate-option').getByRole('checkbox').check();
+  await panel.getByRole('checkbox', { name: /Find characters and products with AI/ }).uncheck();
+  const created = page.waitForResponse(r => r.url().endsWith(API) && r.request().method() === 'POST');
+  await panel.getByRole('button', { name: `Upload and regenerate in ${ratio}` }).click();
+  const id = ((await (await created).json()) as ProductView).template.id;
+  await expect(panel.getByRole('heading', { name: `Your creative regenerated in ${ratio}` })).toBeVisible({ timeout: 120000 });
+  await panel.getByRole('region', { name: `Regenerated in ${ratio}` }).getByRole('checkbox', { name: /I have looked at the regenerated creative/ }).check();
+  return { panel, id };
+}
+
+test('AI detection not approved at upload (1:1): no request sent, the review says so with the cost, and approving it finds the elements in the regenerated creative', async ({ page, request }, info) => {
+  test.skip(info.project.name !== 'desktop', 'One run of this long flow.');
+  mkdirSync(OUT, { recursive: true });
+  await page.route(url => /^https?:$/.test(url.protocol) && url.hostname !== '127.0.0.1', r => r.abort());
+  const { panel, id } = await regeneratedWithoutAi(page, request, `AI at the review ${Date.now().toString(36)}`, 'Square 1:1');
+  // Offered with its cost at the decision, never ticked for the person; left unticked here.
+  await expect(panel.getByTestId('regeneration-ai-option')).toContainText('Estimated cost: up to about $0.35');
+  await expect(panel.getByTestId('regeneration-ai-option').getByRole('checkbox')).not.toBeChecked();
+  await page.screenshot({ path: `${OUT}/08-ai-detection-offered-at-decision.png` });
+  await panel.getByRole('button', { name: 'Use this design and continue' }).click();
+  // Not approved anywhere: no request sent, and the review says so — with the cost and the action — not a failure.
+  await expect(panel.getByRole('heading', { name: 'Approve AI detection to find characters and products' })).toBeVisible({ timeout: 120000 });
+  const approve = panel.getByRole('group', { name: 'Approve AI detection' });
+  await expect(approve).toContainText('was not approved for this creative, so no AI request was sent'); await expect(approve).toContainText('Estimated cost: up to about $0.35');
+  await expect(panel.getByText('AI detection did not complete')).toHaveCount(0); await expect(panel.getByText(/available provider/)).toHaveCount(0);
+  let v = (await (await request.get(`${API}/${id}`)).json()) as ProductView;
+  expect(v.product.detection?.ai).toMatchObject({ status: 'skipped', code: 'NOT_APPROVED' }); expect(v.template.source).toMatchObject({ width: 1536, height: 1536 });
+  await page.screenshot({ path: `${OUT}/09-ai-detection-approve-at-review.png` });
+  await approve.getByRole('button', { name: 'Approve AI detection and continue' }).click();
+  await expect(panel.getByRole('heading', { name: 'Here’s what we found' })).toBeVisible({ timeout: 120000 });
+  v = (await (await request.get(`${API}/${id}`)).json()) as ProductView;
+  expect(v.product.detection?.ai?.status).toBe('done'); expect(v.counts.characters + v.counts.products).toBeGreaterThan(0);
+  expect(v.template.source).toMatchObject({ width: 1536, height: 1536 }); expect(v.product.regeneration?.status).toBe('approved');
+  await page.screenshot({ path: `${OUT}/10-found-after-approval-1x1.png` });
+});
+
+test('AI detection approved with the regenerated design (cost shown there): found, reviewed, decomposed, saved and edited', async ({ page, request }, info) => {
+  test.skip(info.project.name !== 'desktop', 'One run of this long flow.');
+  mkdirSync(OUT, { recursive: true });
+  await page.route(url => /^https?:$/.test(url.protocol) && url.hostname !== '127.0.0.1', r => r.abort());
+  const { panel, id } = await regeneratedWithoutAi(page, request, `AI at the decision ${Date.now().toString(36)}`, 'Landscape 16:9');
+  const option = panel.getByTestId('regeneration-ai-option');
+  await expect(option).toContainText('Estimated cost: up to about $0.35');
+  await option.getByRole('checkbox').check();
+  await panel.getByRole('button', { name: 'Use this design and continue' }).click();
+  await expect(panel.getByRole('heading', { name: 'Here’s what we found' })).toBeVisible({ timeout: 120000 });
+  const v = (await (await request.get(`${API}/${id}`)).json()) as ProductView;
+  expect(v.product.detection?.ai?.status).toBe('done'); expect(v.product.regeneration).toMatchObject({ status: 'approved', useAi: true });
+  await panel.getByRole('button', { name: 'Save and choose what to decompose' }).click();
+  await panel.getByRole('button', { name: 'Continue to Decomposition' }).click();
+  await expect(panel.getByRole('heading', { name: 'Inspect the layers and the background' })).toBeVisible({ timeout: 120000 });
+  for (const c of await panel.getByRole('complementary', { name: 'Checks' }).getByRole('checkbox').all()) await c.check();
+  const draft = panel.getByRole('button', { name: 'Save as a draft with these warnings…' });
+  if (await draft.isVisible()) { await draft.click(); await panel.getByRole('button', { name: 'Yes, save as a draft' }).click(); }
+  else await panel.getByRole('button', { name: 'Save master template' }).click();
+  await expect(panel.getByRole('heading', { name: 'Your template is saved' })).toBeVisible({ timeout: 60000 });
+  const opened = page.waitForResponse(r => r.url().endsWith(`/${id}/open-editor`) && r.request().method() === 'POST');
+  await panel.getByRole('button', { name: 'Open in Editor', exact: true }).click();
+  const { runId } = await (await opened).json();
+  await expect(panel).toBeHidden({ timeout: 60000 });
+  const stored = () => page.evaluate(() => JSON.parse(localStorage.getItem('frameflow:project:v1')!) as ProjectDocument);
+  await expect.poll(async () => (await stored()).variants.some(x => x.importedFrom?.runId === runId), { timeout: 60000 }).toBe(true);
+  const design = (await stored()).variants.find(x => x.importedFrom?.runId === runId)!;
+  expect(design.canvas).toMatchObject({ width: 2048, height: 1152 }); expect(design.layers!.length).toBeGreaterThan(2);
+  await page.screenshot({ path: `${OUT}/11-editor-after-ai-approved-at-decision.png` });
+});
+
 async function savedTemplate(request: APIRequestContext, name: string) {
   const poster = await (await request.get('/__test__/product-poster.png')).body();
   let v = await (await request.post(API, { multipart: { name, useAi: 'true', image: { name: 'poster.png', mimeType: 'image/png', buffer: poster } } })).json() as ProductView;

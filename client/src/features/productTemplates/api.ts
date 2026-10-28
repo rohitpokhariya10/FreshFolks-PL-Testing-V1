@@ -101,7 +101,7 @@ export const productApi = {
   /** Whether a creative can be regenerated in a common ratio by the image model here, by which model, and each size's estimate. */
   regenerationInfo: () => call<RegenerationInfo>('/regeneration'),
   /** The regenerated creative approved (it becomes what is found, reviewed and decomposed) or declined (the upload as it is). */
-  decideRegeneration: (id: string, input: { use: 'regenerated' | 'original'; approved?: boolean; expectedRevision: number }) => call<ProductView>(`/${id}/regeneration`, json('POST', input)),
+  decideRegeneration: (id: string, input: { use: 'regenerated' | 'original'; approved?: boolean; useAi?: boolean; expectedRevision: number }) => call<ProductView>(`/${id}/regeneration`, json('POST', input)),
   retryRegeneration: (id: string, input: { approveUsd: number; expectedRevision: number }) => call<ProductView>(`/${id}/regeneration/retry`, json('POST', input)),
   /** The master's chosen size changed later in its creation (kept with the template; nothing is composed or charged). */
   setTargetRatio: (id: string, input: { ratio: ReuseAspectRatio; expectedRevision: number }) => call<ProductView>(`/${id}/target-ratio`, json('PUT', input)),
