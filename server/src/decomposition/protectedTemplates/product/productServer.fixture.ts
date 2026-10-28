@@ -37,8 +37,8 @@ export async function setup(options: { analyzer?: boolean | SceneAnalyzer; segme
 }
 
 /** The fixture uploaded, detected, prepared (locally), approved and saved as revision 1. */
-export async function savedTemplate(s: Awaited<ReturnType<typeof setup>>, png: Buffer) {
-  const made = await s.form('', png, { name: 'Festive offer' });
+export async function savedTemplate(s: Awaited<ReturnType<typeof setup>>, png: Buffer, fields: Record<string, string> = {}) {
+  const made = await s.form('', png, { name: 'Festive offer', ...fields });
   let v = await s.detected(made.body.template.id);
   v = (await s.send('PUT', `/${v.template.id}/review`, { expectedRevision: v.template.revision, objects: v.product.objects.map(o => ({ ...o, accepted: true })), texts: [], logos: [], dismissMissingText: true })).body;
   await s.send('POST', `/${v.template.id}/prepare`, { expectedRevision: v.template.revision });

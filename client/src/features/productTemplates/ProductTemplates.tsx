@@ -11,7 +11,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Crop, Image as ImageIcon, Package, Plus, Recycle, Sparkles, Upload } from 'lucide-react';
-import { REUSE_ASPECT_LABELS, type OfferAspectRatio, type PixelRect, type ProductDetection, type ProductStage } from '@frameflow/shared';
+import { REUSE_ASPECT_LABELS, type OfferAspectRatio, type PixelRect, type ProductDetection, type ProductStage, type ReuseAspectRatio } from '@frameflow/shared';
 import { Alert, Badge } from '../templateStudio/ui';
 import { productApi, productFileUrl, type ProductListItem, type ProductView, type SheetAnswer } from './api';
 import { ProductReview } from './ProductReview';
@@ -21,6 +21,7 @@ import { ProductTemplatePage } from './ProductTemplatePage';
 import { ReuseStudio } from './ReuseStudio';
 import { MasterSize } from './MasterSize';
 import { formatName } from './TemplateGallery';
+import { SizePicker } from './SizeControls';
 import './productTemplates.css';
 
 /** One AI detection request, as its confirmation states it (the answer is capped at 16,000 output tokens: at most about $0.35). */
@@ -49,7 +50,7 @@ function AiDetectionFailed({ detection, onUseSaved }: { detection?: ProductDetec
 export const PRODUCT_STAGE_LABELS: Record<ProductStage, string> = {
   detecting: 'Finding elements', 'detect-failed': 'Needs another try', review: 'Ready to review', preparing: 'Preparing', prepared: 'Ready to approve', ready: 'Saved', changed: 'Changed since saved',
 };
-export type ProductRequest = { view: 'new' } | { view: 'setup'; id: string; choose?: boolean } | { view: 'template'; id: string; tab?: 'creatives' | 'variations' | 'details' } | { view: 'reuse'; id: string };
+export type ProductRequest = { view: 'new' } | { view: 'setup'; id: string; choose?: boolean } | { view: 'template'; id: string; tab?: 'creatives' | 'variations' | 'details' } | { view: 'reuse'; id: string; /** Create Offer Creative: the size chosen with the template. */ ratio?: ReuseAspectRatio };
 type Props = {
   onOpenRun?: (runId: string) => Promise<void>;
   request: ProductRequest; onBack: () => void;
@@ -60,7 +61,7 @@ type Props = {
 export function ProductTemplates({ request, onBack, onOpenRunInEditor, onOpenRun }: Props) {
   const [view, setView] = useState<ProductRequest>(request);
   if (view.view === 'new') return <ProductUpload onCancel={onBack} onCreated={id => setView({ view: 'setup', id })} />;
-  if (view.view === 'reuse') return <ReuseStudio key={view.id} templateId={view.id} onBack={onBack} onOpenRunInEditor={onOpenRunInEditor} onOpenTemplate={id => setView({ view: 'setup', id })} />;
+  if (view.view === 'reuse') return <ReuseStudio key={view.id} templateId={view.id} initialRatio={view.ratio} onBack={onBack} onOpenRunInEditor={onOpenRunInEditor} onOpenTemplate={id => setView({ view: 'setup', id })} />;
   if (view.view === 'setup') return <ProductSetup key={`${view.id}-${view.choose ? 'choose' : ''}`} id={view.id} initialChoosing={view.choose} onBack={onBack} onUse={id => setView({ view: 'template', id })} onOpenRunInEditor={onOpenRunInEditor} />;
   return <ProductTemplatePage onOpenRun={onOpenRun} key={view.id} id={view.id} initialTab={view.tab} onOpenTemplate={id => setView({ view: 'setup', id })} onChangeSelection={() => setView({ view: 'setup', id: view.id, choose: true })} onBack={onBack} onEditTemplate={() => setView({ view: 'setup', id: view.id })} onOpenRunInEditor={onOpenRunInEditor} />;
 }
@@ -79,7 +80,8 @@ export function ProductLibrary({ onNew, onSetup, onUse, onGenerate, onReuse }: {
         <img src={productFileUrl(t.id, t.master?.preview ?? t.source.inputFile)} alt="" loading="lazy" />
         <div className="ot-card-body">
           <h3>{t.name}</h3>
-          {t.master && <p className="ot-small ot-muted">{REUSE_ASPECT_LABELS[t.master.aspectRatio]} master · {t.master.canvas.width} × {t.master.canvas.height}</p>}
+          {t.master ? <p className="ot-small ot-muted">{REUSE_ASPECT_LABELS[t.master.aspectRatio]} master · {t.master.canvas.width} × {t.master.canvas.height}</p>
+            : t.targetRatio && <p className="ot-small ot-muted">Master size chosen: {REUSE_ASPECT_LABELS[t.targetRatio]}</p>}
           <div className="ot-row"><Badge tone={t.stage === 'ready' ? 'ok' : t.stage === 'detect-failed' ? 'danger' : 'neutral'}>{PRODUCT_STAGE_LABELS[t.stage]}</Badge>{t.draft && <Badge tone="warn">Draft · quality warnings</Badge>}
             <span className="ot-small ot-muted">{t.counts.products} product{t.counts.products === 1 ? '' : 's'} · {t.counts.characters} character{t.counts.characters === 1 ? '' : 's'} · {t.counts.text} text</span></div>
           <div className="ot-row">
@@ -101,9 +103,13 @@ export function Steps({ current }: { current: 1 | 2 | 3 | 4 | 5 | 6 }) {
     <span>{i + 1 < current ? <Check size={12} aria-hidden="true" /> : i + 1}</span>{s}</li>)}</ol>;
 }
 
-/** Step 1: the creative, its name, one creative of a sheet, and whether the AI finds characters and products. */
+/**
+ * Step 1: the creative, its name, one creative of a sheet, the master's size, and whether the AI finds characters and
+ * products. The size is kept with the template from the start; the master is made in it once it is decomposed.
+ */
 function ProductUpload({ onCancel, onCreated }: { onCancel: () => void; onCreated: (id: string) => void }) {
   const [file, setFile] = useState<File>(), [name, setName] = useState(''), [sheet, setSheet] = useState<SheetAnswer>(), [crop, setCrop] = useState<PixelRect | null>(null);
+  const [size, setSize] = useState<ReuseAspectRatio>('original');
   const [useAi, setUseAi] = useState(false), [busy, setBusy] = useState<'' | 'reading' | 'uploading'>(''), [error, setError] = useState('');
   const preview = useMemo(() => (file ? URL.createObjectURL(file) : undefined), [file]);
   useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
@@ -119,7 +125,7 @@ function ProductUpload({ onCancel, onCreated }: { onCancel: () => void; onCreate
   const create = async () => {
     if (!file) return;
     setBusy('uploading'); setError('');
-    try { const v = await productApi.create(file, { name: name.trim() || 'Product template', crop: crop ?? undefined, useAi }); onCreated(v.template.id); }
+    try { const v = await productApi.create(file, { name: name.trim() || 'Product template', crop: crop ?? undefined, useAi, aspectRatio: size }); onCreated(v.template.id); }
     catch (e) { setError(e instanceof Error ? e.message : 'Could not create the template.'); setBusy(''); }
   };
   return <div className="ot-page">
@@ -132,11 +138,14 @@ function ProductUpload({ onCancel, onCreated }: { onCancel: () => void; onCreate
       <div className="prt-upload-form">
         <label className="ff-lab-upload"><strong>{file?.name ?? 'Choose the creative (PNG, JPEG or WebP)'}</strong><input type="file" accept="image/png,image/jpeg,image/webp" aria-label="Creative to upload" onChange={e => void choose(e.target.files?.[0])} /></label>
         <label className="ot-field"><span>Template name</span><input value={name} maxLength={120} placeholder="Festive appliance offer" aria-label="Template name" onChange={e => setName(e.target.value)} /></label>
+        <div className="prt-size-choice" role="group" aria-label="Size of the master template"><h3>Size of the master template</h3>
+          <p className="ot-muted">Original keeps the size you upload. Another size is made after the layers are decomposed — from your original, which is saved too and never changed — with the text, logos, offer details and characters kept exact.</p>
+          <SizePicker value={size} onChange={setSize} original={crop ? { width: crop.width, height: crop.height } : sheet ? { width: sheet.width, height: sheet.height } : undefined} disabled={!!busy} /></div>
         <label className="prt-option"><input type="checkbox" checked={useAi} onChange={e => setUseAi(e.target.checked)} />
           <span><strong>Find characters and products with AI</strong>Reuse a verified saved analysis first, free. If none exists, this authorizes one OpenAI request (estimated up to about $0.35). OpenAI stores the response for recovery. Without approval, only saved analysis or local text candidates are used.</span></label>
         <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={!file || !!busy} onClick={() => void create()}>
           <Upload size={15} aria-hidden="true" />{busy === 'uploading' ? 'Uploading…' : busy === 'reading' ? 'Reading the picture…' : 'Upload and find elements'}</button></div>
-        <p className="ot-muted">Next you check what was found, then FrameFlow prepares the layers and you save the template.</p>
+        <p className="ot-muted">Next you check what was found, then FrameFlow prepares the layers and you save the template{size !== 'original' ? ` in ${REUSE_ASPECT_LABELS[size]}` : ''}.</p>
       </div>
       {preview && <div className="prt-upload-preview">
         {sheet?.sheet ? <>
@@ -177,8 +186,12 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
   const retrieve = () => void productApi.detect(id, { force: true, useAi: false, recover: true }).then(r => { setError(''); setView(r.template); }).catch((e: Error) => setError(e.message));
   const recovery = view.recovery?.retrievable && <p><button type="button" className="ws-btn ws-btn-primary" onClick={retrieve}>Retrieve existing request (no new detection charge)</button> The saved response ID is reused; no new analysis is submitted.</p>;
   const from = view.product.variation;
+  // The size chosen on the upload screen, until the master is saved in it.
+  const chosen = view.product.targetRatio && view.product.masterRatio !== view.product.targetRatio ? view.product.targetRatio : undefined;
   const head = (step: 1 | 2 | 3 | 4 | 5 | 6, title: string, text: string) => <><div className="ot-head"><div><p className="ot-kicker">{view.template.name}</p><h2>{title}</h2><p>{text}</p></div>
-    <button type="button" className="ws-btn ws-btn-quiet" onClick={onBack}>Back to templates</button></div><Steps current={step} />{error && <Alert>{error}</Alert>}{view.product.detection?.lastFailure && <Alert>{view.product.detection.lastFailure.message} Your previous successful analysis is still available.</Alert>}
+    <button type="button" className="ws-btn ws-btn-quiet" onClick={onBack}>Back to templates</button></div><Steps current={step} />
+    {chosen && step < 6 && <p className="prt-size-chosen" data-testid="chosen-size">Master size: <strong>{REUSE_ASPECT_LABELS[chosen]}</strong> · chosen at upload. Your original is decomposed first; the master is then made in this size before it is saved.</p>}
+    {error && <Alert>{error}</Alert>}{view.product.detection?.lastFailure && <Alert>{view.product.detection.lastFailure.message} Your previous successful analysis is still available.</Alert>}
     {from && <div className="prt-note prt-journey" role="status" data-testid="from-variation"><strong>Edit Individual Elements</strong>
       <ol><li>Check what we found in your creative <span>(free)</span></li><li>Separate it into layers with AI <span>(you’ll approve the cost first)</span></li><li>Open it in the editor to move, resize and edit</li></ol>
       <details><summary>Details</summary>Made from the generated variation “{from.title}”. Its elements and editable words come from its saved composition (no new detection charge). Review the selection, approve OpenAI + Seedream decomposition, then inspect the returned layers.</details></div>}</>;
@@ -233,7 +246,7 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
         <p className="ot-muted">Use the template to swap products, change the offer and make variations. Each creative opens in the editor with every element editable.</p>
         <p className="prt-size-note" data-testid="master-size">{sized && latest?.canvas ? <><Check size={14} aria-hidden="true" />{REUSE_ASPECT_LABELS[sized]} master · {latest.canvas.width} × {latest.canvas.height} px · made from your original (version {latest.fromRevision}, {view.template.source.width} × {view.template.source.height}, kept unchanged).</>
           : <>Original size · {formatName(view.template.source.width, view.template.source.height)} · {view.template.source.width} × {view.template.source.height} px.</>}
-          {' '}<button type="button" className="ws-btn ws-btn-quiet prt-inline" onClick={() => setSizing(view.product.masterRatio ?? '16:9')}>{sized ? 'Change the master’s size' : 'Make the master another size'}</button></p>
+          {' '}<button type="button" className="ws-btn ws-btn-quiet prt-inline" onClick={() => setSizing(view.product.masterRatio ?? view.product.targetRatio ?? '16:9')}>{sized ? 'Change the master’s size' : 'Make the master another size'}</button></p>
         <div className="ot-row">{onOpenRunInEditor && <button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={opening} onClick={() => void openInEditor()}>{opening ? 'Opening…' : 'Open in Editor'}</button>}
           <button type="button" className={`ws-btn ${from ? '' : 'ws-btn-primary '}ws-btn-large`} onClick={() => onUse(id)}><Package size={15} aria-hidden="true" />Use this template</button>
           <button type="button" className="ws-btn ws-btn-quiet" onClick={() => setReviewing(true)}>Change what was found</button>

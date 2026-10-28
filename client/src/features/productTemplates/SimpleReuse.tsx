@@ -11,13 +11,14 @@
  *                     Manually (the detailed studio, same draft), Regenerate Layout; then Edit Individual Elements
  *                     (Decompose & Edit) for editing every element in the editor
  *
- * Every change is saved in the draft as it is made: a reload continues where the person left off.
+ * Every change is saved in the draft as it is made: a reload continues where the person left off. The size chosen with
+ * the template (step 1) is the draft's from the start — a draft continued from before takes it — and stays changeable.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeft, Check, Columns2, ImagePlus, LayoutGrid, Maximize2, Pencil, RefreshCw, Save, Sparkles, Star, Trash2, UploadCloud, X } from 'lucide-react';
 import { isOfferAspectRatio, REUSE_ASPECT_LABELS, REUSE_OFFERED_RATIOS, type ReuseAspectRatio, type ReuseDraft } from '@frameflow/shared';
 import { productApi, productFileUrl, type ProductView, type ReuseDraftChange, type ReuseStudioView } from './api';
-import { CreativeSteps, formatName } from './TemplateGallery';
+import { CreativeSteps, formatName, rememberSize } from './TemplateGallery';
 import { EditYourCreative } from './MakeEditable';
 import { PreSaveChecks, SizePicker } from './SizeControls';
 
@@ -41,15 +42,15 @@ const friendly = (e: unknown) => ({ message: FRIENDLY[(e as { code?: string })?.
 type Pending = { key: string; name: string; url: string; file: File; error?: string };
 type Step = 'upload' | 'generating' | 'result';
 
-export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRunInEditor, onOpenTemplate }: {
-  templateId: string; onBack: () => void; onEdit: (draftId: string) => void; onAllDrafts: () => void;
+export function SimpleReuse({ templateId, initialRatio, onBack, onEdit, onAllDrafts, onOpenRunInEditor, onOpenTemplate }: {
+  templateId: string; initialRatio?: ReuseAspectRatio; onBack: () => void; onEdit: (draftId: string) => void; onAllDrafts: () => void;
   onOpenRunInEditor: (runId: string) => Promise<void>; onOpenTemplate: (id: string) => void;
 }) {
   const [template, setTemplate] = useState<ProductView>(), [view, setView] = useState<ReuseStudioView>(), [draft, setDraft] = useState<ReuseDraft>();
   const [pending, setPending] = useState<Pending[]>([]), [step, setStep] = useState<Step>('upload'), [saving, setSaving] = useState(false);
   const [progress, setProgress] = useState<{ stages: string[]; at: number }>({ stages: [], at: 0 });
   const [error, setError] = useState<{ message: string; detail?: string }>(), [note, setNote] = useState(''), [askAi, setAskAi] = useState<'generate' | 'regenerate' | 'compose'>(), [regenMenu, setRegenMenu] = useState(false);
-  const [ratio, setRatio] = useState<ReuseAspectRatio>('original'), [dragOver, setDragOver] = useState(false);
+  const [ratio, setRatio] = useState<ReuseAspectRatio>(initialRatio ?? 'original'), [dragOver, setDragOver] = useState(false);
   const [full, setFull] = useState(false), [compare, setCompare] = useState(false), [removing, setRemoving] = useState<string>();
   const draftRef = useRef<ReuseDraft | undefined>(undefined), input = useRef<HTMLInputElement>(null);
   useEffect(() => { draftRef.current = draft; }, [draft]);
@@ -68,9 +69,22 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
   }, [templateId]);
   // Continue the latest simple draft (a reload loses nothing), or wait for the first upload to start one.
   useEffect(() => {
+    let live = true;
     void productApi.get(templateId).then(setTemplate).catch(() => undefined);
-    void productApi.reuseDrafts(templateId).then(r => { const d = r.drafts.find(x => x.simple); return d ? load(d.id) : undefined; }).catch(e => setError(friendly(e)));
-  }, [templateId, load]);
+    void productApi.reuseDrafts(templateId).then(async r => {
+      const d = r.drafts.find(x => x.simple);
+      if (!d) return;
+      const v = await load(d.id);
+      // The size chosen with the template wins over the one this draft had before (kept in the draft from now on).
+      if (!live || !initialRatio || (v.draft.ratios.length === 1 && v.draft.ratios[0] === initialRatio)) return;
+      const next = await productApi.updateReuseDraft(templateId, v.draft.id, { ratios: [initialRatio], expectedRevision: v.draft.revision });
+      setDraft(next); draftRef.current = next; setRatio(initialRatio);
+      if (!next.outputs[initialRatio]) { setStep('upload'); return; }
+      // Made in this size before: drawn again with every change kept (free, no AI request).
+      setStep('result'); setDraft(await productApi.reuseGenerate(templateId, next.id).then(g => { draftRef.current = g; return g; }));
+    }).catch(e => setError(friendly(e)));
+    return () => { live = false; };
+  }, [templateId, load, initialRatio]);
   /** The draft, made on first use (its template products left out). */
   const ensure = async () => {
     if (draftRef.current) return draftRef.current;
@@ -154,7 +168,7 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
   const generate = () => { if (!placeAi && !composeAi) void run(false); else if (aiCost > 0) setAskAi('generate'); else void run(placeAi, undefined, composeAi); };
   /** The size, chosen before generating and changeable afterwards (saved with the draft; a new size is composed free at once). */
   const pickSize = async (r: ReuseAspectRatio) => {
-    setRatio(r);
+    setRatio(r); rememberSize(r);
     if (!draftRef.current) return;
     const next = await change({ ratios: [r] }, d => ({ ...d, ratios: [r] }));
     if (next && step === 'result') await refresh();

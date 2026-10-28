@@ -29,8 +29,14 @@ export function ProductPrepare({ view, onChange, onError, onBackToReview, onChan
   const [tab, setTab] = useState<Tab>('layers'), [hidden, setHidden] = useState<Set<string>>(new Set()), [offsets, setOffsets] = useState<Record<string, { x: number; y: number }>>({});
   const [overlays, setOverlays] = useState(true), [looked, setLooked] = useState(false), [focus, setFocus] = useState<PixelRect>(), [busy, setBusy] = useState(false), [showEstimated, setShowEstimated] = useState(false);
   const [estimate, setEstimate] = useState<PrepareEstimate>(), [confirmPaid, setConfirmPaid] = useState(false), [confirmDraft, setConfirmDraft] = useState(false), [confirmAi, setConfirmAi] = useState(false);
-  // The master's size, chosen before it is saved: Original keeps it as uploaded; another size is previewed next.
-  const [size, setSize] = useState<ReuseAspectRatio>(view.product.masterRatio ?? 'original');
+  // The master's size, chosen on the upload screen (kept with the template) and changeable here before it is saved:
+  // Original keeps it as uploaded; another size is previewed next.
+  const [size, setSize] = useState<ReuseAspectRatio>(view.product.masterRatio ?? view.product.targetRatio ?? 'original');
+  const chooseSize = async (r: ReuseAspectRatio) => {
+    const was = size; setSize(r);
+    try { onChange(await productApi.setTargetRatio(id, { ratio: r, expectedRevision: view.template.revision })); }
+    catch (e) { setSize(was); onError(e instanceof Error ? e.message : 'The size could not be kept.'); }
+  };
   useEffect(() => { void productApi.estimate(id).then(setEstimate).catch(() => undefined); }, [id]);
   const stands = useMemo(() => p.stands ?? [], [p]);
   const objects = useMemo(() => [...stands, ...view.product.objects.filter(o => o.cutout)].sort((a, b) => a.z - b.z), [view, stands]);
@@ -204,7 +210,7 @@ export function ProductPrepare({ view, onChange, onError, onBackToReview, onChan
           <p className="ot-muted">Saves a recoverable editor draft with these checks. Quality warnings stay unresolved until you review and approve them.</p></>}
         {onSize && <div className="prt-size-choice" role="group" aria-label="Size of the master template"><h3>Size of the master template</h3>
           <p className="ot-muted">Original keeps it as uploaded. Another size is previewed next — made from your original, which is saved too and never changed.</p>
-          <SizePicker value={size} onChange={setSize} original={{ width: W, height: H }} disabled={busy} /></div>}
+          <SizePicker value={size} onChange={r => void chooseSize(r)} original={{ width: W, height: H }} disabled={busy} /></div>}
         <label className="ot-check"><input type="checkbox" checked={looked} onChange={e => setLooked(e.target.checked)} />
           <span>I have looked at the background and the layers{warnings.length ? ` (and the ${warnings.length} warning${warnings.length === 1 ? '' : 's'})` : ''}.</span></label>
         {blocking.length > 0 ? <>

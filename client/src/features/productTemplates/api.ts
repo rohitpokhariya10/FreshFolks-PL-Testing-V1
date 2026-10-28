@@ -41,7 +41,9 @@ export interface ProductView {
 }
 export interface ProductListItem { id: string; name: string; createdAt: string; updatedAt: string; stage: ProductStage; source: ProtectedTemplate['source']; counts: ProductView['counts']; revisions: number; /** The latest saved version is a draft with quality warnings. */ draft?: boolean;
   /** The master was saved in a common ratio when it was created: its size, canvas and preview (the original upload stays its source). */
-  master?: { aspectRatio: OfferAspectRatio; canvas: { width: number; height: number }; preview?: string } }
+  master?: { aspectRatio: OfferAspectRatio; canvas: { width: number; height: number }; preview?: string };
+  /** The master size chosen on the upload screen (absent: Original). */
+  targetRatio?: OfferAspectRatio }
 export interface SheetAnswer { sheet: boolean; width: number; height: number; boxes: PixelRect[] }
 /** What fitting the text did, line by line (letters: read on this computer; strokes: by the picture; kept: unchanged). */
 export interface TextFit { moved: number; lines: { text: string; method: 'letters' | 'strokes' | 'kept'; moved: number; reason?: string }[] }
@@ -94,7 +96,9 @@ export interface TemplateBrief { generation: ProductGenerationBrief; saved: bool
 export const productApi = {
   list: () => call<{ templates: ProductListItem[] }>(''),
   sheet: (file: Blob) => call<SheetAnswer>('/sheet', upload(file)),
-  create: (file: Blob, input: { name: string; crop?: PixelRect; useAi: boolean }) => call<ProductView>('', upload(file, { name: input.name, useAi: String(input.useAi), ...(input.crop ? { crop: JSON.stringify(input.crop) } : {}) })),
+  create: (file: Blob, input: { name: string; crop?: PixelRect; useAi: boolean; aspectRatio?: ReuseAspectRatio }) => call<ProductView>('', upload(file, { name: input.name, useAi: String(input.useAi), ...(input.crop ? { crop: JSON.stringify(input.crop) } : {}), ...(input.aspectRatio && input.aspectRatio !== 'original' ? { aspectRatio: input.aspectRatio } : {}) })),
+  /** The master's chosen size changed later in its creation (kept with the template; nothing is composed or charged). */
+  setTargetRatio: (id: string, input: { ratio: ReuseAspectRatio; expectedRevision: number }) => call<ProductView>(`/${id}/target-ratio`, json('PUT', input)),
   get: (id: string) => call<ProductView>(`/${id}`),
   /** `savedAnswer`: read the AI answer already received for this creative again (free: no new request). */
   detect: (id: string, input: { force?: boolean; useAi: boolean; savedAnswer?: boolean; recover?: boolean; newRequest?: boolean }) => call<{ started: boolean; template: ProductView }>(`/${id}/detect`, json('POST', input)),

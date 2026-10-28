@@ -222,6 +222,11 @@ export interface ProductInfo {
   revisions: ProductRevisionRef[];
   /** The size its master was last adapted to when it was saved (absent: its original size). */
   masterRatio?: OfferAspectRatio;
+  /**
+   * The size chosen for the master when it was created, on the upload screen (absent: Original, and on templates made
+   * before it was asked). Kept through review, choosing and decomposing; the Size step starts with it.
+   */
+  targetRatio?: OfferAspectRatio;
   /** Local reads and paid requests so far (reuse never adds to it). */
   activity: { scans: number; aiCalls: number; segmentRequests: number; costUsd: number };
   history: ProductHistoryEntry[];

@@ -60,7 +60,7 @@ export function OfferTemplates({ request, onProductTemplate, onOpenCreative, onO
   if (view.kind === 'ai') return <AiCreatives masterId={view.id} onBack={library} onSetup={() => setView({ kind: 'setup', id: view.id })} onManual={() => setView({ kind: 'reuse', id: view.id, at: Date.now() })} onEdit={creativeId => setView({ kind: 'reuse', id: view.id, creativeId, at: Date.now() })} onOpenRun={onOpenRun} />;
   if (view.kind === 'reuse') return <CreativeStudio key={`${view.id}-${view.creativeId ?? view.at}`} masterId={view.id} creativeId={view.creativeId} onBack={library} onOpenEditor={onOpenCreative} onAi={() => setView({ kind: 'ai', id: view.id })} onOpenRun={onOpenRun} />;
   if (view.kind === 'new') return <NewTemplate onCancel={library} onProduct={() => product({ view: 'new' })} onCreated={id => setView({ kind: 'setup', id })} />;
-  if (client) return <TemplateGallery onUse={id => product({ view: 'reuse', id })} />;
+  if (client) return <TemplateGallery onUse={(id, ratio) => product({ view: 'reuse', id, ratio })} />;
   return <>
     <Library onNew={() => setView({ kind: 'new' })} onSetup={id => setView({ kind: 'setup', id })} onAi={id => setView({ kind: 'ai', id })} onReuse={(id, creativeId) => setView({ kind: 'reuse', id, creativeId, at: Date.now() })} />
     <div className="ot-page prt-library-page"><ProductLibrary onNew={() => product({ view: 'new' })} onSetup={id => product({ view: 'setup', id })} onUse={id => product({ view: 'template', id })} onGenerate={id => product({ view: 'template', id, tab: 'variations' })} onReuse={id => product({ view: 'reuse', id })} />

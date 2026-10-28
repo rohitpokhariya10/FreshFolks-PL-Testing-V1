@@ -166,7 +166,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     };
   }
   function list() {
-    return store.list().filter(t => !!t.product).map(t => { const v = view(t.id); return { id: t.id, name: t.name, createdAt: t.createdAt, updatedAt: t.updatedAt, stage: v.stage, source: t.source, counts: v.counts, revisions: v.product.revisions.length, ...(v.product.revisions.at(-1)?.aspectRatio ? { master: { aspectRatio: v.product.revisions.at(-1)!.aspectRatio!, canvas: v.product.revisions.at(-1)!.canvas!, preview: v.product.revisions.at(-1)!.preview } } : {}), ...(v.product.revisions.at(-1)?.draft ? { draft: true } : {}) }; });
+    return store.list().filter(t => !!t.product).map(t => { const v = view(t.id); return { id: t.id, name: t.name, createdAt: t.createdAt, updatedAt: t.updatedAt, stage: v.stage, source: t.source, counts: v.counts, revisions: v.product.revisions.length, ...(v.product.revisions.at(-1)?.aspectRatio ? { master: { aspectRatio: v.product.revisions.at(-1)!.aspectRatio!, canvas: v.product.revisions.at(-1)!.canvas!, preview: v.product.revisions.at(-1)!.preview } } : {}), ...(v.product.revisions.at(-1)?.draft ? { draft: true } : {}), ...(v.product.targetRatio ? { targetRatio: v.product.targetRatio } : {}) }; });
   }
 
   // --- Create ----------------------------------------------------------------------------------------------------------
@@ -177,8 +177,13 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     const found = findSheetCreatives(await decodeRgba(img.input));
     return { width: img.width, height: img.height, sheet: found.sheet, boxes: found.boxes };
   }
-  /** A template from an upload; with `crop`, from that rectangle of it (a creative on a sheet), cropped without resampling. */
-  async function create(bytes: Buffer, input: { name?: string; filename?: string; crop?: PixelRect }) {
+  /**
+   * A template from an upload; with `crop`, from that rectangle of it (a creative on a sheet), cropped without resampling.
+   * `aspectRatio`: the master's size chosen on the upload screen ('original' or absent: its own size), kept with it.
+   */
+  async function create(bytes: Buffer, input: { name?: string; filename?: string; crop?: PixelRect; aspectRatio?: unknown }) {
+    if (input.aspectRatio !== undefined && input.aspectRatio !== 'original' && !isOfferAspectRatio(input.aspectRatio)) fail('INVALID_REQUEST', 'Choose Original, Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9.');
+    const targetRatio = isOfferAspectRatio(input.aspectRatio) ? input.aspectRatio : undefined;
     let img;
     try { img = await ingestImage(bytes, 'image', { minSide: PRODUCT_LIMITS.minSide }); } catch (error) { if (error instanceof ProtectedImageError) fail(error.code, error.message); throw error; }
     let sourceBytes = img.input, sheet: ProductInfo['sheet'], files: Record<string, Buffer> = {};
@@ -194,8 +199,8 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     const meta = await sharp(sourceBytes).metadata(), hash = sha256(sourceBytes), ext = input.crop ? 'png' : img.ext, file = `source.${ext}`;
     files = { [file]: sourceBytes, ...files };
     const now = nowIso(), id = newProtectedTemplateId(), name = (input.name?.trim() || input.filename?.replace(/\.[a-z0-9]+$/i, '') || 'Product template').slice(0, PRODUCT_LIMITS.maxName);
-    const product: ProductInfo = { version: PRODUCT_SCHEMA_VERSION, type: 'product-text', ...(sheet ? { sheet } : {}), objects: [], objectsRevision: 0, revisions: [], activity: { scans: 0, aiCalls: 0, segmentRequests: 0, costUsd: 0 },
-      history: [{ at: now, action: 'created', detail: input.filename ? `From ${input.filename.slice(0, 120)}` : undefined }, ...(sheet ? [{ at: now, action: 'cropped' as const, detail: `One creative (${sheet.crop.width}×${sheet.crop.height} at ${sheet.crop.x},${sheet.crop.y}) of a ${sheet.width}×${sheet.height} sheet.` }] : [])] };
+    const product: ProductInfo = { version: PRODUCT_SCHEMA_VERSION, type: 'product-text', ...(sheet ? { sheet } : {}), ...(targetRatio ? { targetRatio } : {}), objects: [], objectsRevision: 0, revisions: [], activity: { scans: 0, aiCalls: 0, segmentRequests: 0, costUsd: 0 },
+      history: [{ at: now, action: 'created', detail: [input.filename ? `From ${input.filename.slice(0, 120)}` : '', targetRatio ? `Master size chosen: ${REUSE_ASPECT_LABELS[targetRatio]}` : ''].filter(Boolean).join('. ') || undefined }, ...(sheet ? [{ at: now, action: 'cropped' as const, detail: `One creative (${sheet.crop.width}×${sheet.crop.height} at ${sheet.crop.x},${sheet.crop.y}) of a ${sheet.width}×${sheet.height} sheet.` }] : [])] };
     store.create({ schemaVersion: PROTECTED_SCHEMA_VERSION, id, name, createdAt: now, updatedAt: now, revision: 1, coordinateSystem: 'source-pixels', elements: [], elementsRevision: 0, layerInstructions: '', runs: [],
       source: { file, inputFile: file, sha256: hash, mime: `image/${ext === 'jpg' ? 'jpeg' : ext}`, width: meta.width!, height: meta.height!, bytes: sourceBytes.length, orientationNormalized: false, origin: { kind: 'upload', ...(input.filename ? { filename: input.filename.slice(0, 200) } : {}) } },
       product }, files);
@@ -926,6 +931,23 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     return latest.fromRevision ?? snapshot(id, latest.revision).adaptation?.fromRevision ?? latest.revision;
   };
   /**
+   * The master's chosen size changed later in its creation (the Decompose screen): kept with the template, so every step
+   * and a reload start with it. 'original': its own size. Nothing is composed or charged here.
+   */
+  const setTargetRatio = (id: string, input: { ratio?: unknown; expectedRevision?: unknown }) => locked(id, async () => {
+    const t = requireProduct(id);
+    if (input.expectedRevision !== undefined && input.expectedRevision !== t.revision) fail('STALE_REVISION', `This template changed since you opened it (revision ${t.revision}). Reload it and try again.`, { revision: t.revision });
+    if (input.ratio !== 'original' && !isOfferAspectRatio(input.ratio)) fail('INVALID_REQUEST', 'Choose Original, Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9.');
+    const ratio = isOfferAspectRatio(input.ratio) ? input.ratio : undefined;
+    if ((t.product.targetRatio ?? undefined) === ratio) return view(id);
+    store.update(id, t.revision, x => {
+      const q = x.product!;
+      if (ratio) q.targetRatio = ratio; else delete q.targetRatio;
+      history(q, { action: 'reviewed', detail: `Master size chosen: ${ratio ? REUSE_ASPECT_LABELS[ratio] : 'Original size'}.` });
+    });
+    return view(id);
+  });
+  /**
    * The master in a common ratio, previewed before it is saved: composed from the saved original revision by the Reuse
    * Template engine (reuseCompose.ts) — free by the rules, or by its approved AI composition — with its checks.
    */
@@ -979,6 +1001,6 @@ export function createProductTemplates(options: ProductTemplateOptions) {
   // Reuse Template (separate from variations): the person's own product set, copy and formats.
   const reuse = createReuseStudio({ store, creatives, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, placement: options.placement, composer: options.composer, recognizer: options.recognizer, toTemplate: input => createFromVariation(input) });
 
-  return { list, view, sheetOf, create, createFromVariation, startDetect, review, fitText, select, brief, editBrief, uploadReviewAsset, estimate, startPrepare, approve, publish, openEditor, saveEditorMaster, masterSize, saveMasterSize, snapshot, creatives, variations, reuse, isDetecting: (id: string) => detecting.has(id), isPreparing: (id: string) => preparing.has(id), requireProduct, kinds: PRODUCT_ELEMENT_KINDS, isOverlayKind };
+  return { list, view, sheetOf, create, createFromVariation, startDetect, review, fitText, select, brief, editBrief, uploadReviewAsset, estimate, startPrepare, approve, publish, openEditor, saveEditorMaster, masterSize, saveMasterSize, setTargetRatio, snapshot, creatives, variations, reuse, isDetecting: (id: string) => detecting.has(id), isPreparing: (id: string) => preparing.has(id), requireProduct, kinds: PRODUCT_ELEMENT_KINDS, isOverlayKind };
 }
 export type ProductTemplates = ReturnType<typeof createProductTemplates>;

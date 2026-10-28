@@ -51,7 +51,7 @@ const ratioKey = (r: ReuseAspectRatio) => (r === 'original' ? 'original' : r.rep
 /** Each format's number in a derived template's name and id (stable: the formats offered first keep theirs). */
 const FORMAT_INDEX: Record<ReuseAspectRatio, number> = { original: 0, '3:9': 1, '4:9': 2, '16:9': 3, '1:1': 4, '4:5': 5, '9:16': 6 };
 /** Bumped when reuseCompose.ts changes what a recomposed background looks like (a new cached file). */
-const RECOMPOSE_VERSION = 1;
+const RECOMPOSE_VERSION = 2;
 const isRatio = (r: unknown): r is ReuseAspectRatio => (REUSE_ASPECT_RATIOS as readonly string[]).includes(r as string);
 const asInstance = (c: ProductCreative) => ({ ...c, schemaVersion: CREATIVE_SCHEMA_VERSION, masterId: c.templateId, masterRevision: c.templateRevision, origin: { kind: 'master' }, editor: null, exports: [], history: [] }) as unknown as CreativeInstance;
 const area = (b: Box) => Math.max(0, b.width) * Math.max(0, b.height);
@@ -86,7 +86,7 @@ interface Context {
  */
 interface Ground { file: string; png: Buffer; lettering: Map<string, { file: string; sha256: string; box: Box }> }
 /** Bumped when stageCleanup.ts changes what it draws (a new cached file per revision). */
-const STAGE_CLEANUP_VERSION = 1, TEXT_ART_VERSION = 3;
+const STAGE_CLEANUP_VERSION = 1, TEXT_ART_VERSION = 5;
 export interface Composed {
   creative: ProductCreative; frame: ReuseFrame; mode: ReusePlacementMode;
   /** `places`: for a product standing in a template product's place, that original product's box in this format. */
@@ -143,6 +143,27 @@ export function fitInSlot(slot: ProductSlot, picture: { width: number; height: n
   const scale = Math.min(slot.targetHeight / ph, room / pw, (slot.contactY + 1) / ph, canvas.width / pw);
   const width = Math.max(1, Math.round(pw * scale)), height = Math.max(1, Math.round(ph * scale));
   return { x: Math.round(Math.min(Math.max(0, cx - width / 2), canvas.width - width)), y: Math.round(Math.max(0, slot.contactY + 1 - height)), width, height };
+}
+
+/**
+ * A decoration scattered over much of the poster (confetti, sparkles, light rays): its box spans most of the scene, so it
+ * is not an area a product could hide — products are never kept clear of it (they would have nowhere to stand).
+ */
+export const scattered = (b: Box, canvas: { width: number; height: number }) => area(b) > canvas.width * canvas.height * 0.25;
+/**
+ * A new photo standing in a template product's place (`was`: that product's box), made smaller about its foot point
+ * (proportions kept, on the same base line) until it covers no protected area more than the product it replaces did —
+ * with a margin under the checks' own limit (8 % of the area). At most down to 55 %; unchanged when it is already clear.
+ */
+export function clearOfKeepOut(box: Box, was: Box | undefined, keepOut: Box[]): Box {
+  const covers = (b: Box) => keepOut.some(k => inter(b, k) - (was ? inter(was, k) : 0) > area(k) * 0.06);
+  if (!covers(box)) return box;
+  const cx = box.x + box.width / 2, foot = box.y + box.height;
+  for (let k = 0.97; k >= 0.549; k -= 0.03) {
+    const b = { x: Math.round(cx - box.width * k / 2), y: Math.round(foot - box.height * k), width: Math.max(1, Math.round(box.width * k)), height: Math.max(1, Math.round(box.height * k)) };
+    if (!covers(b)) return b;
+  }
+  return box;
 }
 
 export function createReuseStudio(deps: {
@@ -594,7 +615,16 @@ export function createReuseStudio(deps: {
     const keepOut = [...c.groups.map(g => ({ g, b: groupBounds(c, g.id) })).filter(x => x.b).map(x => ({ ...x.b!, label: `the text “${x.g.label.slice(0, 40)}”` })),
       ...c.images.filter(i => !i.hidden).map(i => ({ ...i.box, label: `the ${i.label}` })),
       // Decorations painted into the background (a badge beside the stage) are never covered either.
-      ...ctx.decorations.filter(x => !frame.excluded.includes(x.label)).map(x => ({ ...mapBox(frame, x.box), label: `the ${x.label}` }))];
+      ...ctx.decorations.filter(x => !frame.excluded.includes(x.label) && !scattered(x.box, snapshot.canvas)).map(x => ({ ...mapBox(frame, x.box), label: `the ${x.label}` }))];
+    // A new photo in a template product's place may be wider than what stood there (fitInSlot): kept clear of the badges,
+    // text and logos beside it by being made a little smaller, never moved off its place.
+    if (mode === 'original') c = { ...c, objects: c.objects.map(o => {
+      if (o.kind !== 'product' || o.asset.kind !== 'upload' || !places[o.id]) return o;
+      const b = clearOfKeepOut(o.box, mapBox(frame, places[o.id]), keepOut);
+      if (b === o.box) return o;
+      notes.push(`${o.label} was made ${Math.round((1 - b.height / o.box.height) * 100)} % smaller to stay clear of the template’s badge, text and logos beside its place.`);
+      return { ...o, box: { ...o.box, ...b } };
+    }) };
     // Something beside the stage reaching down into the products' height (a badge, its words) narrows the lane on its side.
     for (const k of keepOut) {
       const band = { top: stage.cy - stage.b - H * 0.25, bottom: stage.cy + stage.b };

@@ -8,6 +8,7 @@ import { productPosterPng } from './productPoster.fixture.js';
 import { frameBackground, planFrame } from './reuseLayout.js';
 import { checkPlacement, geometryPlacement, shapeMismatch, type PlacementInput, type ReusePlacementPlanner } from './reusePlacement.js';
 import { cleanStage } from './stageCleanup.js';
+import { clearOfKeepOut, scattered } from './reuseStudio.js';
 import { refineCluster } from './reuseCluster.js';
 type ReusePreview = { ratio: ReuseAspectRatio; creative: ProductCreative; checks: { status: string } };
 
@@ -275,5 +276,26 @@ describe('Reuse Template composition pass (one showcase group)', () => {
     const hidden = refineCluster(input, [{ id: 'f', x: 2000, y: 1800, width: 440, height: 860, z: 0 }, { id: 'w', x: 2020, y: 2100, width: 420, height: 560, z: 9 }], 'f');
     const [back, front] = ['f', 'w'].map(k => hidden.boxes.find(b => b.id === k)!);
     expect(inter(front, back) / (back.width * back.height)).toBeLessThanOrEqual(0.41);
+  });
+});
+
+describe('Reuse Template: a new photo in a template product’s place', () => {
+  const canvas = { width: 1560, height: 1563 };
+  it('is never kept clear of confetti scattered over the whole scene, only of compact elements', () => {
+    expect(scattered({ x: 54, y: 477, width: 1475, height: 625 }, canvas)).toBe(true);
+    expect(scattered({ x: 351, y: 511, width: 223, height: 224 }, canvas)).toBe(false);
+  });
+  it('is made smaller about its foot point until it covers a badge beside its place no more than the product it replaces did', () => {
+    // A wide espresso machine in the place of a slim payment stand, reaching over the badge on its left.
+    const was = { x: 613, y: 507, width: 369, height: 685 }, box = { x: 520, y: 540, width: 553, height: 650 }, badge = { x: 351, y: 511, width: 223, height: 224 };
+    const fit = clearOfKeepOut(box, was, [badge]);
+    expect(fit).not.toBe(box);
+    expect(fit.y + fit.height).toBe(box.y + box.height); expect(fit.x + fit.width / 2).toBeCloseTo(box.x + box.width / 2, 0);
+    expect(fit.width / fit.height).toBeCloseTo(box.width / box.height, 1);
+    expect(inter(fit, badge) - inter(was, badge)).toBeLessThanOrEqual(badge.width * badge.height * 0.08);
+    expect(fit.width).toBeGreaterThan(box.width * 0.8);
+    // Already clear: unchanged.
+    const clear = { x: 640, y: 540, width: 320, height: 650 };
+    expect(clearOfKeepOut(clear, was, [badge])).toBe(clear);
   });
 });

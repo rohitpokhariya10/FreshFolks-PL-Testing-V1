@@ -24,6 +24,16 @@ export async function textArt(sourceImage: Buffer, basePng: Buffer, words: Box[]
   // Where they differ (beyond compression noise), grown by 3 px so every letter keeps its smooth edge.
   const differ = new Uint8Array(w * h);
   for (let i = 0; i < w * h; i++) if (Math.max(Math.abs(s[i * 3] - b[i * 3]), Math.abs(s[i * 3 + 1] - b[i * 3 + 1]), Math.abs(s[i * 3 + 2] - b[i * 3 + 2])) > 28) differ[i] = 1;
+  // Above and below the words' own rows, a long line — solid or dotted — is a rule or a plate's rim the text removal
+  // took out with the letters (a pill's border just under the line), not lettering: left out (a descender is short, and
+  // the descenders of a line are far apart).
+  const top = Math.min(...words.map(v => v.y)) - y0, bottom = Math.max(...words.map(v => v.y + v.height)) - y0, long = heights[heights.length >> 1] * 2.5;
+  for (let y = 0; y < h; y++) {
+    if (y >= top && y < bottom) continue;
+    let run = 0, longest = 0, first = -1, last = -1, count = 0;
+    for (let x = 0; x < w; x++) { const on = differ[y * w + x]; run = on ? run + 1 : 0; longest = Math.max(longest, run); if (on) { if (first < 0) first = x; last = x; count++; } }
+    if (longest >= long || (last - first >= long && count >= (last - first + 1) * 0.35)) differ.fill(0, y * w, (y + 1) * w);
+  }
   const grown = new Uint8Array(w * h), R = 3;
   let bx0 = w, by0 = h, bx1 = -1, by1 = -1;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {

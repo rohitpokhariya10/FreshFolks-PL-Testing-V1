@@ -1,11 +1,19 @@
 /**
- * Create Offer Creative, step 1: the saved templates as large cards, one action each (Use This Template). For anyone:
- * no versions, stages, layers or plans — only templates ready to use are shown. Templates made from a creative
- * (Decompose & Edit) follow the masters in their own row.
+ * Create Offer Creative, step 1: the creative's size, then the saved templates as large cards, one action each (Use This
+ * Template). For anyone: no versions, stages, layers or plans — only templates ready to use are shown. Templates made
+ * from a creative (Decompose & Edit) follow the masters in their own row. The size goes with the chosen template into
+ * the next steps (kept in its draft); this browser remembers the last one chosen.
  */
 import { useEffect, useState } from 'react';
 import { ArrowRight, Check, LayoutTemplate } from 'lucide-react';
+import { REUSE_OFFERED_RATIOS, type ReuseAspectRatio } from '@frameflow/shared';
 import { productApi, productFileUrl, type ProductListItem } from './api';
+import { SizePicker } from './SizeControls';
+
+const SIZE_KEY = 'frameflow.offerCreative.size';
+/** The size last chosen in Create Offer Creative (here, or while making a creative), if one was. */
+const rememberedSize = (): ReuseAspectRatio | undefined => { try { const v = localStorage.getItem(SIZE_KEY); return (REUSE_OFFERED_RATIOS as readonly string[]).includes(v ?? '') ? v as ReuseAspectRatio : undefined; } catch { return undefined; } };
+export const rememberSize = (r: ReuseAspectRatio) => { try { localStorage.setItem(SIZE_KEY, r); } catch { /* remembered for this visit only */ } };
 
 export const CREATIVE_STEPS = ['Choose Template', 'Upload Products', 'Generate', 'Review & Save'] as const;
 /** Where the person is in the four steps of Create Offer Creative. */
@@ -21,8 +29,12 @@ export function formatName(width: number, height: number) {
   return near ? near[1] : r > 1 ? 'Landscape' : 'Portrait';
 }
 
-export function TemplateGallery({ onUse }: { onUse: (id: string) => void }) {
-  const [templates, setTemplates] = useState<ProductListItem[]>(), [error, setError] = useState('');
+/** `onUse`: the template and the size chosen here (undefined when none was ever chosen: a creative continued keeps its own). */
+export function TemplateGallery({ onUse: choose }: { onUse: (id: string, ratio?: ReuseAspectRatio) => void }) {
+  const [templates, setTemplates] = useState<ProductListItem[]>(), [error, setError] = useState(''), [chosen, setChosen] = useState<ReuseAspectRatio | undefined>(rememberedSize);
+  const size = chosen ?? 'original';
+  const chooseSize = (r: ReuseAspectRatio) => { setChosen(r); rememberSize(r); };
+  const onUse = (id: string) => choose(id, chosen);
   useEffect(() => { void productApi.list().then(r => setTemplates(r.templates)).catch(() => setError('We couldn’t load your templates. Check your connection and try again.')); }, []);
   const ready = (templates ?? []).filter(t => t.revisions > 0);
   const fromCreative = (t: ProductListItem) => /^variation-/.test(t.source.origin?.kind === 'upload' ? t.source.origin.filename ?? '' : '');
@@ -40,6 +52,9 @@ export function TemplateGallery({ onUse }: { onUse: (id: string) => void }) {
   return <div className="cg-page">
     <header className="cg-head"><h2>Choose a template</h2><p>Pick the design for your offer. You’ll add your own product photos next — the festive artwork, text and logos stay as they are.</p></header>
     <CreativeSteps current={0} />
+    <section className="cg-size" aria-label="Choose your size"><h3>Choose your size</h3>
+      <p>Your creative is designed for this shape — never stretched. Original keeps each template’s own size. You can still change it before you save.</p>
+      <SizePicker value={size} onChange={chooseSize} /></section>
     {error && <div className="sr-error" role="alert"><p>{error}</p></div>}
     {!templates && !error ? <div className="cg-grid" aria-busy="true" aria-label="Loading templates">{[0, 1, 2].map(i => <div key={i} className="cg-card cg-skeleton" aria-hidden="true"><div className="cg-thumb" /><div className="cg-card-body"><span /><span /></div></div>)}</div>
       : templates && !ready.length ? <section className="cg-empty"><LayoutTemplate size={30} aria-hidden="true" /><h3>No templates yet</h3><p>Ask your template owner to add one under Offer Templates. It will appear here, ready to use.</p></section>

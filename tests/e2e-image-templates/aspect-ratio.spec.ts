@@ -24,26 +24,32 @@ async function savedTemplate(request: APIRequestContext, name: string) {
   expect(v.stage).toBe('ready');
   return id;
 }
-async function openTemplate(page: Page, name: string) {
+/** Create Offer Creative: the size chosen at its start (step 1, with the template), then the template. */
+async function openTemplate(page: Page, name: string, size?: RegExp) {
   await page.goto('/');
   await page.getByRole('button', { name: 'Create Offer Creative' }).click();
   const app = page.getByRole('dialog', { name: 'Create Offer Creative' });
+  if (size) {
+    const start = app.getByRole('region', { name: 'Choose your size' });
+    for (const label of [/^Original/, /Square 1:1/, /Portrait 4:5/, /Story 9:16/, /Landscape 16:9/]) await expect(start.getByRole('radio', { name: label })).toBeVisible();
+    await start.getByRole('radio', { name: size }).click();
+    await expect(start.getByRole('radio', { name: size })).toHaveAttribute('aria-checked', 'true');
+    await page.screenshot({ path: `${OUT}/00-choose-size-with-template.png` });
+  }
   await app.getByRole('article', { name: `Template ${name}` }).getByRole('button', { name: 'Use This Template' }).click();
   await expect(app.getByRole('heading', { name: 'Create Your Offer Creative' })).toBeVisible();
   return app;
 }
 const exact = (c: { width: number; height: number }, w: number, h: number) => c.width * h === c.height * w;
 
-test('choose a size before the first generation, approve AI composition, check and save; reuse keeps it and composes another size', async ({ page, request }) => {
+test('choose a size at the start (with the template), approve AI composition, check and save; reuse keeps it and composes another size', async ({ page, request }) => {
   mkdirSync(OUT, { recursive: true });
   await page.route(url => /^https?:$/.test(url.protocol) && url.hostname !== '127.0.0.1', r => r.abort());
   const name = `Aspect ratio proof ${Date.now().toString(36)}`, id = await savedTemplate(request, name);
-  let app = await openTemplate(page, name);
-  // The size is chosen before anything is made: the template's own and the common offer-creative ratios.
+  // The size is chosen at the very start, with the template, before any product is uploaded; it is carried in.
+  let app = await openTemplate(page, name, /Story 9:16/);
   const sizes = app.getByRole('radiogroup', { name: 'Creative size' });
   for (const label of [/^Original/, /Square 1:1/, /Portrait 4:5/, /Story 9:16/, /Landscape 16:9/]) await expect(sizes.getByRole('radio', { name: label })).toBeVisible();
-  await expect(sizes.getByRole('radio', { name: /^Original/ })).toHaveAttribute('aria-checked', 'true');
-  await sizes.getByRole('radio', { name: /Story 9:16/ }).click();
   await expect(sizes.getByRole('radio', { name: /Story 9:16/ })).toHaveAttribute('aria-checked', 'true');
   const packshot = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="360" height="760"><rect x="10" y="10" width="340" height="740" rx="18" fill="#374151"/><rect x="186" y="24" width="150" height="712" rx="10" fill="#4b5563"/></svg>')).png().toBuffer();
   await app.getByLabel('Upload product photos').setInputFiles({ name: 'refrigerator.png', mimeType: 'image/png', buffer: packshot });

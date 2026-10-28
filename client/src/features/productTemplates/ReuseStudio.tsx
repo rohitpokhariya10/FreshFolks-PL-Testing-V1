@@ -22,9 +22,9 @@ const PLACEMENT_LABEL = { original: 'the template’s own places', geometry: 'ar
  * Reuse Template: the simple flow first (Upload Products → Generate My Creative → Review and save); Edit Creative opens
  * the detailed studio on the same draft; every draft of the template is one click away.
  */
-export function ReuseStudio({ templateId, onBack, onOpenRunInEditor, onOpenTemplate }: { templateId: string; onBack: () => void; onOpenRunInEditor: (runId: string) => Promise<void>; onOpenTemplate: (id: string) => void }) {
+export function ReuseStudio({ templateId, initialRatio, onBack, onOpenRunInEditor, onOpenTemplate }: { templateId: string; /** The size chosen with the template (Create Offer Creative, step 1). */ initialRatio?: ReuseAspectRatio; onBack: () => void; onOpenRunInEditor: (runId: string) => Promise<void>; onOpenTemplate: (id: string) => void }) {
   const [mode, setMode] = useState<{ kind: 'simple' } | { kind: 'drafts' } | { kind: 'editor'; draftId: string; from: 'simple' | 'drafts' }>({ kind: 'simple' });
-  if (mode.kind === 'simple') return <SimpleReuse templateId={templateId} onBack={onBack} onEdit={did => setMode({ kind: 'editor', draftId: did, from: 'simple' })} onAllDrafts={() => setMode({ kind: 'drafts' })} onOpenRunInEditor={onOpenRunInEditor} onOpenTemplate={onOpenTemplate} />;
+  if (mode.kind === 'simple') return <SimpleReuse templateId={templateId} initialRatio={initialRatio} onBack={onBack} onEdit={did => setMode({ kind: 'editor', draftId: did, from: 'simple' })} onAllDrafts={() => setMode({ kind: 'drafts' })} onOpenRunInEditor={onOpenRunInEditor} onOpenTemplate={onOpenTemplate} />;
   if (mode.kind === 'editor') return <ReuseEditor key={mode.draftId} templateId={templateId} draftId={mode.draftId} backLabel={mode.from === 'simple' ? 'Back to my creative' : 'Reuse drafts'} simple={mode.from === 'simple'} onClose={() => setMode(mode.from === 'simple' ? { kind: 'simple' } : { kind: 'drafts' })} onOpenRunInEditor={onOpenRunInEditor} onOpenTemplate={onOpenTemplate} />;
   return <ReuseDrafts templateId={templateId} onBack={() => setMode({ kind: 'simple' })} onOpen={did => setMode({ kind: 'editor', draftId: did, from: 'drafts' })} />;
 }

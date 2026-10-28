@@ -5,8 +5,9 @@ import type { ProductSnapshot, ProjectDocument } from '@frameflow/shared';
 import type { ProductView } from '../../client/src/features/productTemplates/api';
 
 // Creating a master template for the first time in a chosen size (offline: every provider is a test double; nothing is
-// paid, nothing leaves the machine): Upload → Review → Choose → Decompose → Size (16:9, previewed, designed by AI after
-// approval) → Save → Open in Editor; then the new master reused in another size from Create Offer Creative.
+// paid, nothing leaves the machine): the size chosen on the Upload screen (16:9) → Review → Choose → Decompose (the size
+// kept all along, also after a reload) → Size (16:9, previewed, designed by AI after approval) → Save → Open in Editor;
+// then the new master reused in another size from Create Offer Creative.
 const API = '/api/layerize-experiment/product-templates', OUT = 'test-results/master-aspect-ratio';
 test.use({ extraHTTPHeaders: { origin: `http://127.0.0.1:${process.env.FRAMEFLOW_OFFLINE_E2E_PORT ?? 3317}` }, actionTimeout: 30000 });
 test.setTimeout(300000);
@@ -20,7 +21,7 @@ async function open(page: Page) {
 }
 const exact = (c: { width: number; height: number }, w: number, h: number) => c.width * h === c.height * w;
 
-test('first-time master: choose 16:9 before saving, preview it, design it with AI, save, open it in the editor, reuse it in 9:16', async ({ page, request }, info) => {
+test('first-time master: choose 16:9 on the upload screen, keep it through every step, design it with AI, save, open it in the editor, reuse it in 9:16', async ({ page, request }, info) => {
   test.skip(info.project.name !== 'desktop', 'One run of this long flow.');
   mkdirSync(OUT, { recursive: true });
   await page.route(url => /^https?:$/.test(url.protocol) && url.hostname !== '127.0.0.1', r => r.abort());
@@ -32,11 +33,26 @@ test('first-time master: choose 16:9 before saving, preview it, design it with A
   await panel.getByLabel('Creative to upload').setInputFiles({ name: 'poster.png', mimeType: 'image/png', buffer: await (await request.get('/__test__/product-poster.png')).body() });
   await panel.getByLabel('Template name').fill(name);
   await panel.getByRole('checkbox', { name: /Find characters and products with AI/ }).check();
+  // The master's size, chosen at the start: Original by default (today's behaviour), Landscape 16:9 here.
+  const start = panel.getByRole('group', { name: 'Size of the master template' });
+  for (const label of [/^Original/, /Square 1:1/, /Portrait 4:5/, /Story 9:16/, /Landscape 16:9/]) await expect(start.getByRole('radio', { name: label })).toBeVisible();
+  await expect(start.getByRole('radio', { name: /^Original/ })).toHaveAttribute('aria-checked', 'true');
+  await start.getByRole('radio', { name: /Landscape 16:9/ }).click();
+  await expect(start.getByRole('radio', { name: /Landscape 16:9/ })).toHaveAttribute('aria-checked', 'true');
+  await page.screenshot({ path: `${OUT}/00-upload-choose-16x9.png` });
   const created = page.waitForResponse(r => r.url().endsWith(API) && r.request().method() === 'POST');
   await panel.getByRole('button', { name: 'Upload and find elements' }).click();
   const id = ((await (await created).json()) as ProductView).template.id;
-  // 2. Review keeps working as it did.
+  expect(((await (await request.get(`${API}/${id}`)).json()) as ProductView).product.targetRatio).toBe('16:9');
+  // 2. Review keeps working as it did, with the chosen size shown; a reload loses nothing (it is the template's).
   await expect(panel.getByRole('heading', { name: 'Here’s what we found' })).toBeVisible({ timeout: 120000 });
+  await expect(panel.getByTestId('chosen-size')).toContainText('Landscape 16:9');
+  await page.reload();
+  const again = await open(page), inLibrary = again.getByRole('article', { name: `Product template ${name}` });
+  await expect(inLibrary).toContainText('Master size chosen: Landscape 16:9');
+  await inLibrary.getByRole('button', { name: 'Continue setup' }).click();
+  await expect(again.getByRole('heading', { name: 'Here’s what we found' })).toBeVisible({ timeout: 120000 });
+  await expect(again.getByTestId('chosen-size')).toContainText('Landscape 16:9');
   for (const g of ['Characters', 'Products', 'Text', 'Logos']) await expect(panel.getByRole('region', { name: g, exact: true })).toBeVisible();
   await expect(panel.getByRole('list', { name: 'Steps' })).toContainText('Size');
   // 3. Choose and decompose (on this computer, free).
@@ -45,12 +61,11 @@ test('first-time master: choose 16:9 before saving, preview it, design it with A
   await panel.getByRole('button', { name: 'Continue to Decomposition' }).click();
   await expect(panel.getByRole('heading', { name: 'Inspect the layers and the background' })).toBeVisible({ timeout: 120000 });
   for (const c of await panel.getByRole('complementary', { name: 'Checks' }).getByRole('checkbox').all()) await c.check();
-  // 4. The size of the master, chosen before it is saved: Original keeps today's behaviour; 16:9 here.
+  // 4. The size chosen at the start is still the master's (changeable here before saving).
+  await expect(panel.getByTestId('chosen-size')).toContainText('Landscape 16:9');
   const sizes = panel.getByRole('group', { name: 'Size of the master template' });
-  for (const label of [/^Original/, /Square 1:1/, /Portrait 4:5/, /Story 9:16/, /Landscape 16:9/]) await expect(sizes.getByRole('radio', { name: label })).toBeVisible();
-  await expect(sizes.getByRole('radio', { name: /^Original/ })).toHaveAttribute('aria-checked', 'true');
-  await sizes.getByRole('radio', { name: /Landscape 16:9/ }).click();
-  await page.screenshot({ path: `${OUT}/01-inspect-choose-16x9.png` });
+  await expect(sizes.getByRole('radio', { name: /Landscape 16:9/ })).toHaveAttribute('aria-checked', 'true');
+  await page.screenshot({ path: `${OUT}/01-inspect-size-kept-16x9.png` });
   await panel.getByRole('button', { name: 'Save and preview Landscape 16:9' }).click();
   // 5. The 16:9 master previewed (composed free on this computer, labelled so), with its checks.
   await expect(panel.getByRole('heading', { name: 'Your master in Landscape 16:9' })).toBeVisible({ timeout: 120000 });

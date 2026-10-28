@@ -44,7 +44,7 @@ export function registerProductTemplateRoutes(router: Router, ctx: { products: P
     try {
       const { bytes, filename, fields } = await readUpload(req);
       if (!bytes?.length) throw new RunError('INVALID_UPLOAD', 'Choose an image.');
-      const id = await products.create(bytes, { name: fields.name, filename, crop: cropOf(fields.crop) });
+      const id = await products.create(bytes, { name: fields.name, filename, crop: cropOf(fields.crop), ...(fields.aspectRatio ? { aspectRatio: fields.aspectRatio } : {}) });
       products.startDetect(id, { useAi: fields.useAi === 'true' });
       res.status(201).json(products.view(id));
     } catch (error) { next(error); }
@@ -70,6 +70,7 @@ export function registerProductTemplateRoutes(router: Router, ctx: { products: P
   });
   router.post(`${base}/:id/approve`, json, async (req, res, next) => { try { res.json(await products.approve(idOf(req), { expectedRevision: req.body?.expectedRevision, acknowledge: req.body?.acknowledge, draft: req.body?.draft })); } catch (error) { next(error); } });
   // First-time master creation in a common ratio: preview the size (free; AI composition through the reuse compose route), then save it.
+  router.put(`${base}/:id/target-ratio`, json, async (req, res, next) => { try { res.json(await products.setTargetRatio(idOf(req), req.body ?? {})); } catch (error) { next(error); } });
   router.post(`${base}/:id/master-size`, json, async (req, res, next) => { try { res.json(await products.masterSize(idOf(req), req.body ?? {})); } catch (error) { next(error); } });
   router.post(`${base}/:id/master-size/save`, json, async (req, res, next) => { try { res.status(201).json(await products.saveMasterSize(idOf(req), req.body ?? {})); } catch (error) { next(error); } });
   router.post(`${base}/:id/publish`, json, async (req, res, next) => { try { res.status(201).json(await products.publish(idOf(req), { expectedRevision: req.body?.expectedRevision })); } catch (error) { next(error); } });

@@ -5,7 +5,8 @@ import { describe, expect, it } from 'vitest';
 import { OFFER_ASPECT_RATIOS, type ProductCreative, type ProductSnapshot, type ReuseDraft, type ReuseOutput } from '@frameflow/shared';
 import { setup, savedTemplate, type View } from './productServer.fixture.js';
 import { productPosterPng } from './productPoster.fixture.js';
-import { checkComposePlan, composeBackground, planRules, toCanvas, type composeRequest, type ReuseComposer, type Structure } from './reuseCompose.js';
+import { checkComposePlan, composeBackground, oneLineScale, planRules, readStructure, toCanvas, type composeRequest, type ReuseComposer, type Structure } from './reuseCompose.js';
+import { textArt } from './textArt.js';
 
 type Box = { x: number; y: number; width: number; height: number };
 const inter = (a: Box, b: Box) => Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x)) * Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
@@ -182,6 +183,34 @@ describe('Recompose in the Reuse Template studio (HTTP, temporary store, mocked 
 });
 
 describe('First-time master creation in a common ratio (HTTP, temporary store, mocked AI)', { timeout: 180000 }, () => {
+  it('keeps the size chosen on the upload screen through review, decomposition and saving; the Size step makes the master in it', async () => {
+    const s = await setup({ composer: composer() });
+    try {
+      // Only the offered sizes; nothing is created for another.
+      expect((await s.form('', await productPosterPng(), { name: 'Bad size', aspectRatio: '2:3' })).status).toBe(400);
+      const v = await savedTemplate(s, await productPosterPng(), { aspectRatio: '9:16' }), id = v.template.id;
+      // Kept with the template from the upload, through detection, review, decomposing and saving the original.
+      expect(v.product.targetRatio).toBe('9:16');
+      expect(v.product.revisions.map(r => r.aspectRatio ?? 'original')).toEqual(['original']);
+      expect((await s.call<{ templates: { id: string; targetRatio?: string }[] }>('')).body.templates.find(t => t.id === id)?.targetRatio).toBe('9:16');
+      // Changed later in the flow (the Decompose screen): kept; a stale revision is refused; Original clears it.
+      expect((await s.send('PUT', `/${id}/target-ratio`, { ratio: '16:9', expectedRevision: v.template.revision - 1 })).status).toBe(409);
+      let t = (await s.send<View>('PUT', `/${id}/target-ratio`, { ratio: '16:9', expectedRevision: v.template.revision })).body;
+      expect(t.product.targetRatio).toBe('16:9');
+      t = (await s.send<View>('PUT', `/${id}/target-ratio`, { ratio: 'original', expectedRevision: t.template.revision })).body;
+      expect(t.product.targetRatio).toBeUndefined();
+      t = (await s.send<View>('PUT', `/${id}/target-ratio`, { ratio: '9:16', expectedRevision: t.template.revision })).body;
+      // The Size step composes the chosen size from the saved original (free), and saves the master in it.
+      const preview = (await s.send<{ draft: ReuseDraft }>('POST', `/${id}/master-size`, { ratio: t.product.targetRatio })).body, out = preview.draft.outputs['9:16']!;
+      expect(exact('9:16', out.canvas)).toBe(true); expect(out.checks.status).not.toBe('failed');
+      const saved = (await s.send<View>('POST', `/${id}/master-size/save`, { draftId: preview.draft.id, ratio: '9:16', expectedRevision: t.template.revision })).body;
+      expect(saved.product).toMatchObject({ masterRatio: '9:16', targetRatio: '9:16' });
+      expect(saved.product.revisions.map(r => r.aspectRatio ?? 'original')).toEqual(['original', '9:16']);
+      // A template made without a size (or before it was asked) has none: Original, exactly as before.
+      expect((await savedTemplate(s, await productPosterPng())).product.targetRatio).toBeUndefined();
+    } finally { await s.close(); }
+  });
+
   it('saves the original, previews and saves a 16:9 master from it with every layer editable, opens it in the editor, and reuses it in another ratio', async () => {
     const s = await setup({ composer: composer() });
     try {
@@ -230,5 +259,42 @@ describe('First-time master creation in a common ratio (HTTP, temporary store, m
       const plain = await savedTemplate(s, await productPosterPng());
       expect(plain.product.revisions.map(x => x.aspectRatio ?? 'original')).toEqual(['original']);
     } finally { await s.close(); }
+  });
+});
+
+describe('Recompose: plates and lettering in the bands', () => {
+  /** A 1000 × 1000 template: the scene (rows 150–850), a footer with a dotted strip across it and one line of text on a pill whose rim was cleared where the letters were taken out. */
+  const style = { fontFamily: 'Poppins', fontWeight: 600, fontStyle: 'normal', fontSize: 30, letterSpacing: 0, color: '#111111', opacity: 1 } as const;
+  const template = { canvas: { width: 1000, height: 1000 }, images: [], objects: [], shapes: [], groups: [{ id: 'pg-prizes', label: 'iPhone 17 Pro Max | Pixel 10 Pro', category: 'offer', masterGroupId: null, align: 'center' }],
+    texts: ['iPhone', '17', 'Pro', 'Max', '|', 'Pixel', '10', 'Pro'].map((text, i) => ({ id: `ct-${i}`, wordId: null, groupId: 'pg-prizes', line: 0, order: i, text, x: 260 + i * 62, baselineY: 925, rotation: 0, style, hidden: false, locked: false, z: 1 })) } as unknown as ProductCreative;
+  const footer = (rim: boolean) => sharp({ create: { width: 1000, height: 1000, channels: 3, background: '#f6fbfb' } }).composite([{ input: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="1000">
+    <rect width="1000" height="850" fill="#7a5cf0"/>${Array.from({ length: 100 }, (_, i) => `<rect x="${i * 10}" y="856" width="6" height="4" fill="#22cc66"/>`).join('')}
+    <rect x="200" y="886" width="600" height="56" rx="28" fill="none" stroke="#111111" stroke-width="2"/>${rim ? '' : '<rect x="330" y="880" width="340" height="68" fill="#f6fbfb"/>'}</svg>`), left: 0, top: 0 }]).png().toBuffer();
+  const files = () => { const m = new Map<string, Buffer>(); return { has: (f: string) => m.has(f), read: (f: string) => m.get(f)!, write: (f: string, b: Buffer) => { m.set(f, b); } }; };
+
+  it('reads a pill broken where its text was taken out as ONE plate of that text, and leaves a strip across the band to the band', async () => {
+    const st = await readStructure(files(), await footer(false), template, { top: 150, bottom: 850 }, [], []);
+    expect(st.pieces).toHaveLength(1);
+    expect(st.pieces[0]).toMatchObject({ owner: 'g:pg-prizes', label: expect.stringMatching(/^Plate · /) });
+    // Both ends of the pill, whole: it travels round its text.
+    expect(st.pieces[0].box.x).toBeLessThanOrEqual(200); expect(st.pieces[0].box.x + st.pieces[0].box.width).toBeGreaterThanOrEqual(800);
+    expect(st.free.some(f => f.kind === 'piece')).toBe(false);
+    // The pill's rim along one row never becomes a stripe of the band's colour (each row: the median of its neighbours);
+    // the dotted strip across the band stays the band's own (its column draws it).
+    const { data } = await sharp(st.foot!.column).raw().toBuffer({ resolveWithObject: true }), k = 512 / 1000, first = Math.ceil(850 * k), row = (y: number) => (Math.floor(y * k) - first) * 3;
+    for (let y = 870; y <= 960; y++) expect(Math.min(...data.subarray(row(y), row(y) + 3))).toBeGreaterThan(200);
+    expect(Math.min(...data.subarray(row(858), row(858) + 3))).toBeLessThan(200);
+  });
+
+  it('keeps a one-line text on a plate one line (smaller), and a cut of its lettering leaves out the rule under it', async () => {
+    const zone = { x: 0, y: 0, width: 300, height: 80 }, k = oneLineScale(template, 'pg-prizes', zone)!;
+    expect(k).toBeGreaterThan(0); expect(k).toBeLessThan(1);
+    expect(oneLineScale({ ...template, texts: template.texts.map((t, i) => ({ ...t, line: i % 2 })) }, 'pg-prizes', zone)).toBeUndefined();
+    // The original: words with a rule 8 px under them; the base: neither (the text removal took the rule with the letters).
+    const words = [{ x: 300, y: 400, width: 400, height: 40 }];
+    const source = await sharp({ create: { width: 1000, height: 600, channels: 3, background: '#ffffff' } }).composite([{ input: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600"><rect x="300" y="400" width="400" height="40" fill="#111111"/><rect x="250" y="448" width="500" height="2" fill="#111111"/></svg>'), left: 0, top: 0 }]).png().toBuffer();
+    const base = await sharp({ create: { width: 1000, height: 600, channels: 3, background: '#ffffff' } }).png().toBuffer();
+    const cut = (await textArt(source, base, words))!;
+    expect(cut.box.y + cut.box.height).toBeLessThanOrEqual(445);
   });
 });

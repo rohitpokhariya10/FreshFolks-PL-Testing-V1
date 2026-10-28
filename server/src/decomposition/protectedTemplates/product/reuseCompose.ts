@@ -80,8 +80,10 @@ export async function readStructure(files: Files, base: Buffer, template: Produc
     return m;
   };
   const top = Math.max(0, Math.min(ah, Math.floor(art.top * k))), bottom = Math.max(top, Math.min(ah, Math.ceil(art.bottom * k))), minBand = Math.max(8, H * 0.02);
+  // (A thin line along most of one row — a plate's rim — would make that row's median its colour, and the band, made
+  // longer, would show it as a stripe: each row is the median of its own and its neighbours' within the band.)
   const band = async (y0: number, y1: number): Promise<Band> => {
-    const rows = Array.from({ length: Math.max(1, y1 - y0) }, (_, i) => rowMedian(Math.min(ah - 1, y0 + i)));
+    const rows = Array.from({ length: Math.max(1, y1 - y0) }, (_, i) => { const near = [-2, -1, 0, 1, 2].map(d => rowMedian(Math.max(y0, Math.min(y1 - 1, Math.min(ah - 1, y0 + i + d))))); return [0, 1, 2].map(c => near.map(r => r[c]).sort((a, b) => a - b)[2]); });
     const colour = [0, 1, 2].map(c => [...rows.map(r => r[c])].sort((a, b) => a - b)[rows.length >> 1]);
     return { column: await sharp(Buffer.from(rows.flat()), { raw: { width: 1, height: rows.length, channels: 3 } }).png().toBuffer(), colour: hex(colour) };
   };
@@ -104,13 +106,21 @@ export async function readStructure(files: Files, base: Buffer, template: Produc
   for (const o of template.objects.filter(x => x.kind === 'character' && !x.hidden)) keep.push({ ...o.box, label: o.label, kind: 'character' });
   for (const d of decorations) keep.push({ ...d.box, label: d.label, kind: 'decoration' });
   for (const s of stages) keep.push({ ...s, label: 'the stage', kind: 'stage' });
-  // Painted marks in the bands (pixels off their row's colour), as connected pieces on the analysis grid.
+  // The band's own colour at a row: the median of the row medians around it, so a thin line running along most of one
+  // row (a pill's rim) is still a mark on it, not the colour of that row.
+  const grounds = new Map<number, number[]>();
+  const groundAt = (y: number) => {
+    let g = grounds.get(y);
+    if (!g) { const rows = Array.from({ length: 7 }, (_, i) => rowMedian(Math.max(0, Math.min(ah - 1, y - 3 + i)))); g = [0, 1, 2].map(c => rows.map(r => r[c]).sort((a, b) => a - b)[3]); grounds.set(y, g); }
+    return g;
+  };
+  // Painted marks in the bands (pixels off their band's colour), as connected pieces on the analysis grid.
   const mask = new Uint8Array(aw * ah);
   for (const [y0, y1] of [...(head ? [[0, top]] : []), ...(foot ? [[bottom, ah]] : [])]) for (let y = y0; y < y1; y++) {
-    const m = rowMedian(y);
+    const m = groundAt(y);
     for (let x = 0; x < aw; x++) { const p = (y * aw + x) * 3; if (Math.max(Math.abs(data[p] - m[0]), Math.abs(data[p + 1] - m[1]), Math.abs(data[p + 2] - m[2])) > 28) mask[y * aw + x] = 1; }
   }
-  const seen = new Uint8Array(aw * ah), pieces: Piece[] = [];
+  const seen = new Uint8Array(aw * ah), pieces: Piece[] = [], marks: { box: Box; owner?: FreeItem }[] = [];
   for (let start = 0; start < mask.length; start++) {
     if (!mask[start] || seen[start]) continue;
     let x0 = aw, y0 = ah, x1 = 0, y1 = 0;
@@ -126,16 +136,31 @@ export async function readStructure(files: Files, base: Buffer, template: Produc
     }
     const box = { x: Math.max(0, Math.floor((x0 - 1) / k)), y: Math.max(0, Math.floor((y0 - 1) / k)), width: 0, height: 0 };
     box.width = Math.min(W, Math.ceil((x1 + 2) / k)) - box.x; box.height = Math.min(H, Math.ceil((y1 + 2) / k)) - box.y;
-    if (area(box) < W * H * 0.00012) continue;
-    // Its owner: the logo or text it lies under (most of either inside the other).
+    // Its owner: the logo or text it lies under (most of either inside the other); else a text whose row it frames (a
+    // part of a plate round that line: as tall as the line or a little taller, across part of it).
     const owner = free.map(f => ({ f, o: inter(box, { x: f.box.x - 6, y: f.box.y - 6, width: f.box.width + 12, height: f.box.height + 12 }) / Math.max(1, Math.min(area(box), area(f.box))) }))
-      .filter(x => x.o >= 0.5).sort((a, b) => b.o - a.o)[0]?.f;
-    if (!owner && area(box) < W * H * 0.002) continue;
-    // Cut out against its rows' own colour (soft at its rim): the band around it is drawn by the band.
+      .filter(x => x.o >= 0.5).sort((a, b) => b.o - a.o)[0]?.f
+      ?? free.filter(f => f.kind === 'text' && box.height <= f.box.height * 2.5 && Math.min(box.y + box.height, f.box.y + f.box.height) - Math.max(box.y, f.box.y) >= f.box.height * 0.8
+        && Math.min(box.x + box.width, f.box.x + f.box.width) > Math.max(box.x, f.box.x)).sort((a, b) => a.box.height - b.box.height)[0];
+    marks.push({ box, ...(owner ? { owner } : {}) });
+  }
+  // The parts of one plate are one piece, so it travels whole with its text: a pill whose rim was cleared where the
+  // letters were taken out is found in parts, each framing the same line. Unowned marks join only where they overlap.
+  const joined: { box: Box; owner?: FreeItem }[] = [];
+  const union = (a: Box, b: Box): Box => { const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y); return { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y }; };
+  for (const m of marks) {
+    const same = joined.find(j => (m.owner ? j.owner === m.owner : !j.owner && inter(j.box, m.box) > 0));
+    if (same) same.box = union(same.box, m.box); else joined.push({ ...m });
+  }
+  for (const { box, owner } of joined) {
+    if (area(box) < W * H * 0.00012) continue;
+    // (A rule or strip across the whole band is the band's own pattern: its column draws it.)
+    if (!owner && (area(box) < W * H * 0.002 || box.width >= W * 0.9)) continue;
+    // Cut out against its band's own colour (soft at its rim): the band around it is drawn by the band.
     const crop = await sharp(base).ensureAlpha().extract({ left: box.x, top: box.y, width: box.width, height: box.height }).raw().toBuffer({ resolveWithObject: true });
     const px = crop.data;
     for (let y = 0; y < box.height; y++) {
-      const m = rowMedian(Math.min(ah - 1, Math.floor((box.y + y) * k)));
+      const m = groundAt(Math.min(ah - 1, Math.floor((box.y + y) * k)));
       for (let x = 0; x < box.width; x++) {
         const p = (y * box.width + x) * 4, d = Math.max(Math.abs(px[p] - m[0]), Math.abs(px[p + 1] - m[1]), Math.abs(px[p + 2] - m[2]));
         px[p + 3] = Math.round(px[p + 3] * Math.max(0, Math.min(1, (d - 10) / 26)));
@@ -409,7 +434,7 @@ export function checkComposePlan(raw: unknown, st: Structure, rules: Plan): Plan
  * colour behind it (an image layer of its own). Every element stays its own layer.
  */
 export async function applyPlan(files: Files, c: ProductCreative, st: Structure, plan: Plan, measure: MeasureText = fontMeasure): Promise<{ creative: ProductCreative; notes: string[] }> {
-  const { width: Wc, height: Hc } = plan.canvas, m = marginOf(plan.canvas), notes: string[] = [];
+  const { width: Wc, height: Hc } = plan.canvas, m = marginOf(plan.canvas), notes: string[] = [], unplated = new Set<string>();
   const moves = new Map<string, { from: Box; to: Box; k: number }>();
   let out: ProductCreative = { ...c, canvas: { ...plan.canvas } };
   const contain = (box: Box, aspect: number): Box => { const w = Math.min(box.width, box.height * aspect), h = w / aspect; return { x: box.x + (box.width - w) / 2, y: box.y + (box.height - h) / 2, width: w, height: h }; };
@@ -427,7 +452,19 @@ export async function applyPlan(files: Files, c: ProductCreative, st: Structure,
       if (!before || !word) continue;
       // Already in its box (a format of the template's own shape): left exactly as designed.
       if (Math.abs(before.x - target.x) <= 2 && Math.abs(before.y - target.y) <= 2 && Math.abs(before.width - target.width) <= 2 && Math.abs(before.height - target.height) <= 2) continue;
-      out = fitGroup(out, gid, target, f.align, 1.25, measure);
+      // A one-line text on a plate (a pill, a ribbon) stays one line, made smaller to fit: re-wrapped, its plate (moved
+      // with it, its own shape) would no longer go round it. Wrapped only when that would make it too small to read.
+      // Its plate is wider than its words: the words are fitted so that the plate, moved with them, fits across the box
+      // (never off the panel or the canvas; its padding above and below may reach past the box, as on the template).
+      const plates = [...st.pieces.filter(p => p.owner === f.key).map(p => toCanvas(st, plan.art, p.box)), ...out.shapes.filter(sh => sh.groupId === gid && !sh.hidden).map(sh => sh.box)];
+      const outer = Math.max(before.x + before.width, ...plates.map(p => p.x + p.width)) - Math.min(before.x, ...plates.map(p => p.x));
+      const kw = Math.min(1, before.width / Math.max(1, outer));
+      const zone = plates.length ? { ...target, x: target.x + target.width * (1 - kw) / 2, width: target.width * kw } : target;
+      const one = plates.length ? oneLineScale(out, gid, zone, measure) : undefined;
+      const oneLine = one !== undefined && word.style.fontSize * one >= Math.max(Wc, Hc) * 0.0085;
+      out = fitGroup(out, gid, zone, f.align, oneLine ? one : 1.25, measure);
+      // Too long to stay one line readably: re-wrapped, without the plate that no longer goes round it (reported).
+      if (plates.length && !oneLine) { unplated.add(f.key); notes.push(`“${f.label.slice(0, 40)}” is set on more lines in this size, so its plate is not shown (it would not go round it).`); }
       const after = groupBounds(out, gid, measure), now = out.texts.find(t => t.id === word.id);
       if (after && now) moves.set(f.key, { from: before, to: after, k: now.style.fontSize / Math.max(0.01, word.style.fontSize) });
     }
@@ -438,7 +475,7 @@ export async function applyPlan(files: Files, c: ProductCreative, st: Structure,
     const w = b.width * mv.k, h = b.height * mv.k, cx = tc.x + (b.x + b.width / 2 - fc.x) * mv.k, cy = tc.y + (b.y + b.height / 2 - fc.y) * mv.k;
     return { x: cx - w / 2, y: cy - h / 2, width: w, height: h };
   };
-  out = { ...out, shapes: out.shapes.map(sh => { const mv = moves.get(`g:${sh.groupId}`); return mv ? { ...sh, box: { ...sh.box, ...follow(sh.box, mv) }, radius: sh.radius * mv.k } : sh; }) };
+  out = { ...out, shapes: out.shapes.map(sh => { const mv = moves.get(`g:${sh.groupId}`); return mv ? { ...sh, box: { ...sh.box, ...follow(sh.box, mv) }, radius: sh.radius * mv.k, ...(unplated.has(`g:${sh.groupId}`) ? { hidden: true } : {}) } : sh; }) };
   const hiddenOwner = (key: string) => (key.startsWith('i:') ? out.images.find(i => i.id === key.slice(2))?.hidden ?? true : key.startsWith('g:') ? !out.texts.some(t => t.groupId === key.slice(2) && !t.hidden && t.text.trim()) : false);
   const objects: ProductCreativeObject[] = [];
   for (const p of st.pieces) {
@@ -447,7 +484,7 @@ export async function applyPlan(files: Files, c: ProductCreative, st: Structure,
     const box = mv ? follow(mapped, mv) : plan.boxes[`p:${p.id}`] ? contain(plan.boxes[`p:${p.id}`], p.width / Math.max(1, p.height)) : undefined;
     if (!box) continue;
     objects.push({ id: `co-${sha256(Buffer.from(p.id)).slice(0, 10)}`, objectId: null, kind: 'decoration', label: p.label, asset: { kind: 'upload', file: p.file, sha256: p.sha256, width: p.width, height: p.height, background: 'transparent' },
-      box: round(box), hidden: p.owner ? hiddenOwner(p.owner) : false, locked: true, z: 0.5 });
+      box: round(box), hidden: p.owner ? hiddenOwner(p.owner) || unplated.has(p.owner) : false, locked: true, z: 0.5 });
   }
   // Text and logos of the artwork that a cropped canvas would cut: kept inside it (text re-wrapped across it).
   for (const g of out.groups) {
@@ -479,6 +516,18 @@ export async function applyPlan(files: Files, c: ProductCreative, st: Structure,
     objects.push({ id: `co-${sha256(Buffer.from(`panel:${Math.round(box.x)}:${Math.round(box.y)}`)).slice(0, 10)}`, objectId: null, kind: 'decoration', label: 'Panel · offer details', asset: { kind: 'upload', file, sha256: hash, width: w, height: h, background: 'transparent' }, box: round(box), hidden: false, locked: true, z: 0.4 });
   }
   return { creative: { ...out, objects: [...out.objects, ...objects] }, notes };
+}
+
+/**
+ * The largest scale (at most 1.25) at which a one-line text group stays one line inside `zone`: its words' widths and
+ * spaces across, its line height down. Undefined for a group of several lines.
+ */
+export function oneLineScale(c: ProductCreative, gid: string, zone: Box, measure: MeasureText = fontMeasure): number | undefined {
+  const words = c.texts.filter(t => t.groupId === gid && !t.hidden && t.text.trim()).sort((a, b) => a.line - b.line || a.x - b.x);
+  if (!words.length || new Set(words.map(t => t.line)).size > 1) return undefined;
+  const width = words.reduce((w, t, i) => w + measure(t.text, { ...t.style, letterSpacing: Math.max(0, t.style.letterSpacing) }) + (i ? measure(' ', t.style) : 0), 0);
+  const height = Math.max(...words.map(t => t.style.fontSize)) * 1.18;
+  return Math.min(1.25, zone.width / Math.max(1, width), zone.height / Math.max(1, height)) * 0.99;
 }
 
 /** The share of the canvas (percent) the template's own artwork and bands do not cover: continued (AI or locally). */
