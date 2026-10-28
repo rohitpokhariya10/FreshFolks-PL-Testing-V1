@@ -10,12 +10,12 @@
  *
  * Every change bumps `objectsRevision` (a prepared template of an older one is stale) and is kept in the history.
  */
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import {
   decomposesObject, estimateAdvance, isMasterCategory, isOverlayKind, normalizeBox, orderProductObjects, PRODUCT_ELEMENT_KINDS, PRODUCT_LIMITS, PRODUCT_OBJECT_KINDS, PRODUCT_PREPARE_VERSION, PRODUCT_SCHEMA_VERSION, PROTECTED_SCHEMA_VERSION, withHistory,
   type DetectedWord, type LogoSlot, type MasterCategory, type PixelRect, type ProductHistoryEntry, type ProductInfo, type ProductObject, type ProductObjectKind, type ProductPrepared, type ProductSnapshot, type ProductGenerationBrief, type ProductStage, type ProtectedTemplate, type SourceBox,
-  type ReuseAspectRatio, type OfferAspectRatio, isOfferAspectRatio, REUSE_ASPECT_LABELS,
+  type ReuseAspectRatio, type OfferAspectRatio, isOfferAspectRatio, REUSE_ASPECT_LABELS, OFFER_ASPECT_RATIOS, RATIO_REGEN_SIZES, ratioRegenEstimateUsd,
 } from '@frameflow/shared';
 import { RunError } from '../../layerizeExperiment.js';
 import { decodeRgba, ingestImage, ProtectedImageError, sha256 } from '../pixels.js';
@@ -39,6 +39,7 @@ import { paletteOf } from './artwork.js';
 import { createReuseStudio } from './reuseStudio.js';
 import type { ReusePlacementPlanner } from './reusePlacement.js';
 import type { ReuseComposer } from './reuseCompose.js';
+import { atRatioSize, protectRegenerated, regenerationPrompt, type RatioRegenerator } from './ratioRegeneration.js';
 import { mapBox, mapY } from './reuseLayout.js';
 import { measureWord } from '../../../textRecognition/measure.js';
 
@@ -87,6 +88,8 @@ export interface ProductTemplateOptions {
   placement?: () => ReusePlacementPlanner | undefined;
   /** Reuse Template: AI composition of a common-ratio format (layout planner and background continuation; only with approval of their cost). */
   composer?: () => ReuseComposer | undefined;
+  /** The creative regenerated in a common ratio by the image model (ratioRegeneration.ts; only with approval of its cost), for both workflows. */
+  regenerator?: () => RatioRegenerator | undefined;
 }
 /** One element of the review as the client sends it (the whole state each time). */
 export interface ReviewInput {
@@ -106,7 +109,7 @@ export interface ReviewInput {
 
 export function createProductTemplates(options: ProductTemplateOptions) {
   const { store, service } = options;
-  const locks = new Map<string, Promise<unknown>>(), detecting = new Set<string>(), preparingIds = new Set<string>();
+  const locks = new Map<string, Promise<unknown>>(), detecting = new Set<string>(), preparingIds = new Set<string>(), regenerating = new Set<string>();
   const locked = <T>(key: string, work: () => Promise<T>): Promise<T> => { const next = (locks.get(key) ?? Promise.resolve()).then(work, work); locks.set(key, next.catch(() => undefined)); return next; };
   const requireProduct = (id: string) => { const t = store.require(id); if (!t.product) fail('NOT_FOUND', 'Product template not found.'); return t as ProductRecord; };
   const preparingNow = (id: string) => preparingIds.has(id);
@@ -116,6 +119,10 @@ export function createProductTemplates(options: ProductTemplateOptions) {
   function stageOf(t: ProductRecord): ProductStage {
     const p = t.product;
     // A run recorded as running that this process is not doing was interrupted (the server restarted): it failed.
+    if (regenerating.has(t.id)) return 'regenerating';
+    // Regenerated in the chosen size and waiting for the person to look at it (or failed, or interrupted): before anything is found.
+    const g = p.regeneration;
+    if (g && !p.detection && !detecting.has(t.id) && (g.status === 'ready' || g.status === 'failed' || g.status === 'running')) return 'regenerated';
     if (detecting.has(t.id)) return 'detecting';
     if (p.detection?.status === 'running') return 'detect-failed';
     if (p.detection?.status === 'failed') return t.textAnalysis ? 'review' : 'detect-failed';
@@ -181,9 +188,16 @@ export function createProductTemplates(options: ProductTemplateOptions) {
    * A template from an upload; with `crop`, from that rectangle of it (a creative on a sheet), cropped without resampling.
    * `aspectRatio`: the master's size chosen on the upload screen ('original' or absent: its own size), kept with it.
    */
-  async function create(bytes: Buffer, input: { name?: string; filename?: string; crop?: PixelRect; aspectRatio?: unknown }) {
+  async function create(bytes: Buffer, input: { name?: string; filename?: string; crop?: PixelRect; aspectRatio?: unknown; regenerate?: boolean; approveUsd?: unknown; useAi?: boolean }) {
     if (input.aspectRatio !== undefined && input.aspectRatio !== 'original' && !isOfferAspectRatio(input.aspectRatio)) fail('INVALID_REQUEST', 'Choose Original, Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9.');
     const targetRatio = isOfferAspectRatio(input.aspectRatio) ? input.aspectRatio : undefined;
+    // Regenerated in the chosen size first: one image request, sent only with its approved estimate.
+    if (input.regenerate) {
+      if (!targetRatio) fail('INVALID_REQUEST', 'Choose the size to regenerate the creative in (Original needs no regeneration).');
+      const r = options.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI regeneration is not configured on this server (no OpenAI key). Upload without it: the size is made at the Size step.');
+      const estimate = r.offline ? 0 : ratioRegenEstimateUsd(targetRatio);
+      if (estimate && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= estimate)) fail('APPROVAL_REQUIRED', `Regenerating the creative in ${REUSE_ASPECT_LABELS[targetRatio]} sends one request to ${r.model}, at most about $${estimate.toFixed(2)}. Approve the cost first.`, { estimateUsd: estimate });
+    }
     let img;
     try { img = await ingestImage(bytes, 'image', { minSide: PRODUCT_LIMITS.minSide }); } catch (error) { if (error instanceof ProtectedImageError) fail(error.code, error.message); throw error; }
     let sourceBytes = img.input, sheet: ProductInfo['sheet'], files: Record<string, Buffer> = {};
@@ -199,7 +213,8 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     const meta = await sharp(sourceBytes).metadata(), hash = sha256(sourceBytes), ext = input.crop ? 'png' : img.ext, file = `source.${ext}`;
     files = { [file]: sourceBytes, ...files };
     const now = nowIso(), id = newProtectedTemplateId(), name = (input.name?.trim() || input.filename?.replace(/\.[a-z0-9]+$/i, '') || 'Product template').slice(0, PRODUCT_LIMITS.maxName);
-    const product: ProductInfo = { version: PRODUCT_SCHEMA_VERSION, type: 'product-text', ...(sheet ? { sheet } : {}), ...(targetRatio ? { targetRatio } : {}), objects: [], objectsRevision: 0, revisions: [], activity: { scans: 0, aiCalls: 0, segmentRequests: 0, costUsd: 0 },
+    const product: ProductInfo = { version: PRODUCT_SCHEMA_VERSION, type: 'product-text', ...(sheet ? { sheet } : {}), ...(targetRatio ? { targetRatio } : {}),
+      ...(input.regenerate && targetRatio ? { regeneration: { status: 'running' as const, ratio: targetRatio, useAi: input.useAi === true, startedAt: nowIso() } } : {}), objects: [], objectsRevision: 0, revisions: [], activity: { scans: 0, aiCalls: 0, segmentRequests: 0, costUsd: 0 },
       history: [{ at: now, action: 'created', detail: [input.filename ? `From ${input.filename.slice(0, 120)}` : '', targetRatio ? `Master size chosen: ${REUSE_ASPECT_LABELS[targetRatio]}` : ''].filter(Boolean).join('. ') || undefined }, ...(sheet ? [{ at: now, action: 'cropped' as const, detail: `One creative (${sheet.crop.width}×${sheet.crop.height} at ${sheet.crop.x},${sheet.crop.y}) of a ${sheet.width}×${sheet.height} sheet.` }] : [])] };
     store.create({ schemaVersion: PROTECTED_SCHEMA_VERSION, id, name, createdAt: now, updatedAt: now, revision: 1, coordinateSystem: 'source-pixels', elements: [], elementsRevision: 0, layerInstructions: '', runs: [],
       source: { file, inputFile: file, sha256: hash, mime: `image/${ext === 'jpg' ? 'jpeg' : ext}`, width: meta.width!, height: meta.height!, bytes: sourceBytes.length, orientationNormalized: false, origin: { kind: 'upload', ...(input.filename ? { filename: input.filename.slice(0, 200) } : {}) } },
@@ -924,6 +939,92 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     store.update(id, t.revision, x => { x.product!.revisions.push({ revision, file, sha256: sha256(bytes), publishedAt: at, draft: true }); x.product!.editorDraft = { ...link, revision }; delete x.product!.approved; history(x.product!, { action: 'saved', detail: `Editor master revision ${revision}; quality review retained.` }); });
     return view(id);
   });
+
+  // --- Regenerated in the chosen size (ratioRegeneration.ts) ------------------------------------------------------------
+  /** Whether the creative can be regenerated here, by which model, and each size's estimate. */
+  const regenerationInfo = () => { const r = options.regenerator?.(); return { available: !!r, model: r?.model ?? '', offline: r?.offline ?? true, estimates: Object.fromEntries(OFFER_ASPECT_RATIOS.map(x => [x, r?.offline ? 0 : ratioRegenEstimateUsd(x)])) as Record<OfferAspectRatio, number> }; };
+  /**
+   * One regeneration of an upload, in the background (approved at upload, or approved again): the image model recomposes
+   * the creative for its chosen size; the result is protected (QR codes decoding to their payloads, restored from the
+   * upload where needed) and read for the upload's words, then waits for the person. A failure is kept with its reason.
+   */
+  function startRegenerate(id: string) {
+    if (regenerating.has(id) || detecting.has(id)) return { started: false };
+    regenerating.add(id);
+    void runRegenerate(id).catch(error => console.error('product regenerate', id, error)).finally(() => regenerating.delete(id));
+    return { started: true };
+  }
+  async function runRegenerate(id: string) {
+    const t = requireProduct(id), g = t.product.regeneration!, op = randomUUID(), at = nowIso();
+    const save = (f: string, value: object) => store.write(id, `regen-${op.slice(0, 8)}-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 60)}.json`, Buffer.from(JSON.stringify(value, null, 2)));
+    try {
+      const r = options.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI regeneration is not configured on this server (no OpenAI key).');
+      // The upload as sent (at most 2048 px on its long side: the model works at about that size).
+      const original = await sharp(store.read(id, t.source.inputFile)).resize(2048, 2048, { fit: 'inside', withoutEnlargement: true }).png().toBuffer();
+      const out = await r.regenerate({ image: original, prompt: regenerationPrompt(g.ratio), size: RATIO_REGEN_SIZES[g.ratio] }, save, op);
+      const { png, checks } = await protectRegenerated({ original, result: await atRatioSize(out.image, g.ratio), recognizer: options.recognizer() });
+      const hash = sha256(png), file = `regenerated-${g.ratio.replace(':', 'x')}-${hash.slice(0, 12)}.png`, size = RATIO_REGEN_SIZES[g.ratio], estimateUsd = r.offline ? 0 : ratioRegenEstimateUsd(g.ratio);
+      if (!store.has(id, file)) store.write(id, file, png);
+      await service.updateMaster(id, undefined, x => {
+        const q = x.product!;
+        q.regeneration = { ...q.regeneration!, status: 'ready', result: { ratio: g.ratio, at, file, sha256: hash, width: size.width, height: size.height, model: r.model, offline: r.offline, operationId: op, ...(out.requestId ? { requestId: out.requestId } : {}), estimateUsd, ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}), checks } };
+        delete q.regeneration.error;
+        q.activity = { ...q.activity, aiCalls: q.activity.aiCalls + 1, costUsd: Math.round((q.activity.costUsd + (out.costUsd ?? estimateUsd)) * 1000) / 1000 };
+        history(q, { action: 'detected', detail: `Regenerated in ${REUSE_ASPECT_LABELS[g.ratio]} by ${r.model}${out.costUsd !== undefined ? ` ($${out.costUsd.toFixed(3)})` : ''}: waiting for review.${checks.blocking.length ? ` ${checks.blocking.join(' ')}` : ''}` });
+      });
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, 400);
+      await service.updateMaster(id, undefined, x => { const q = x.product!; q.regeneration = { ...q.regeneration!, status: 'failed', error: message }; history(q, { action: 'detected', detail: `Regeneration in ${REUSE_ASPECT_LABELS[g.ratio]} did not complete: ${message}` }); });
+    }
+  }
+  /**
+   * The person's decision on the regenerated creative. `regenerated` (they looked at it and confirm it): it becomes the
+   * creative the pipeline processes — the upload kept as `original` — and the elements are found in it. `original`: the
+   * upload is processed as it is (its size is then made at the Size step).
+   */
+  const decideRegeneration = (id: string, input: { use?: unknown; approved?: unknown; expectedRevision?: unknown }) => locked(id, async () => {
+    const t = requireProduct(id), g = t.product.regeneration;
+    if (input.expectedRevision !== undefined && input.expectedRevision !== t.revision) fail('STALE_REVISION', `This template changed since you opened it (revision ${t.revision}). Reload it and try again.`, { revision: t.revision });
+    if (!g || regenerating.has(id) || t.product.detection || (g.status !== 'ready' && g.status !== 'failed' && g.status !== 'running')) fail('NOT_READY', 'There is no regenerated creative waiting for a decision.');
+    if (input.use === 'regenerated') {
+      if (g.status !== 'ready' || !g.result) fail('NOT_READY', 'The regeneration did not complete: try again, or continue with your original.');
+      if (g.result.checks.blocking.length) fail('NOT_READY', `This result cannot be used: ${g.result.checks.blocking.join(' ')}`);
+      if (input.approved !== true) fail('APPROVAL_REQUIRED', 'Look at the regenerated creative — its text, products, logos and QR codes — and confirm it is right before continuing.');
+      const result = g.result, bytes = store.read(id, result.file);
+      await service.updateMaster(id, t.revision, x => {
+        const q = x.product!;
+        q.regeneration = { ...g, status: 'approved', original: { file: x.source.inputFile, sha256: x.source.sha256, width: x.source.width, height: x.source.height } };
+        x.source = { ...x.source, file: result.file, inputFile: result.file, sha256: result.sha256, mime: 'image/png', width: result.width, height: result.height, bytes: bytes.length, orientationNormalized: false };
+        history(q, { action: 'reviewed', detail: `The ${REUSE_ASPECT_LABELS[g.ratio]} creative regenerated by AI was approved; the elements are found in it (the upload is kept).` });
+      });
+    } else if (input.use === 'original') {
+      await service.updateMaster(id, t.revision, x => { const q = x.product!; q.regeneration = { ...g, status: 'declined' }; history(q, { action: 'reviewed', detail: 'The regenerated creative was not used: the upload is processed as it is.' }); });
+    } else fail('INVALID_REQUEST', 'Choose the regenerated creative or your original.');
+    startDetect(id, { useAi: g.useAi });
+    return view(id);
+  });
+  /** Regenerated again (another approved request), while the person has not decided yet. */
+  const retryRegeneration = (id: string, input: { approveUsd?: unknown; expectedRevision?: unknown }) => locked(id, async () => {
+    const t = requireProduct(id), g = t.product.regeneration;
+    if (input.expectedRevision !== undefined && input.expectedRevision !== t.revision) fail('STALE_REVISION', `This template changed since you opened it (revision ${t.revision}). Reload it and try again.`, { revision: t.revision });
+    if (!g || regenerating.has(id) || t.product.detection || g.status === 'approved' || g.status === 'declined') fail('NOT_READY', 'This creative cannot be regenerated now.');
+    const r = options.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI regeneration is not configured on this server (no OpenAI key).'), estimate = r.offline ? 0 : ratioRegenEstimateUsd(g.ratio);
+    if (estimate && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= estimate)) fail('APPROVAL_REQUIRED', `Regenerating again sends one more request to ${r.model}, at most about $${estimate.toFixed(2)}. Approve the cost first.`, { estimateUsd: estimate });
+    await service.updateMaster(id, t.revision, x => { const q = x.product!; q.regeneration = { ...g, status: 'running', startedAt: nowIso() }; delete q.regeneration.error; });
+    startRegenerate(id);
+    return view(id);
+  });
+  /**
+   * Create Offer Creative: a creative regenerated from a template's draft, approved, made editable through the creation
+   * pipeline — a template of its own from the regenerated picture (already in its size), its elements found, reviewed,
+   * decomposed and edited like any upload.
+   */
+  async function createFromRegenerated(input: { bytes: Buffer; name: string; ratio: OfferAspectRatio; useAi: boolean; from: { templateId: string; draftId: string } }) {
+    const nid = await create(input.bytes, { name: input.name, filename: `regenerated-${input.ratio.replace(':', 'x')}.png`, aspectRatio: input.ratio });
+    await service.updateMaster(nid, undefined, x => { x.product!.regeneration = { status: 'approved', ratio: input.ratio, useAi: input.useAi, startedAt: nowIso(), from: input.from }; history(x.product!, { action: 'created', detail: `Regenerated in ${REUSE_ASPECT_LABELS[input.ratio]} by AI from template ${input.from.templateId} (Create Offer Creative), approved after review.` }); });
+    startDetect(nid, { useAi: input.useAi });
+    return nid;
+  }
   // --- First-time master creation in a common ratio -------------------------------------------------------------------------
   /** The original revision a master's sizes are made from (an adapted master's own original). */
   const sourceRevisionOf = (id: string) => {
@@ -1002,8 +1103,8 @@ export function createProductTemplates(options: ProductTemplateOptions) {
   });
   const variations = createProductVariations({ store, creatives, requireProduct, snapshot, locked, toTemplate: input => createFromVariation(input), latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, planner: options.planner, artwork: options.artwork, recognizer: options.recognizer });
   // Reuse Template (separate from variations): the person's own product set, copy and formats.
-  const reuse = createReuseStudio({ store, creatives, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, placement: options.placement, composer: options.composer, recognizer: options.recognizer, toTemplate: input => createFromVariation(input) });
+  const reuse = createReuseStudio({ store, creatives, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, placement: options.placement, composer: options.composer, regenerator: options.regenerator, fromRegenerated: input => createFromRegenerated(input), recognizer: options.recognizer, toTemplate: input => createFromVariation(input) });
 
-  return { list, view, sheetOf, create, createFromVariation, startDetect, review, fitText, select, brief, editBrief, uploadReviewAsset, estimate, startPrepare, approve, publish, openEditor, saveEditorMaster, masterSize, saveMasterSize, setTargetRatio, snapshot, creatives, variations, reuse, isDetecting: (id: string) => detecting.has(id), isPreparing: (id: string) => preparing.has(id), requireProduct, kinds: PRODUCT_ELEMENT_KINDS, isOverlayKind };
+  return { list, view, sheetOf, create, createFromVariation, startDetect, review, fitText, select, brief, editBrief, uploadReviewAsset, estimate, startPrepare, approve, publish, openEditor, saveEditorMaster, masterSize, saveMasterSize, setTargetRatio, regenerationInfo, startRegenerate, decideRegeneration, retryRegeneration, snapshot, creatives, variations, reuse, isDetecting: (id: string) => detecting.has(id), isPreparing: (id: string) => preparing.has(id), requireProduct, kinds: PRODUCT_ELEMENT_KINDS, isOverlayKind };
 }
 export type ProductTemplates = ReturnType<typeof createProductTemplates>;

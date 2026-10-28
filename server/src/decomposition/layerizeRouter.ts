@@ -41,6 +41,7 @@ import { registerProductTemplateRoutes } from './protectedTemplates/product/rout
 import { liveVariationPlanner, type ProductVariationPlanner } from './protectedTemplates/product/variations.js';
 import { liveReusePlacementPlanner, type ReusePlacementPlanner } from './protectedTemplates/product/reusePlacement.js';
 import { liveReuseComposer, type ReuseComposer } from './protectedTemplates/product/reuseCompose.js';
+import { liveRatioRegenerator, type RatioRegenerator } from './protectedTemplates/product/ratioRegeneration.js';
 import { liveArtworkGenerator, type ArtworkGenerator } from './protectedTemplates/product/artwork.js';
 import type { SceneAnalyzer } from './creativeTemplates/smartProviders.js';
 import { localRecognizer, type WordRecognizer } from '../textRecognition/recognizer.js';
@@ -140,6 +141,8 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
   productPlacement?: () => ReusePlacementPlanner | undefined;
   /** Reuse Template's AI composition (tests inject a double; live only with an OpenAI key and the person's approval). */
   productComposer?: () => ReuseComposer | undefined;
+  /** The creative regenerated in a common ratio by the image model (both workflows); default: the live one when an OpenAI key is set. */
+  productRegenerator?: () => RatioRegenerator | undefined;
   /** Product with Text templates: the image model for new AI artwork of recomposed variations (used only with approval). */
   productArtwork?: () => ArtworkGenerator | undefined;
   smart?: SmartProviders & { analysesDir?: string; variantsDir?: string; env?: NodeJS.ProcessEnv } } = {}): Router {
@@ -224,7 +227,8 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
     planner: options.productPlanner ?? (() => (process.env.OPENAI_API_KEY ? liveVariationPlanner() : undefined)),
     artwork: options.productArtwork ?? (() => (process.env.OPENAI_API_KEY ? liveArtworkGenerator() : undefined)),
     placement: options.productPlacement ?? (() => (process.env.OPENAI_API_KEY ? liveReusePlacementPlanner() : undefined)),
-    composer: options.productComposer ?? (() => (process.env.OPENAI_API_KEY ? liveReuseComposer() : undefined)) }) });
+    composer: options.productComposer ?? (() => (process.env.OPENAI_API_KEY ? liveReuseComposer() : undefined)),
+    regenerator: options.productRegenerator ?? (() => (process.env.OPENAI_API_KEY ? liveRatioRegenerator() : undefined)) }) });
 
   router.get('/runs/:id/diagnostics', async (req, res, next) => {
     try {

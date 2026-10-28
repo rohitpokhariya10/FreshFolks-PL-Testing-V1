@@ -11,9 +11,10 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Crop, Image as ImageIcon, Package, Plus, Recycle, Sparkles, Upload } from 'lucide-react';
-import { REUSE_ASPECT_LABELS, type OfferAspectRatio, type PixelRect, type ProductDetection, type ProductStage, type ReuseAspectRatio } from '@frameflow/shared';
+import { isOfferAspectRatio, REUSE_ASPECT_LABELS, type OfferAspectRatio, type PixelRect, type ProductDetection, type ProductStage, type ReuseAspectRatio } from '@frameflow/shared';
 import { Alert, Badge } from '../templateStudio/ui';
-import { productApi, productFileUrl, type ProductListItem, type ProductView, type SheetAnswer } from './api';
+import { productApi, productFileUrl, type ProductListItem, type ProductView, type RegenerationInfo, type SheetAnswer } from './api';
+import { RegeneratedResult } from './RegeneratedResult';
 import { ProductReview } from './ProductReview';
 import { ProductPrepare } from './ProductPrepare';
 import { ProductSelect } from './ProductSelect';
@@ -48,7 +49,7 @@ function AiDetectionFailed({ detection, onUseSaved }: { detection?: ProductDetec
 }
 
 export const PRODUCT_STAGE_LABELS: Record<ProductStage, string> = {
-  detecting: 'Finding elements', 'detect-failed': 'Needs another try', review: 'Ready to review', preparing: 'Preparing', prepared: 'Ready to approve', ready: 'Saved', changed: 'Changed since saved',
+  regenerating: 'Regenerating with AI', regenerated: 'Regenerated · waiting for you', detecting: 'Finding elements', 'detect-failed': 'Needs another try', review: 'Ready to review', preparing: 'Preparing', prepared: 'Ready to approve', ready: 'Saved', changed: 'Changed since saved',
 };
 export type ProductRequest = { view: 'new' } | { view: 'setup'; id: string; choose?: boolean } | { view: 'template'; id: string; tab?: 'creatives' | 'variations' | 'details' } | { view: 'reuse'; id: string; /** Create Offer Creative: the size chosen with the template. */ ratio?: ReuseAspectRatio };
 type Props = {
@@ -109,7 +110,10 @@ export function Steps({ current }: { current: 1 | 2 | 3 | 4 | 5 | 6 }) {
  */
 function ProductUpload({ onCancel, onCreated }: { onCancel: () => void; onCreated: (id: string) => void }) {
   const [file, setFile] = useState<File>(), [name, setName] = useState(''), [sheet, setSheet] = useState<SheetAnswer>(), [crop, setCrop] = useState<PixelRect | null>(null);
-  const [size, setSize] = useState<ReuseAspectRatio>('original');
+  const [size, setSize] = useState<ReuseAspectRatio>('original'), [regen, setRegen] = useState(false), [info, setInfo] = useState<RegenerationInfo>();
+  useEffect(() => { void productApi.regenerationInfo().then(setInfo).catch(() => undefined); }, []);
+  // Regenerated in the chosen size by the image model first (ticked: the person approves its estimate).
+  const regenerate = isOfferAspectRatio(size) && !!info?.available && regen, estimate = isOfferAspectRatio(size) ? info?.estimates[size] ?? 0 : 0;
   const [useAi, setUseAi] = useState(false), [busy, setBusy] = useState<'' | 'reading' | 'uploading'>(''), [error, setError] = useState('');
   const preview = useMemo(() => (file ? URL.createObjectURL(file) : undefined), [file]);
   useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
@@ -125,7 +129,7 @@ function ProductUpload({ onCancel, onCreated }: { onCancel: () => void; onCreate
   const create = async () => {
     if (!file) return;
     setBusy('uploading'); setError('');
-    try { const v = await productApi.create(file, { name: name.trim() || 'Product template', crop: crop ?? undefined, useAi, aspectRatio: size }); onCreated(v.template.id); }
+    try { const v = await productApi.create(file, { name: name.trim() || 'Product template', crop: crop ?? undefined, useAi, aspectRatio: size, ...(regenerate ? { regenerate: { approveUsd: estimate } } : {}) }); onCreated(v.template.id); }
     catch (e) { setError(e instanceof Error ? e.message : 'Could not create the template.'); setBusy(''); }
   };
   return <div className="ot-page">
@@ -141,10 +145,12 @@ function ProductUpload({ onCancel, onCreated }: { onCancel: () => void; onCreate
         <div className="prt-size-choice" role="group" aria-label="Size of the master template"><h3>Size of the master template</h3>
           <p className="ot-muted">Original keeps the size you upload. Another size is made after the layers are decomposed — from your original, which is saved too and never changed — with the text, logos, offer details and characters kept exact.</p>
           <SizePicker value={size} onChange={setSize} original={crop ? { width: crop.width, height: crop.height } : sheet ? { width: sheet.width, height: sheet.height } : undefined} disabled={!!busy} /></div>
+        {isOfferAspectRatio(size) && info?.available && <label className="prt-option" data-testid="regenerate-option"><input type="checkbox" checked={regen} onChange={e => setRegen(e.target.checked)} />
+          <span><strong>Regenerate the creative in {REUSE_ASPECT_LABELS[size]} with AI first (recommended)</strong>One OpenAI image request ({info.model}, high quality){estimate > 0 ? `, at most about $${estimate.toFixed(2)} (usually much less; the actual cost is recorded)` : ''}. The AI redesigns your creative for this size; QR codes and words are checked against your original, and you look at it and approve it before anything else runs. Your original is kept.</span></label>}
         <label className="prt-option"><input type="checkbox" checked={useAi} onChange={e => setUseAi(e.target.checked)} />
           <span><strong>Find characters and products with AI</strong>Reuse a verified saved analysis first, free. If none exists, this authorizes one OpenAI request (estimated up to about $0.35). OpenAI stores the response for recovery. Without approval, only saved analysis or local text candidates are used.</span></label>
         <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={!file || !!busy} onClick={() => void create()}>
-          <Upload size={15} aria-hidden="true" />{busy === 'uploading' ? 'Uploading…' : busy === 'reading' ? 'Reading the picture…' : 'Upload and find elements'}</button></div>
+          <Upload size={15} aria-hidden="true" />{busy === 'uploading' ? 'Uploading…' : busy === 'reading' ? 'Reading the picture…' : regenerate ? `Upload and regenerate in ${REUSE_ASPECT_LABELS[size]}` : 'Upload and find elements'}</button></div>
         <p className="ot-muted">Next you check what was found, then FrameFlow prepares the layers and you save the template{size !== 'original' ? ` in ${REUSE_ASPECT_LABELS[size]}` : ''}.</p>
       </div>
       {preview && <div className="prt-upload-preview">
@@ -169,12 +175,14 @@ function SheetCrop({ url, sheet, box }: { url: string; sheet: SheetAnswer; box: 
 function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }: { id: string; onBack: () => void; onUse: (id: string) => void; initialChoosing?: boolean; onOpenRunInEditor?: (runId: string) => Promise<void> }) {
   const [view, setView] = useState<ProductView>(), [error, setError] = useState(''), [reviewing, setReviewing] = useState(false), [choosing, setChoosing] = useState(!!initialChoosing), [retryAi, setRetryAi] = useState(false);
   const [inspecting, setInspecting] = useState(false), [opening, setOpening] = useState(false), [fitted, setFitted] = useState(0);
+  // Saved just now (a draft with its warnings too: its stage stays 'prepared', yet it is saved): the saved page shows.
+  const [justSaved, setJustSaved] = useState(-1);
   // The Size step: the master previewed in a common ratio after its original is saved.
   const [sizing, setSizing] = useState<OfferAspectRatio>();
   const live = useRef(true);
   const load = useCallback(async () => { const v = await productApi.get(id); if (live.current) setView(v); return v; }, [id]);
   useEffect(() => { live.current = true; void load().catch((e: Error) => setError(e.message)); return () => { live.current = false; }; }, [load]);
-  const waiting = view?.stage === 'detecting' || view?.stage === 'preparing';
+  const waiting = view?.stage === 'detecting' || view?.stage === 'preparing' || view?.stage === 'regenerating';
   useEffect(() => {
     if (!waiting) return;
     const timer = setInterval(() => { void load().catch(() => undefined); }, 1200);
@@ -187,15 +195,23 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
   const recovery = view.recovery?.retrievable && <p><button type="button" className="ws-btn ws-btn-primary" onClick={retrieve}>Retrieve existing request (no new detection charge)</button> The saved response ID is reused; no new analysis is submitted.</p>;
   const from = view.product.variation;
   // The size chosen on the upload screen, until the master is saved in it.
-  const chosen = view.product.targetRatio && view.product.masterRatio !== view.product.targetRatio ? view.product.targetRatio : undefined;
+  const chosen = view.product.targetRatio && view.product.masterRatio !== view.product.targetRatio ? view.product.targetRatio : undefined, regenerated = view.product.regeneration?.status === 'approved';
   const head = (step: 1 | 2 | 3 | 4 | 5 | 6, title: string, text: string) => <><div className="ot-head"><div><p className="ot-kicker">{view.template.name}</p><h2>{title}</h2><p>{text}</p></div>
     <button type="button" className="ws-btn ws-btn-quiet" onClick={onBack}>Back to templates</button></div><Steps current={step} />
-    {chosen && step < 6 && <p className="prt-size-chosen" data-testid="chosen-size">Master size: <strong>{REUSE_ASPECT_LABELS[chosen]}</strong> · chosen at upload. Your original is decomposed first; the master is then made in this size before it is saved.</p>}
+    {chosen && step < 6 && (regenerated
+      ? <p className="prt-size-chosen" data-testid="chosen-size">Master size: <strong>{REUSE_ASPECT_LABELS[chosen]}</strong> · regenerated by AI and approved by you. This regenerated creative is what is found, reviewed and decomposed{view.product.regeneration?.original ? '; your upload is kept' : ''}.</p>
+      : view.product.regeneration && view.product.regeneration.status !== 'declined'
+        ? <p className="prt-size-chosen" data-testid="chosen-size">Master size: <strong>{REUSE_ASPECT_LABELS[chosen]}</strong> · chosen at upload. Your creative is regenerated in this size by AI; you look at it and approve it before anything else runs.</p>
+        : <p className="prt-size-chosen" data-testid="chosen-size">Master size: <strong>{REUSE_ASPECT_LABELS[chosen]}</strong> · chosen at upload. Your original is decomposed first; the master is then made in this size before it is saved.</p>)}
     {error && <Alert>{error}</Alert>}{view.product.detection?.lastFailure && <Alert>{view.product.detection.lastFailure.message} Your previous successful analysis is still available.</Alert>}
     {from && <div className="prt-note prt-journey" role="status" data-testid="from-variation"><strong>Edit Individual Elements</strong>
       <ol><li>Check what we found in your creative <span>(free)</span></li><li>Separate it into layers with AI <span>(you’ll approve the cost first)</span></li><li>Open it in the editor to move, resize and edit</li></ol>
       <details><summary>Details</summary>Made from the generated variation “{from.title}”. Its elements and editable words come from its saved composition (no new detection charge). Review the selection, approve OpenAI + Seedream decomposition, then inspect the returned layers.</details></div>}</>;
   const openInEditor = async () => { if (opening) return; setOpening(true); setError(''); try { const r = await productApi.openEditor(id); setView(r.template); await onOpenRunInEditor?.(r.runId); } catch (e) { setError(e instanceof Error ? e.message : 'Could not open it in the editor.'); } finally { setOpening(false); } };
+  if (view.stage === 'regenerating') return <div className="ot-page">{head(1, `Regenerating your creative in ${REUSE_ASPECT_LABELS[view.product.regeneration!.ratio]}`, 'The AI redesigns your creative for this size. Then its QR codes and words are checked against your original, and you look at it before anything else runs.')}
+    <Waiting label={`Regenerating with AI (${REUSE_ASPECT_LABELS[view.product.regeneration!.ratio]}, high quality)… this usually takes about a minute.`} /></div>;
+  if (view.stage === 'regenerated') return <div className="ot-page prt-page-wide">{head(1, `Your creative regenerated in ${REUSE_ASPECT_LABELS[view.product.regeneration!.ratio]}`, 'Look at it closely before it is used: everything after this — finding the elements, the review, decomposing, the editor — works on the creative you choose here.')}
+    <RegenerationStep view={view} onChange={setView} onError={setError} /></div>;
   if (view.stage === 'detecting') return <div className="ot-page">{head(2, 'Finding what is in your creative', 'Reading the text and logos on this computer' + (view.product.detection?.ai?.status === 'skipped' ? '.' : ', and asking the AI for the characters and products.'))}
     <Waiting label="Finding text, logos, products and characters…" /><p>You can return from the template library after refreshing. The saved request can be retrieved without submitting detection again.</p></div>;
   if (view.stage === 'detect-failed') return <div className="ot-page">{head(2, 'Finding the elements did not finish', 'Nothing was lost: your creative is stored unchanged.')}
@@ -233,10 +249,10 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
     <ProductReview key={`${view.product.objectsRevision}:${fitted}`} view={view} onSaved={async (v, next) => { setView(v); if (next) { setReviewing(false); setChoosing(true); } }} onError={setError} /></div>;
   if (sizing && view.product.revisions.length) return <div className="ot-page prt-page-wide">{head(5, `Your master in ${REUSE_ASPECT_LABELS[sizing]}`, 'Preview the master in the size you chose, made from your saved original. Save it when it looks right, or keep the original size.')}
     <MasterSize key={sizing} view={view} ratio={sizing} onRatio={setSizing} onSaved={v => { setSizing(undefined); setInspecting(false); setView(v); }} onKeepOriginal={() => { setSizing(undefined); setInspecting(false); }} /></div>;
-  if (view.stage === 'prepared' || inspecting) return <div className="ot-page prt-page-wide">{head(4, 'Inspect the layers and the background', 'Compare it with your original, look at each layer and at the background on its own, then save it as your master template.')}
+  if ((view.stage === 'prepared' && view.product.revisions.length !== justSaved) || inspecting) return <div className="ot-page prt-page-wide">{head(4, 'Inspect the layers and the background', 'Compare it with your original, look at each layer and at the background on its own, then save it as your master template.')}
     {view.product.editorDraft && <p className="ot-muted">These checks describe the original separation. Open in Editor to inspect and continue your saved editing draft. Opening it does not approve quality.</p>}
     {view.product.revisions.length > 0 && <button type="button" className="ws-btn" onClick={() => onUse(id)}>Use a saved revision</button>}
-    <ProductPrepare view={view} onChange={setView} onError={setError} onBackToReview={() => setReviewing(true)} onChangeSelection={() => setChoosing(true)} onOpenEditor={onOpenRunInEditor ? openInEditor : undefined} onSize={setSizing} /></div>;
+    <ProductPrepare view={view} onChange={v => { if (v.product.revisions.length > view.product.revisions.length) { setJustSaved(v.product.revisions.length); setInspecting(false); } setView(v); }} onError={setError} onBackToReview={() => setReviewing(true)} onChangeSelection={() => setChoosing(true)} onOpenEditor={onOpenRunInEditor ? openInEditor : undefined} onSize={setSizing} /></div>;
   // Saved.
   const latest = view.product.revisions.at(-1), sized = latest?.aspectRatio;
   return <div className="ot-page">{head(6, sized ? `Your ${REUSE_ASPECT_LABELS[sized]} master template is saved` : 'Your template is saved', `Version ${latest?.revision ?? 1} is ready to use. Earlier versions stay as they were.`)}
@@ -253,6 +269,33 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
           <button type="button" className="ws-btn ws-btn-quiet" onClick={() => setInspecting(true)}>Inspect layers</button>
           <button type="button" className="ws-btn ws-btn-quiet" onClick={() => setChoosing(true)}>Change what is decomposed</button></div></div>
     </div></section></div>;
+}
+
+/**
+ * Creating a master: the creative regenerated in its chosen size, for the person to look at. Use it (it becomes what is
+ * found, reviewed and decomposed), regenerate it again (another approved request) or continue with the upload as it is.
+ */
+function RegenerationStep({ view, onChange, onError }: { view: ProductView; onChange: (v: ProductView) => void; onError: (m: string) => void }) {
+  const id = view.template.id, g = view.product.regeneration!, label = REUSE_ASPECT_LABELS[g.ratio];
+  const [approved, setApproved] = useState(false), [busy, setBusy] = useState(''), [again, setAgain] = useState(false), [info, setInfo] = useState<RegenerationInfo>();
+  useEffect(() => { void productApi.regenerationInfo().then(setInfo).catch(() => undefined); }, []);
+  const estimate = info?.estimates[g.ratio] ?? 0, original = productFileUrl(id, view.template.source.inputFile);
+  const act = (what: string, work: () => Promise<ProductView>) => { setBusy(what); onError(''); void work().then(onChange).catch((e: Error) => onError(e.message)).finally(() => setBusy('')); };
+  const decide = (use: 'regenerated' | 'original') => act(use, () => productApi.decideRegeneration(id, { use, approved: use === 'regenerated' ? approved : undefined, expectedRevision: view.template.revision }));
+  const retry = () => act('retry', () => productApi.retryRegeneration(id, { approveUsd: estimate, expectedRevision: view.template.revision }));
+  const actions = <div className="ot-row">
+    {g.status === 'ready' && !g.result?.checks.blocking.length && <button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={!!busy || !approved} onClick={() => decide('regenerated')}><Check size={15} aria-hidden="true" />{busy === 'regenerated' ? 'Continuing…' : 'Use this design and continue'}</button>}
+    {again ? <div className="prt-confirm" role="group" aria-label="Confirm regenerating again"><p>Regenerate again? One more request{estimate > 0 ? `, at most about $${estimate.toFixed(2)}` : ''}. Never retried automatically.</p>
+      <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" disabled={!!busy} onClick={() => { setAgain(false); retry(); }}>Yes, regenerate again</button><button type="button" className="ws-btn ws-btn-quiet" onClick={() => setAgain(false)}>Cancel</button></div></div>
+      : <button type="button" className="ws-btn" disabled={!!busy || !info?.available} onClick={() => setAgain(true)}><Sparkles size={14} aria-hidden="true" />{g.status === 'ready' ? 'Regenerate again…' : 'Try again…'}</button>}
+    <button type="button" className="ws-btn ws-btn-quiet" disabled={!!busy} onClick={() => decide('original')}>{busy === 'original' ? 'Continuing…' : 'Continue with my original instead'}</button>
+  </div>;
+  if (g.status !== 'ready' || !g.result) return <section className="ts-card"><div className="ts-card-body">
+    <Alert>{g.status === 'failed' ? `The regeneration in ${label} did not complete: ${g.error ?? 'no answer was received'}. Nothing was retried.` : `The regeneration in ${label} was interrupted (the server restarted). Nothing was retried.`}</Alert>
+    <p className="ot-muted">A request that failed may still have been charged by the provider.</p>{actions}</div></section>;
+  return <section className="ts-card"><div className="ts-card-body">
+    <RegeneratedResult beforeUrl={original} beforeLabel={`Your original · ${view.template.source.width} × ${view.template.source.height}`} resultUrl={productFileUrl(id, g.result.file)} result={g.result} approved={approved} onApproved={setApproved}>{actions}</RegeneratedResult>
+  </div></section>;
 }
 /** The AI-read text boxes moved onto their letters (free, read on this computer), when asked; a person's corrections stay. */
 function FitText({ view, onDone, onError }: { view: ProductView; onDone: (v: ProductView) => void; onError: (message: string) => void }) {

@@ -15,7 +15,7 @@
  */
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { AlertTriangle, ArrowLeft, Check, Eye, EyeOff, Info, Layers, RotateCcw, Save, Scissors, SlidersHorizontal } from 'lucide-react';
-import { isOfferAspectRatio, REUSE_ASPECT_LABELS, type OfferAspectRatio, type PixelRect, type ProductObject, type ReuseAspectRatio } from '@frameflow/shared';
+import { isOfferAspectRatio, offerAspectRatioOf, REUSE_ASPECT_LABELS, type OfferAspectRatio, type PixelRect, type ProductObject, type ReuseAspectRatio } from '@frameflow/shared';
 import { Alert } from '../templateStudio/ui';
 import { productApi, productFileUrl, type PrepareEstimate, type ProductView } from './api';
 import { SizePicker } from './SizeControls';
@@ -31,7 +31,8 @@ export function ProductPrepare({ view, onChange, onError, onBackToReview, onChan
   const [estimate, setEstimate] = useState<PrepareEstimate>(), [confirmPaid, setConfirmPaid] = useState(false), [confirmDraft, setConfirmDraft] = useState(false), [confirmAi, setConfirmAi] = useState(false);
   // The master's size, chosen on the upload screen (kept with the template) and changeable here before it is saved:
   // Original keeps it as uploaded; another size is previewed next.
-  const [size, setSize] = useState<ReuseAspectRatio>(view.product.masterRatio ?? view.product.targetRatio ?? 'original');
+  // (A creative regenerated in its chosen size is that size already: Original keeps it.)
+  const [size, setSize] = useState<ReuseAspectRatio>(view.product.masterRatio ?? (view.product.targetRatio && offerAspectRatioOf(view.template.source) !== view.product.targetRatio ? view.product.targetRatio : 'original'));
   const chooseSize = async (r: ReuseAspectRatio) => {
     const was = size; setSize(r);
     try { onChange(await productApi.setTargetRatio(id, { ratio: r, expectedRevision: view.template.revision })); }

@@ -29,6 +29,7 @@
     "express": "^5.2.1",
     "express-rate-limit": "^8.7.0",
     "image-size": "^2.0.4",
+    "jsqr": "^1.4.0",
     "openai": "^7.23.0",
     "opentype.js": "^2.0.0",
     "sharp": "^0.35.4",
@@ -41,6 +42,8 @@
     "@types/busboy": "^1.5.4",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/qrcode": "^1.5.5",
+    "qrcode": "^1.5.4",
     "tsx": "^4.23.15"
   }
 }

@@ -15,14 +15,15 @@ import type { ArtworkGenerator } from './artwork.js';
 import type { ProductLayerizer } from './aiDecompose.js';
 import type { ReuseComposer } from './reuseCompose.js';
 import type { ReusePlacementPlanner } from './reusePlacement.js';
+import type { RatioRegenerator } from './ratioRegeneration.js';
 
 export type View = ReturnType<ProductTemplates['view']>;
 export const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex');
-export async function setup(options: { analyzer?: boolean | SceneAnalyzer; segmenter?: boolean; planner?: ProductVariationPlanner; artwork?: ArtworkGenerator; layerizer?: ProductLayerizer; placement?: ReusePlacementPlanner; composer?: ReuseComposer } = {}) {
+export async function setup(options: { analyzer?: boolean | SceneAnalyzer; segmenter?: boolean; planner?: ProductVariationPlanner; artwork?: ArtworkGenerator; layerizer?: ProductLayerizer; placement?: ReusePlacementPlanner; composer?: ReuseComposer; regenerator?: RatioRegenerator } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'product-templates-')), recognizer = fakeRecognizer(PRODUCT_WORDS, { artworkText: ['MEGA', 'SALE', '50%'] }), analyzer = typeof options.analyzer === 'object' ? options.analyzer as ReturnType<typeof fakeProductAnalyzer> : fakeProductAnalyzer(), segmenter = fakeSegmenter();
   const app = express().use('/x', createLayerizeRouter({ runsDir: join(root, 'runs'), protectedDir: join(root, 'protected'), templatesDir: join(root, 'tpl'), executionsDir: join(root, 'exe'), imageTemplatesDir: join(root, 'img'),
     deps: () => { throw new Error('No decomposition provider in these tests'); }, masterRecognizer: () => recognizer, productAnalyzer: () => (options.analyzer === false ? undefined : analyzer),
-    productSegmenter: () => (options.segmenter ? segmenter : undefined), productPlanner: () => options.planner, productArtwork: () => options.artwork, productLayerizer: () => options.layerizer, productPlacement: () => options.placement, productComposer: () => options.composer }));
+    productSegmenter: () => (options.segmenter ? segmenter : undefined), productPlanner: () => options.planner, productArtwork: () => options.artwork, productLayerizer: () => options.layerizer, productPlacement: () => options.placement, productComposer: () => options.composer, productRegenerator: () => options.regenerator }));
   const server = app.listen(0, '127.0.0.1');
   // Longer than a client's idle reuse: Node's 5 s default can close a kept-alive socket as a slow test reuses it (ECONNRESET).
   server.keepAliveTimeout = 65_000; server.headersTimeout = 66_000;
