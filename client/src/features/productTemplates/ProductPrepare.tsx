@@ -15,19 +15,22 @@
  */
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { AlertTriangle, ArrowLeft, Check, Eye, EyeOff, Info, Layers, RotateCcw, Save, Scissors, SlidersHorizontal } from 'lucide-react';
-import type { PixelRect, ProductObject } from '@frameflow/shared';
+import { isOfferAspectRatio, REUSE_ASPECT_LABELS, type OfferAspectRatio, type PixelRect, type ProductObject, type ReuseAspectRatio } from '@frameflow/shared';
 import { Alert } from '../templateStudio/ui';
 import { productApi, productFileUrl, type PrepareEstimate, type ProductView } from './api';
+import { SizePicker } from './SizeControls';
 
 type Tab = 'original' | 'recombined' | 'base' | 'cutouts' | 'layers' | 'clean';
 const TABS: [Tab, string][] = [['original', 'Original'], ['recombined', 'Reconstructed full creative'], ['base', 'Background only'], ['cutouts', 'Individual layers'], ['layers', 'Hide / Move test'], ['clean', 'Without text and logos']];
 const pct = (v: number) => (v >= 99.95 ? '99.9' : v.toFixed(1));
 
-export function ProductPrepare({ view, onChange, onError, onBackToReview, onChangeSelection, onOpenEditor }: { view: ProductView; onChange: (v: ProductView) => void; onError: (m: string) => void; onBackToReview: () => void; onChangeSelection?: () => void; onOpenEditor?: () => Promise<void> }) {
+export function ProductPrepare({ view, onChange, onError, onBackToReview, onChangeSelection, onOpenEditor, onSize }: { view: ProductView; onChange: (v: ProductView) => void; /** After saving: the master is previewed in this common ratio (made from the saved original). */ onSize?: (ratio: OfferAspectRatio) => void; onError: (m: string) => void; onBackToReview: () => void; onChangeSelection?: () => void; onOpenEditor?: () => Promise<void> }) {
   const id = view.template.id, p = view.product.prepared!, W = view.template.source.width, H = view.template.source.height;
   const [tab, setTab] = useState<Tab>('layers'), [hidden, setHidden] = useState<Set<string>>(new Set()), [offsets, setOffsets] = useState<Record<string, { x: number; y: number }>>({});
   const [overlays, setOverlays] = useState(true), [looked, setLooked] = useState(false), [focus, setFocus] = useState<PixelRect>(), [busy, setBusy] = useState(false), [showEstimated, setShowEstimated] = useState(false);
   const [estimate, setEstimate] = useState<PrepareEstimate>(), [confirmPaid, setConfirmPaid] = useState(false), [confirmDraft, setConfirmDraft] = useState(false), [confirmAi, setConfirmAi] = useState(false);
+  // The master's size, chosen before it is saved: Original keeps it as uploaded; another size is previewed next.
+  const [size, setSize] = useState<ReuseAspectRatio>(view.product.masterRatio ?? 'original');
   useEffect(() => { void productApi.estimate(id).then(setEstimate).catch(() => undefined); }, [id]);
   const stands = useMemo(() => p.stands ?? [], [p]);
   const objects = useMemo(() => [...stands, ...view.product.objects.filter(o => o.cutout)].sort((a, b) => a.z - b.z), [view, stands]);
@@ -42,6 +45,7 @@ export function ProductPrepare({ view, onChange, onError, onBackToReview, onChan
     try {
       const approved = await productApi.approve(id, { expectedRevision: view.template.revision, acknowledge: issues.map(i => i.id), ...(draft ? { draft: true } : {}) });
       onChange(await productApi.publish(id, { expectedRevision: approved.template.revision }));
+      if (isOfferAspectRatio(size)) onSize?.(size);
     } catch (e) { onError(e instanceof Error ? e.message : 'The template could not be saved.'); }
     finally { setBusy(false); setConfirmDraft(false); }
   };
@@ -198,6 +202,9 @@ export function ProductPrepare({ view, onChange, onError, onBackToReview, onChan
       <section className="prt-cta">
         {onOpenEditor && <><button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={busy} onClick={() => { setBusy(true); void onOpenEditor().finally(() => setBusy(false)); }}>Open in Editor</button>
           <p className="ot-muted">Saves a recoverable editor draft with these checks. Quality warnings stay unresolved until you review and approve them.</p></>}
+        {onSize && <div className="prt-size-choice" role="group" aria-label="Size of the master template"><h3>Size of the master template</h3>
+          <p className="ot-muted">Original keeps it as uploaded. Another size is previewed next — made from your original, which is saved too and never changed.</p>
+          <SizePicker value={size} onChange={setSize} original={{ width: W, height: H }} disabled={busy} /></div>}
         <label className="ot-check"><input type="checkbox" checked={looked} onChange={e => setLooked(e.target.checked)} />
           <span>I have looked at the background and the layers{warnings.length ? ` (and the ${warnings.length} warning${warnings.length === 1 ? '' : 's'})` : ''}.</span></label>
         {blocking.length > 0 ? <>
@@ -205,7 +212,7 @@ export function ProductPrepare({ view, onChange, onError, onBackToReview, onChan
           {confirmDraft ? <div className="prt-confirm" role="group" aria-label="Confirm the draft"><p>Save it as a <strong>draft</strong>? The warnings are saved with it and shown wherever it is used; fix them later and save again for a clean version.</p>
             <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" disabled={busy || !looked} onClick={() => void save(true)}><Save size={15} aria-hidden="true" />Yes, save as a draft</button><button type="button" className="ws-btn ws-btn-quiet" onClick={() => setConfirmDraft(false)}>Cancel</button></div></div>
             : <button type="button" className="ws-btn" disabled={busy || !looked} onClick={() => setConfirmDraft(true)}>Save as a draft with these warnings…</button>}
-        </> : <button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={busy || !looked} onClick={() => void save(false)}><Save size={15} aria-hidden="true" />{busy ? 'Saving…' : 'Save master template'}</button>}
+        </> : <button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={busy || !looked} onClick={() => void save(false)}><Save size={15} aria-hidden="true" />{busy ? 'Saving…' : size === 'original' ? 'Save master template' : `Save and preview ${REUSE_ASPECT_LABELS[size]}`}</button>}
         {onChangeSelection && blocking.length === 0 && <button type="button" className="ws-btn ws-btn-quiet" onClick={onChangeSelection}><SlidersHorizontal size={14} aria-hidden="true" />Change what is decomposed</button>}
         <button type="button" className="ws-btn ws-btn-quiet" onClick={onBackToReview}><ArrowLeft size={14} aria-hidden="true" />Back to the review</button>
       </section>

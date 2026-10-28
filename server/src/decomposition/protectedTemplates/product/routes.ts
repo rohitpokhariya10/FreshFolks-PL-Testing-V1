@@ -69,6 +69,9 @@ export function registerProductTemplateRoutes(router: Router, ctx: { products: P
     try { const id = idOf(req), { started } = await products.startPrepare(id, { expectedRevision: req.body?.expectedRevision, paid: req.body?.paid, engine: req.body?.engine, approveUsd: req.body?.approveUsd }); res.status(started ? 202 : 200).json({ started, template: products.view(id) }); } catch (error) { next(error); }
   });
   router.post(`${base}/:id/approve`, json, async (req, res, next) => { try { res.json(await products.approve(idOf(req), { expectedRevision: req.body?.expectedRevision, acknowledge: req.body?.acknowledge, draft: req.body?.draft })); } catch (error) { next(error); } });
+  // First-time master creation in a common ratio: preview the size (free; AI composition through the reuse compose route), then save it.
+  router.post(`${base}/:id/master-size`, json, async (req, res, next) => { try { res.json(await products.masterSize(idOf(req), req.body ?? {})); } catch (error) { next(error); } });
+  router.post(`${base}/:id/master-size/save`, json, async (req, res, next) => { try { res.status(201).json(await products.saveMasterSize(idOf(req), req.body ?? {})); } catch (error) { next(error); } });
   router.post(`${base}/:id/publish`, json, async (req, res, next) => { try { res.status(201).json(await products.publish(idOf(req), { expectedRevision: req.body?.expectedRevision })); } catch (error) { next(error); } });
   router.post(`${base}/:id/open-editor`, async (req, res, next) => { try { res.json(await products.openEditor(idOf(req))); } catch (error) { next(error); } });
   // Creatives: the saved template reused. Every change is a new revision of the creative (expectedRevision guards it).

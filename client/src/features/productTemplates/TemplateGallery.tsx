@@ -29,11 +29,11 @@ export function TemplateGallery({ onUse }: { onUse: (id: string) => void }) {
   const masters = ready.filter(t => !fromCreative(t)), mine = ready.filter(fromCreative);
   const card = (t: ProductListItem) => <article key={t.id} className="cg-card" aria-label={`Template ${t.name}`}>
     <button type="button" className="cg-thumb" onClick={() => onUse(t.id)} aria-label={`Use ${t.name}`} tabIndex={-1}>
-      <img src={productFileUrl(t.id, t.source.inputFile)} alt="" loading="lazy" style={{ aspectRatio: `${t.source.width} / ${t.source.height}` }} />
+      <img src={productFileUrl(t.id, t.master?.preview ?? t.source.inputFile)} alt="" loading="lazy" style={{ aspectRatio: `${(t.master?.canvas ?? t.source).width} / ${(t.master?.canvas ?? t.source).height}` }} />
     </button>
     <div className="cg-card-body">
       <h3>{t.name}</h3>
-      <p className="cg-meta">{formatName(t.source.width, t.source.height)} format · ready to use</p>
+      <p className="cg-meta">{formatName((t.master?.canvas ?? t.source).width, (t.master?.canvas ?? t.source).height)} format · ready to use</p>
       <button type="button" className="ws-btn ws-btn-primary cg-use" onClick={() => onUse(t.id)}>Use This Template<ArrowRight size={15} aria-hidden="true" /></button>
     </div>
   </article>;

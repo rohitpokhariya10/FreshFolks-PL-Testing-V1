@@ -15,10 +15,11 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeft, Check, Columns2, ImagePlus, LayoutGrid, Maximize2, Pencil, RefreshCw, Save, Sparkles, Star, Trash2, UploadCloud, X } from 'lucide-react';
-import { isOfferAspectRatio, REUSE_ASPECT_LABELS, REUSE_OFFERED_RATIOS, type ReuseAspectRatio, type ReuseDraft, type ReuseValidation } from '@frameflow/shared';
+import { isOfferAspectRatio, REUSE_ASPECT_LABELS, REUSE_OFFERED_RATIOS, type ReuseAspectRatio, type ReuseDraft } from '@frameflow/shared';
 import { productApi, productFileUrl, type ProductView, type ReuseDraftChange, type ReuseStudioView } from './api';
 import { CreativeSteps, formatName } from './TemplateGallery';
 import { EditYourCreative } from './MakeEditable';
+import { PreSaveChecks, SizePicker } from './SizeControls';
 
 const KIND_CHOICES = ['washing machine', 'refrigerator', 'television', 'dishwasher', 'microwave oven', 'air conditioner', 'coffee machine', 'cooker', 'air fryer', 'water purifier', 'mixer grinder', 'speaker', 'smart speaker', 'soundbar', 'phone', 'computer', 'tablet', 'headphones', 'kettle', 'vacuum cleaner', 'fan'];
 const FRIENDLY: Record<string, string> = {
@@ -36,28 +37,6 @@ const FRIENDLY: Record<string, string> = {
   BUSY: 'FrameFlow is still working on your creative. Please wait a moment and try again.',
   HTTP_ERROR: 'We couldn’t reach FrameFlow. Check your connection and try again.',
 };
-/**
- * The creative's size, chosen before it is made (and again on every reuse): the template's own, or one of the common
- * offer-creative ratios. Each is composed for its shape — never stretched — and saved with the creative.
- */
-function SizePicker({ value, onChange, original, disabled }: { value: ReuseAspectRatio; onChange: (r: ReuseAspectRatio) => void; original?: { width: number; height: number }; disabled?: boolean }) {
-  const shape = (r: ReuseAspectRatio) => (r === 'original' ? (original ? `${original.width} / ${original.height}` : '1 / 1') : r.replace(':', ' / '));
-  return <div className="sr-formats" role="radiogroup" aria-label="Creative size">{REUSE_OFFERED_RATIOS.map(r => <button key={r} type="button" role="radio" aria-checked={value === r} className={`sr-format${value === r ? ' is-on' : ''}`} disabled={disabled} onClick={() => onChange(r)}>
-    <span className="sr-shape" style={{ aspectRatio: shape(r) }} aria-hidden="true" />{r === 'original' ? `Original${original ? ` · ${formatName(original.width, original.height)}` : ''}` : REUSE_ASPECT_LABELS[r]}</button>)}</div>;
-}
-/** What was verified before saving: the exact size, the protected elements, readability and clipping. */
-const count = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
-function PreSaveChecks({ v }: { v?: ReuseValidation }) {
-  if (!v) return null;
-  const rows: [string, boolean, string][] = [
-    ['Size', v.size.ok, v.size.message],
-    ['Logos, text & products', v.protected.ok, v.protected.ok ? `${count(v.protected.logos, 'logo')}, ${count(v.protected.texts, 'text block')} and ${count(v.protected.products, 'product')} — all shown, exact and unchanged.` : v.protected.issues.join(' ')],
-    ['Readability', v.readability.ok, v.readability.ok ? 'Every text is large enough and stands out from what is behind it.' : v.readability.issues.join(' ')],
-    ['Edges', v.clipping.ok, v.clipping.ok ? 'Nothing is cut off by the edges.' : v.clipping.issues.join(' ')],
-  ];
-  return <ul className="sr-checks" aria-label="Checked before saving">{rows.map(([title, ok, text]) => <li key={title} className={ok ? 'is-ok' : 'is-warn'}>
-    <span className="sr-check-mark" aria-hidden="true">{ok ? <Check size={12} /> : '!'}</span><span><strong>{title}</strong> {text}</span></li>)}</ul>;
-}
 const friendly = (e: unknown) => ({ message: FRIENDLY[(e as { code?: string })?.code ?? ''] ?? 'Something went wrong. Please try again.', detail: e instanceof Error ? e.message : String(e) });
 type Pending = { key: string; name: string; url: string; file: File; error?: string };
 type Step = 'upload' | 'generating' | 'result';
@@ -204,7 +183,9 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
     finally { setSaving(false); }
   };
   const saved = !!output?.creativeId && output.savedDraftRevision === draft?.revision;
-  const masterPreview = template ? productFileUrl(templateId, template.template.source.inputFile) : undefined;
+  // A master saved in a common ratio is that size (its own preview); the original upload stays its source.
+  const latestMaster = template?.product.revisions.at(-1), masterCanvas = view?.canvas ?? latestMaster?.canvas ?? template?.template.source;
+  const masterPreview = template ? productFileUrl(templateId, latestMaster?.preview ?? template.template.source.inputFile) : undefined;
   const formats = view?.formats ?? [];
   const failed = output?.checks.status === 'failed', notes = output?.checks.issues ?? [], aiSkipped = output?.placement === 'ai' && !aiUsed;
   const startOver = () => { setDraft(undefined); draftRef.current = undefined; setView(undefined); setStep('upload'); setNote(''); setPending([]); };
@@ -260,7 +241,7 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
       <aside className="sr-aside" aria-label="Your template">
         <section className="sr-size-card" aria-label="Choose your size"><h3>Choose your size</h3>
           <p className="sr-hint">Each size is designed for its shape — never stretched — and saved with your creative.</p>
-          <SizePicker value={ratio} onChange={r => void pickSize(r)} original={template?.template.source} disabled={saving} />
+          <SizePicker value={ratio} onChange={r => void pickSize(r)} original={masterCanvas} disabled={saving} />
           {!REUSE_OFFERED_RATIOS.includes(ratio as typeof REUSE_OFFERED_RATIOS[number]) && <p className="sr-hint">This creative uses {REUSE_ASPECT_LABELS[ratio]} (an earlier size). Choose another to change it.</p>}
           {formats.find(f => f.ratio === ratio)?.note && <p className="sr-hint">{formats.find(f => f.ratio === ratio)!.note}</p>}</section>
         {masterPreview && <figure className="sr-template"><img src={masterPreview} alt={`Template ${template?.template.name ?? ''}`} /><figcaption><span>Your template</span><strong>{template?.template.name}</strong></figcaption></figure>}
@@ -302,7 +283,7 @@ export function SimpleReuse({ templateId, onBack, onEdit, onAllDrafts, onOpenRun
       <aside className="sr-panel">
         <h3>{failed ? 'Almost there' : 'Your creative is ready!'}</h3>
         <label className="sr-size-row"><span>Size</span><select aria-label="Creative size" value={ratio} disabled={saving} onChange={e => void pickSize(e.target.value as ReuseAspectRatio)}>
-          {[...REUSE_OFFERED_RATIOS, ...(REUSE_OFFERED_RATIOS.includes(ratio as typeof REUSE_OFFERED_RATIOS[number]) ? [] : [ratio])].map(r => <option key={r} value={r}>{r === 'original' && template ? `Original · ${formatName(template.template.source.width, template.template.source.height)}` : REUSE_ASPECT_LABELS[r]}</option>)}</select></label>
+          {[...REUSE_OFFERED_RATIOS, ...(REUSE_OFFERED_RATIOS.includes(ratio as typeof REUSE_OFFERED_RATIOS[number]) ? [] : [ratio])].map(r => <option key={r} value={r}>{r === 'original' && masterCanvas ? `Original · ${formatName(masterCanvas.width, masterCanvas.height)}` : REUSE_ASPECT_LABELS[r]}</option>)}</select></label>
         {output?.composition?.source === 'rules' && composer?.ai && isOfferAspectRatio(ratio) && <button type="button" className="ws-btn" onClick={() => (composeCost > 0 ? setAskAi('compose') : void run(false, undefined, true))}><Sparkles size={15} aria-hidden="true" />Design this size with AI</button>}
         {output && fresh && <PreSaveChecks v={output.validation} />}
         <p className="sr-panel-lead">{failed ? FRIENDLY.NOT_READY : saved ? 'It’s saved to your creatives — you can use it as it is.' : 'Take a look. Save it when you’re happy, or adjust it first.'}</p>

@@ -4,7 +4,7 @@
  * vision request), `paid` (the cut-out service, one request per object) and `ai` (the variation planner, one request)
  * are only sent when the person chose them after seeing the cost.
  */
-import type { MasterCategory, PixelRect, ProductAspectRatio, ReuseAspectRatio, ReuseDraft, ReuseValidation, ReuseOverride, ReuseTextEdit, ProductVariationCheck, CreativeTextStyle, ProductDecompositionPlan, ProductGenerationBrief, ProductCreative, ProductInfo, ProductObjectKind, ProductSnapshot, ProductStage, ProductVariationInfo, ProductVariationKind, ProtectedTemplate } from '@frameflow/shared';
+import type { MasterCategory, OfferAspectRatio, PixelRect, ProductAspectRatio, ReuseAspectRatio, ReuseDraft, ReuseValidation, ReuseOverride, ReuseTextEdit, ProductVariationCheck, CreativeTextStyle, ProductDecompositionPlan, ProductGenerationBrief, ProductCreative, ProductInfo, ProductObjectKind, ProductSnapshot, ProductStage, ProductVariationInfo, ProductVariationKind, ProtectedTemplate } from '@frameflow/shared';
 import { ProtectedApiError, protectedFileUrl } from '../protectedTemplates/api';
 
 const BASE = '/api/layerize-experiment/product-templates';
@@ -39,7 +39,9 @@ export interface ProductView {
   stage: ProductStage; product: ProductInfo; texts: TextBlock[]; logos: LogoView[]; attention: Attention[];
   counts: { characters: number; products: number; text: number; words: number; logos: number; background: number };
 }
-export interface ProductListItem { id: string; name: string; createdAt: string; updatedAt: string; stage: ProductStage; source: ProtectedTemplate['source']; counts: ProductView['counts']; revisions: number; /** The latest saved version is a draft with quality warnings. */ draft?: boolean }
+export interface ProductListItem { id: string; name: string; createdAt: string; updatedAt: string; stage: ProductStage; source: ProtectedTemplate['source']; counts: ProductView['counts']; revisions: number; /** The latest saved version is a draft with quality warnings. */ draft?: boolean;
+  /** The master was saved in a common ratio when it was created: its size, canvas and preview (the original upload stays its source). */
+  master?: { aspectRatio: OfferAspectRatio; canvas: { width: number; height: number }; preview?: string } }
 export interface SheetAnswer { sheet: boolean; width: number; height: number; boxes: PixelRect[] }
 /** What fitting the text did, line by line (letters: read on this computer; strokes: by the picture; kept: unchanged). */
 export interface TextFit { moved: number; lines: { text: string; method: 'letters' | 'strokes' | 'kept'; moved: number; reason?: string }[] }
@@ -107,6 +109,10 @@ export const productApi = {
   prepare: (id: string, input: { expectedRevision: number; paid?: boolean; engine?: 'ai'; approveUsd?: number }) => call<{ started: boolean; template: ProductView }>(`/${id}/prepare`, json('POST', input)),
   approve: (id: string, input: { expectedRevision: number; acknowledge: string[]; /** Save despite blocking warnings, as a draft. */ draft?: boolean }) => call<ProductView>(`/${id}/approve`, json('POST', input)),
   publish: (id: string, input: { expectedRevision: number }) => call<ProductView>(`/${id}/publish`, json('POST', input)),
+  /** First-time master creation: the master previewed in a common ratio from its saved original (free; AI composition via reuseCompose). */
+  masterSize: (id: string, ratio: OfferAspectRatio) => call<{ draft: ReuseDraft; view: ReuseStudioView; sourceRevision: number; ratio: OfferAspectRatio }>(`/${id}/master-size`, json('POST', { ratio })),
+  /** Saves the previewed size as the master (a new revision; the original revision is kept unchanged). */
+  saveMasterSize: (id: string, input: { draftId: string; ratio: OfferAspectRatio; expectedRevision: number }) => call<ProductView>(`/${id}/master-size/save`, json('POST', input)),
   openEditor: (id: string) => call<{ runId: string; created: boolean; template: ProductView }>(`/${id}/open-editor`, { method: 'POST' }),
   snapshot: (id: string, revision: number) => call<ProductSnapshot>(`/${id}/revisions/${revision}`),
   creatives: (id: string) => call<{ creatives: CreativeListItem[] }>(`/${id}/creatives`),

@@ -11,7 +11,7 @@ Template Studio's generated posters stay on their own tab. Text & Graphics maste
 `product` field these templates add).
 
 ```
-Create   Upload ─► Review ─► Prepare ─► Save
+Create   Upload ─► Review ─► Prepare ─► Size ─► Save   (Size: Original, or 1:1 / 4:5 / 9:16 / 16:9 — see REUSE_TEMPLATE_STUDIO.md, "Master size")
          (a sheet: choose one creative; cropped exactly, the upload kept)
          (local OCR; optional AI vision, one request, opt-in) (local; optional SAM-3, priced and confirmed) (version N)
 Reuse    Use template ─► New creative ─► Replace / edit / move ─► Save (a new creative version) ─► Open in editor

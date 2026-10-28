@@ -15,7 +15,7 @@ import sharp from 'sharp';
 import {
   decomposesObject, estimateAdvance, isMasterCategory, isOverlayKind, normalizeBox, orderProductObjects, PRODUCT_ELEMENT_KINDS, PRODUCT_LIMITS, PRODUCT_OBJECT_KINDS, PRODUCT_PREPARE_VERSION, PRODUCT_SCHEMA_VERSION, PROTECTED_SCHEMA_VERSION, withHistory,
   type DetectedWord, type LogoSlot, type MasterCategory, type PixelRect, type ProductHistoryEntry, type ProductInfo, type ProductObject, type ProductObjectKind, type ProductPrepared, type ProductSnapshot, type ProductGenerationBrief, type ProductStage, type ProtectedTemplate, type SourceBox,
-  type ReuseAspectRatio,
+  type ReuseAspectRatio, type OfferAspectRatio, isOfferAspectRatio, REUSE_ASPECT_LABELS,
 } from '@frameflow/shared';
 import { RunError } from '../../layerizeExperiment.js';
 import { decodeRgba, ingestImage, ProtectedImageError, sha256 } from '../pixels.js';
@@ -39,6 +39,7 @@ import { paletteOf } from './artwork.js';
 import { createReuseStudio } from './reuseStudio.js';
 import type { ReusePlacementPlanner } from './reusePlacement.js';
 import type { ReuseComposer } from './reuseCompose.js';
+import { mapBox, mapY } from './reuseLayout.js';
 import { measureWord } from '../../../textRecognition/measure.js';
 
 const nowIso = () => new Date().toISOString();
@@ -165,7 +166,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     };
   }
   function list() {
-    return store.list().filter(t => !!t.product).map(t => { const v = view(t.id); return { id: t.id, name: t.name, createdAt: t.createdAt, updatedAt: t.updatedAt, stage: v.stage, source: t.source, counts: v.counts, revisions: v.product.revisions.length, ...(v.product.revisions.at(-1)?.draft ? { draft: true } : {}) }; });
+    return store.list().filter(t => !!t.product).map(t => { const v = view(t.id); return { id: t.id, name: t.name, createdAt: t.createdAt, updatedAt: t.updatedAt, stage: v.stage, source: t.source, counts: v.counts, revisions: v.product.revisions.length, ...(v.product.revisions.at(-1)?.aspectRatio ? { master: { aspectRatio: v.product.revisions.at(-1)!.aspectRatio!, canvas: v.product.revisions.at(-1)!.canvas!, preview: v.product.revisions.at(-1)!.preview } } : {}), ...(v.product.revisions.at(-1)?.draft ? { draft: true } : {}) }; });
   }
 
   // --- Create ----------------------------------------------------------------------------------------------------------
@@ -862,12 +863,16 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     const edit = p.editorDraft;
     if (edit && edit.objectsRevision === p.objectsRevision && edit.analysisRevision === p.prepared.analysisRevision && edit.baseSha256 === p.prepared.base.sha256) {
       const edited = JSON.parse(store.read(id, `product-r${edit.revision}.json`).toString('utf8')) as ProductSnapshot;
-      if (edited.editorCreative) { snapshot.editorCreative = edited.editorCreative; snapshot.canvas = edited.editorCreative.canvas; }
+      if (edited.editorCreative) {
+        snapshot.editorCreative = edited.editorCreative; snapshot.canvas = edited.editorCreative.canvas;
+        // An adapted master saved again keeps its size: its objects and structure are in that canvas.
+        if (edited.adaptation) Object.assign(snapshot, { adaptation: edited.adaptation, objects: edited.objects, backgroundStructure: edited.backgroundStructure });
+      }
     }
     const bytes = Buffer.from(JSON.stringify(snapshot, null, 2)), file = `product-r${revision}.json`;
     if (store.has(id, file)) fail('CONFLICT', `Revision ${revision} exists already.`);
     store.write(id, file, bytes);
-    const saved = store.update(id, t.revision, x => { const q = x.product!; q.generation ??= generation; q.revisions = [...q.revisions, { revision, file, sha256: sha256(bytes), publishedAt: at, ...(draft ? { draft: true } : {}) }]; if (snapshot.editorCreative && q.editorDraft) q.editorDraft.revision = revision; history(q, { action: 'saved', detail: `Revision ${revision}${draft ? ' (an editor draft; quality approval is still required)' : ''}.` }); });
+    const saved = store.update(id, t.revision, x => { const q = x.product!; q.generation ??= generation; q.revisions = [...q.revisions, { revision, file, sha256: sha256(bytes), publishedAt: at, ...(draft ? { draft: true } : {}), ...(snapshot.adaptation ? { aspectRatio: snapshot.adaptation.ratio, canvas: { ...snapshot.canvas }, fromRevision: snapshot.adaptation.fromRevision } : {}) }]; if (snapshot.editorCreative && q.editorDraft) q.editorDraft.revision = revision; history(q, { action: 'saved', detail: `Revision ${revision}${draft ? ' (an editor draft; quality approval is still required)' : ''}.` }); });
     return view(saved.id);
   }
   function snapshot(id: string, revision: number): ProductSnapshot {
@@ -914,10 +919,66 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     store.update(id, t.revision, x => { x.product!.revisions.push({ revision, file, sha256: sha256(bytes), publishedAt: at, draft: true }); x.product!.editorDraft = { ...link, revision }; delete x.product!.approved; history(x.product!, { action: 'saved', detail: `Editor master revision ${revision}; quality review retained.` }); });
     return view(id);
   });
+  // --- First-time master creation in a common ratio -------------------------------------------------------------------------
+  /** The original revision a master's sizes are made from (an adapted master's own original). */
+  const sourceRevisionOf = (id: string) => {
+    const latest = requireProduct(id).product.revisions.at(-1) ?? fail('NOT_READY', 'Save the master template in its original size first.');
+    return latest.fromRevision ?? snapshot(id, latest.revision).adaptation?.fromRevision ?? latest.revision;
+  };
+  /**
+   * The master in a common ratio, previewed before it is saved: composed from the saved original revision by the Reuse
+   * Template engine (reuseCompose.ts) — free by the rules, or by its approved AI composition — with its checks.
+   */
+  const masterSize = async (id: string, input: { ratio?: unknown }) => {
+    if (!isOfferAspectRatio(input.ratio)) fail('INVALID_REQUEST', 'Choose Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9 (Original size needs no adaptation).');
+    const revision = sourceRevisionOf(id), r = await reuse.masterDraft(id, { revision, ratio: input.ratio });
+    return { ...r, sourceRevision: revision, ratio: input.ratio };
+  };
+  /**
+   * Saves the previewed size as the master: a new revision whose layers (`editorCreative`) are the composition at its
+   * exact canvas, its objects and background structure mapped into it, words, logo slots and plates kept as the original's
+   * source evidence, and `adaptation` linking it to the original revision (never changed). The original stays a revision
+   * of its own; reuse in the master's size starts from this one, in any other common ratio from the original.
+   */
+  const saveMasterSize = (id: string, input: { draftId?: unknown; ratio?: unknown; expectedRevision?: unknown }) => locked(id, async () => {
+    const t = requireProduct(id);
+    if (input.expectedRevision !== t.revision) fail('STALE_REVISION', `This template changed since you opened it (revision ${t.revision}). Reload it and try again.`, { revision: t.revision });
+    if (!isOfferAspectRatio(input.ratio) || typeof input.draftId !== 'string') fail('INVALID_REQUEST', 'Preview a size of the master first.');
+    const ratio: OfferAspectRatio = input.ratio;
+    if (detecting.has(id) || preparingNow(id)) fail('BUSY', 'Wait for detection or decomposition to finish before saving the master.');
+    const from = sourceRevisionOf(id), made = await reuse.masterCreative(id, input.draftId, ratio);
+    if (made.draft.templateRevision !== from) fail('STALE_REVISION', 'The master was saved again since this preview: preview the size again.');
+    const previous = snapshot(id, from), f = made.frame, c = made.creative, excluded = new Set(f.excluded);
+    const box = (b: PixelRect) => { const m = mapBox(f, b); return { x: Math.round(m.x), y: Math.round(m.y), width: Math.max(1, Math.round(m.width)), height: Math.max(1, Math.round(m.height)) }; };
+    // Each object where the composition drew it (a character re-anchored, a product in its mapped place), else mapped.
+    const drawn = (o: ProductObject) => c.objects.find(x => x.kind === o.kind && (x.objectId ?? x.id) === o.id && !x.hidden)?.box;
+    const objects = previous.objects.filter(o => !excluded.has(o.label)).map(o => {
+      const at = drawn(o), b = at ? { x: Math.round(at.x), y: Math.round(at.y), width: Math.round(at.width), height: Math.round(at.height) } : box(o.box);
+      return { ...o, box: b, ...(o.cutout ? { cutout: { ...o.cutout, placement: { ...b } } } : {}), ...(o.slot ? { slot: { ...o.slot, box: box(o.slot.box), contactY: Math.round(mapY(f, o.slot.contactY)), targetHeight: Math.round(o.slot.targetHeight * f.scale) } } : {}) };
+    });
+    const latest = t.product.revisions.at(-1)!, revision = latest.revision + 1, at = nowIso();
+    const adapted: ProductSnapshot = { ...previous, revision, publishedAt: at, canvas: { ...c.canvas }, objects,
+      backgroundStructure: (previous.backgroundStructure ?? []).filter(o => !excluded.has(o.label)).map(o => ({ ...o, box: box(o.box) })),
+      editorCreative: { ...structuredClone(c), name: t.name, templateRevision: revision, origin: { kind: 'template' } },
+      adaptation: { fromRevision: from, ratio: ratio, source: made.composition.source, layout: made.composition.layout, at, draftId: made.draft.id, ...(made.validation ? { validation: made.validation } : {}), ...(c.background?.extension ? { extension: c.background.extension } : {}) } };
+    const file = `product-r${revision}.json`, bytes = Buffer.from(JSON.stringify(adapted, null, 2));
+    if (store.has(id, file)) fail('CONFLICT', `Revision ${revision} exists already.`);
+    store.write(id, file, bytes);
+    const draft = t.product.revisions.find(r => r.revision === from)?.draft;
+    store.update(id, t.revision, x => {
+      const q = x.product!;
+      q.revisions = [...q.revisions, { revision, file, sha256: sha256(bytes), publishedAt: at, aspectRatio: ratio, canvas: { ...c.canvas }, fromRevision: from, ...(made.preview ? { preview: made.preview } : {}), ...(draft ? { draft: true } : {}) }];
+      q.masterRatio = ratio;
+      // The editor opens the adapted master next (a new editing creative of it).
+      if (q.editorDraft) q.editorDraft = { objectsRevision: q.editorDraft.objectsRevision, analysisRevision: q.editorDraft.analysisRevision, baseSha256: q.editorDraft.baseSha256, revision };
+      history(q, { action: 'saved', detail: `Revision ${revision}: the master in ${REUSE_ASPECT_LABELS[ratio]} (${c.canvas.width} × ${c.canvas.height}), ${made.composition.source === 'ai' ? 'laid out by the approved AI composition' : 'composed on this computer'}, from revision ${from} (kept unchanged).` });
+    });
+    return view(id);
+  });
   const variations = createProductVariations({ store, creatives, requireProduct, snapshot, locked, toTemplate: input => createFromVariation(input), latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, planner: options.planner, artwork: options.artwork, recognizer: options.recognizer });
   // Reuse Template (separate from variations): the person's own product set, copy and formats.
   const reuse = createReuseStudio({ store, creatives, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, placement: options.placement, composer: options.composer, recognizer: options.recognizer, toTemplate: input => createFromVariation(input) });
 
-  return { list, view, sheetOf, create, createFromVariation, startDetect, review, fitText, select, brief, editBrief, uploadReviewAsset, estimate, startPrepare, approve, publish, openEditor, saveEditorMaster, snapshot, creatives, variations, reuse, isDetecting: (id: string) => detecting.has(id), isPreparing: (id: string) => preparing.has(id), requireProduct, kinds: PRODUCT_ELEMENT_KINDS, isOverlayKind };
+  return { list, view, sheetOf, create, createFromVariation, startDetect, review, fitText, select, brief, editBrief, uploadReviewAsset, estimate, startPrepare, approve, publish, openEditor, saveEditorMaster, masterSize, saveMasterSize, snapshot, creatives, variations, reuse, isDetecting: (id: string) => detecting.has(id), isPreparing: (id: string) => preparing.has(id), requireProduct, kinds: PRODUCT_ELEMENT_KINDS, isOverlayKind };
 }
 export type ProductTemplates = ReturnType<typeof createProductTemplates>;

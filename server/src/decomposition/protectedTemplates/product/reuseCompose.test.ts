@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import sharp from 'sharp';
 import { describe, expect, it } from 'vitest';
-import { OFFER_ASPECT_RATIOS, type ProductCreative, type ReuseDraft, type ReuseOutput } from '@frameflow/shared';
+import { OFFER_ASPECT_RATIOS, type ProductCreative, type ProductSnapshot, type ReuseDraft, type ReuseOutput } from '@frameflow/shared';
 import { setup, savedTemplate, type View } from './productServer.fixture.js';
 import { productPosterPng } from './productPoster.fixture.js';
 import { checkComposePlan, composeBackground, planRules, toCanvas, type composeRequest, type ReuseComposer, type Structure } from './reuseCompose.js';
@@ -30,6 +30,21 @@ async function structure(): Promise<Structure> {
       { kind: 'text', label: 'the headline', x: 200, y: 200, width: 600, height: 120 },
     ] };
 }
+
+const plans: { format: string; keys: string[] }[] = [], edits: { size: { width: number; height: number }; editArea: number }[] = [];
+/** The layout planner and image editor as test doubles (no network, no charge; offline:false so the approval is exercised). */
+const composer = (paint = '#e8f4ea'): ReuseComposer => ({ model: 'test layout planner (no network)', offline: false,
+  async plan(input, _image, save) {
+    const i = input as ReturnType<typeof composeRequest>;
+    plans.push({ format: i.format, keys: i.elements.map(e => e.key) }); save('compose.test-request.json', { format: i.format, testOnly: true });
+    return { responseId: `fake-plan-${plans.length}`, raw: { layout: 'scene beside an offer column (test)', art: i.proposal.art, boxes: i.proposal.boxes, safeArea: { x: 0, y: 0, ...i.canvas }, notes: ['test double'] } };
+  },
+  editor: { model: 'test image editor (no network)', offline: false, async edit(r) {
+    const { data } = await sharp(r.mask).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    let open = 0; for (let k = 3; k < data.length; k += 4) if (data[k] < 128) open++;
+    edits.push({ size: r.size, editArea: open / (data.length / 4) });
+    return { image: await sharp({ create: { ...r.size, channels: 3, background: paint } }).png().toBuffer(), requestId: 'fake-edit' };
+  } } });
 
 describe('Recompose: the rules’ plan (free, deterministic)', () => {
   it('makes every common ratio exactly, the artwork at one scale within its own pixels, every element inside the canvas and apart', async () => {
@@ -92,20 +107,6 @@ describe('Recompose background', () => {
 });
 
 describe('Recompose in the Reuse Template studio (HTTP, temporary store, mocked AI)', { timeout: 180000 }, () => {
-  const plans: { format: string; keys: string[] }[] = [], edits: { size: { width: number; height: number }; editArea: number }[] = [];
-  /** The layout planner and image editor as test doubles (no network, no charge; offline:false so the approval is exercised). */
-  const composer = (paint = '#e8f4ea'): ReuseComposer => ({ model: 'test layout planner (no network)', offline: false,
-    async plan(input, _image, save) {
-      const i = input as ReturnType<typeof composeRequest>;
-      plans.push({ format: i.format, keys: i.elements.map(e => e.key) }); save('compose.test-request.json', { format: i.format, testOnly: true });
-      return { responseId: `fake-plan-${plans.length}`, raw: { layout: 'scene beside an offer column (test)', art: i.proposal.art, boxes: i.proposal.boxes, safeArea: { x: 0, y: 0, ...i.canvas }, notes: ['test double'] } };
-    },
-    editor: { model: 'test image editor (no network)', offline: false, async edit(r) {
-      const { data } = await sharp(r.mask).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-      let open = 0; for (let k = 3; k < data.length; k += 4) if (data[k] < 128) open++;
-      edits.push({ size: r.size, editArea: open / (data.length / 4) });
-      return { image: await sharp({ create: { ...r.size, channels: 3, background: paint } }).png().toBuffer(), requestId: 'fake-edit' };
-    } } });
 
   it('composes every common ratio as its own layers, verifies it before saving, keeps older drafts working, and records the ratio on the master made from it', async () => {
     const s = await setup({ composer: composer() });
@@ -176,6 +177,58 @@ describe('Recompose in the Reuse Template studio (HTTP, temporary store, mocked 
       expect(ext && 'failed' in ext ? ext.failed : '').toMatch(/drew lettering/);
       d = (await s.send<ReuseDraft>('POST', `/${id}/reuse/${d.id}/generate`, {})).body;
       expect(d.outputs['16:9']!.background.extension?.method).toBe('local'); expect(d.outputs['16:9']!.composition?.source).toBe('ai');
+    } finally { await s.close(); }
+  });
+});
+
+describe('First-time master creation in a common ratio (HTTP, temporary store, mocked AI)', { timeout: 180000 }, () => {
+  it('saves the original, previews and saves a 16:9 master from it with every layer editable, opens it in the editor, and reuses it in another ratio', async () => {
+    const s = await setup({ composer: composer() });
+    try {
+      const v = await savedTemplate(s, await productPosterPng()), id = v.template.id, original = readFileSync(join(s.protectedDir, id, 'product-r1.json'));
+      // The size is chosen before the master is saved in it: a free preview from the original revision, with its checks.
+      const preview = (await s.send<{ draft: ReuseDraft; sourceRevision: number; ratio: string; view: { composition: { ai: boolean } } }>('POST', `/${id}/master-size`, { ratio: '16:9' })).body;
+      expect(preview.sourceRevision).toBe(1); expect(preview.draft.master).toBe(true); expect(preview.view.composition.ai).toBe(true);
+      const out = preview.draft.outputs['16:9']!;
+      expect(exact('16:9', out.canvas)).toBe(true); expect(out.validation).toMatchObject({ size: { ok: true }, protected: { ok: true }, clipping: { ok: true } });
+      // A master size draft is the master's, not a reuse draft.
+      expect((await s.call<{ drafts: unknown[] }>(`/${id}/reuse`)).body.drafts).toEqual([]);
+      // Designed with AI (approved; test doubles), then previewed again.
+      let d = (await s.send<ReuseDraft>('POST', `/${id}/reuse/${preview.draft.id}/compose`, { ratios: ['16:9'], approveUsd: 0.2 })).body;
+      d = (await s.send<ReuseDraft>('POST', `/${id}/reuse/${d.id}/generate`, {})).body;
+      expect(d.outputs['16:9']!.composition?.source).toBe('ai');
+      const before = (await s.call<View>(`/${id}`)).body;
+      const saved = (await s.send<View>('POST', `/${id}/master-size/save`, { draftId: d.id, ratio: '16:9', expectedRevision: before.template.revision })).body;
+      expect(saved.product.revisions.map(r => [r.revision, r.aspectRatio ?? 'original', r.fromRevision ?? null])).toEqual([[1, 'original', null], [2, '16:9', 1]]);
+      expect(saved.product.masterRatio).toBe('16:9');
+      // The original revision is never changed; the master is revision 2, exactly 16:9, its own layers editable.
+      expect(readFileSync(join(s.protectedDir, id, 'product-r1.json'))).toEqual(original);
+      const master = JSON.parse(readFileSync(join(s.protectedDir, id, 'product-r2.json'), 'utf8')) as ProductSnapshot;
+      expect(exact('16:9', master.canvas)).toBe(true); expect(master.editorCreative!.canvas).toEqual(master.canvas);
+      expect(master.adaptation).toMatchObject({ fromRevision: 1, ratio: '16:9', source: 'ai' });
+      const ec = master.editorCreative!;
+      expect(ec.images.filter(i => !i.hidden)).toHaveLength(v.counts.logos);
+      expect(ec.texts.filter(t => !t.hidden).map(t => t.text)).toEqual(expect.arrayContaining(['Grand', 'Savings', 'T&Cs', 'apply']));
+      expect(ec.objects.some(o => o.label.startsWith('Text · '))).toBe(false);
+      const products = ec.objects.filter(o => o.kind === 'product');
+      expect(products.length).toBe(v.counts.products); expect(products.every(o => o.asset.kind === 'template')).toBe(true);
+      for (const o of [...products, ...ec.images]) expect(inter(o.box, { x: 0, y: 0, ...master.canvas })).toBeGreaterThanOrEqual(o.box.width * o.box.height * 0.98);
+      // Its objects are in the new canvas (the reuse studio stands products in their places from them).
+      for (const o of master.objects.filter(x => x.kind === 'product')) expect(inter(o.box, { x: 0, y: 0, ...master.canvas })).toBeGreaterThan(0);
+      // The editor opens the 16:9 master; a creative of it (Use template) is 16:9.
+      const opened = (await s.send<{ runId: string }>('POST', `/${id}/open-editor`, {})).body;
+      expect(opened.runId).toBeTruthy();
+      const made = (await s.send<ProductCreative>('POST', `/${id}/creatives`, { name: 'From the 16:9 master' })).body;
+      expect(made.templateRevision).toBe(2); expect(made.canvas).toEqual(master.canvas);
+      // Reused: its own size as designed, and another common ratio composed from the original revision.
+      let r = (await s.send<ReuseDraft>('POST', `/${id}/reuse`, { simple: true, ratios: ['original', '9:16'] })).body;
+      expect(r.templateRevision).toBe(2);
+      r = (await s.send<ReuseDraft>('POST', `/${id}/reuse/${r.id}/generate`, {})).body;
+      expect(r.outputs.original!.canvas).toEqual(master.canvas); expect(exact('9:16', r.outputs['9:16']!.canvas)).toBe(true);
+      for (const k of ['original', '9:16'] as const) expect(r.outputs[k]!.checks.status, `${k}: ${r.outputs[k]!.checks.issues.map(i => i.message).join(' ')}`).not.toBe('failed');
+      // Original size stays the original: a template saved without a size has one revision and no adaptation.
+      const plain = await savedTemplate(s, await productPosterPng());
+      expect(plain.product.revisions.map(x => x.aspectRatio ?? 'original')).toEqual(['original']);
     } finally { await s.close(); }
   });
 });

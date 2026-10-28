@@ -187,7 +187,9 @@ export interface ProductPrepared {
   stands?: (ProductObject & { stand: { under: string[]; visiblePixels: number; completedPixels: number; uncertain: boolean } })[];
   durationMs: number;
 }
-export interface ProductRevisionRef { revision: number; file: string; sha256: string; publishedAt: string; /** A draft saved with quality warnings. */ draft?: boolean }
+export interface ProductRevisionRef { revision: number; file: string; sha256: string; publishedAt: string; /** A draft saved with quality warnings. */ draft?: boolean;
+  /** A master adapted to a common ratio (its snapshot's `adaptation`): the ratio, its canvas, its preview and the original revision it was made from. */
+  aspectRatio?: OfferAspectRatio; canvas?: SourceSize; preview?: string; fromRevision?: number }
 export interface ProductHistoryEntry { at: string; action: 'created' | 'cropped' | 'detected' | 'reviewed' | 'prepared' | 'approved' | 'saved'; detail?: string }
 export interface ProductInfo {
   /** Recoverable editor entry for this preparation; opening it again reuses the same creative and run. */
@@ -218,6 +220,8 @@ export interface ProductInfo {
   /** The administrator saw the prepared template and its checks and accepted it (with the issues listed then). */
   approved?: { at: string; objectsRevision: number; baseSha256: string; acknowledged: string[]; /** Saved as a draft with blocking quality warnings, as the person chose. */ draft?: boolean };
   revisions: ProductRevisionRef[];
+  /** The size its master was last adapted to when it was saved (absent: its original size). */
+  masterRatio?: OfferAspectRatio;
   /** Local reads and paid requests so far (reuse never adds to it). */
   activity: { scans: number; aiCalls: number; segmentRequests: number; costUsd: number };
   history: ProductHistoryEntry[];
@@ -280,6 +284,12 @@ export interface ProductDecompositionPlan {
 export interface ProductSnapshot {
   /** Native editor state for this revision; original detection and provider metadata remain alongside it. */
   editorCreative?: ProductCreative;
+  /**
+   * A master adapted to a common aspect ratio when it was created (Recompose): made from `fromRevision` (the original,
+   * kept unchanged), its layers in `editorCreative` at `canvas`. Its objects (boxes, slots, cut-out placements) and
+   * background structure are in this canvas; words, logo slots and plates stay the original's source evidence.
+   */
+  adaptation?: { fromRevision: number; ratio: OfferAspectRatio; source: 'ai' | 'rules'; layout: string; at: string; draftId: string; validation?: ReuseValidation; extension?: ReuseExtension };
   /** Complete provider provenance at this revision, alongside the reviewed selection and quality report. */
   preparation?: ProductPrepared;
   selectedObjects?: ProductObject[];
@@ -573,6 +583,8 @@ export interface ReuseDraft {
   placement: { mode: ReusePlacementMode; keepStands: boolean; hero?: string | null; variant?: number };
   /** Made in the simple flow (Upload Products → Generate My Creative): the template's own products start left out. */
   simple?: boolean;
+  /** The master's own size (first-time master creation): the template's products in their places; not listed with reuse drafts. */
+  master?: boolean;
   ai: { requests: number; costUsd: number; plans: Partial<Record<ReuseAspectRatio, ReuseAiPlan>>; failures: { at: string; operationId: string; message: string }[] };
   overrides: Partial<Record<ReuseAspectRatio, Record<string, ReuseOverride>>>;
   outputs: Partial<Record<ReuseAspectRatio, ReuseOutput>>;

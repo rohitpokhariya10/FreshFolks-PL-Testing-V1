@@ -511,6 +511,16 @@ export async function contrastIssues(png: Buffer, c: ProductCreative, measure: M
   return out;
 }
 
+/**
+ * The creative's layers in the same order with whole-number depths (the editor's document holds only integers): its
+ * objects among themselves, its overlays (shapes, logos, text) among themselves, ties kept as ties. Nothing moves.
+ */
+export function integerOrder(c: ProductCreative): ProductCreative {
+  const rank = (zs: number[]) => { const order = new Map([...new Set(zs)].sort((a, b) => a - b).map((z, n) => [z, n] as const)); return (z: number) => order.get(z) ?? 0; };
+  const object = rank(c.objects.map(o => o.z)), overlay = rank([...c.shapes, ...c.images, ...c.texts].map(x => x.z));
+  return { ...c, objects: c.objects.map(o => ({ ...o, z: object(o.z) })), shapes: c.shapes.map(x => ({ ...x, z: overlay(x.z) })), images: c.images.map(x => ({ ...x, z: overlay(x.z) })), texts: c.texts.map(x => ({ ...x, z: overlay(x.z) })) };
+}
+
 // --- The background -------------------------------------------------------------------------------------------------------
 /**
  * A picture (resized to width × height) with exactly this alpha channel. Assembled here: sharp applies removeAlpha after

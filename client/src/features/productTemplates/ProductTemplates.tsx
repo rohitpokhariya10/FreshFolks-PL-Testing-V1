@@ -11,7 +11,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Crop, Image as ImageIcon, Package, Plus, Recycle, Sparkles, Upload } from 'lucide-react';
-import type { PixelRect, ProductDetection, ProductStage } from '@frameflow/shared';
+import { REUSE_ASPECT_LABELS, type OfferAspectRatio, type PixelRect, type ProductDetection, type ProductStage } from '@frameflow/shared';
 import { Alert, Badge } from '../templateStudio/ui';
 import { productApi, productFileUrl, type ProductListItem, type ProductView, type SheetAnswer } from './api';
 import { ProductReview } from './ProductReview';
@@ -19,6 +19,8 @@ import { ProductPrepare } from './ProductPrepare';
 import { ProductSelect } from './ProductSelect';
 import { ProductTemplatePage } from './ProductTemplatePage';
 import { ReuseStudio } from './ReuseStudio';
+import { MasterSize } from './MasterSize';
+import { formatName } from './TemplateGallery';
 import './productTemplates.css';
 
 /** One AI detection request, as its confirmation states it (the answer is capped at 16,000 output tokens: at most about $0.35). */
@@ -74,9 +76,10 @@ export function ProductLibrary({ onNew, onSetup, onUse, onGenerate, onReuse }: {
     {error && <Alert>{error}</Alert>}
     {!templates ? <p className="ot-muted" role="status">Loading…</p> : !templates.length ? <p className="ot-muted">No product templates yet.</p>
       : <div className="ot-grid">{templates.map(t => <article key={t.id} className="ot-card" aria-label={`Product template ${t.name}`}>
-        <img src={productFileUrl(t.id, t.source.inputFile)} alt="" loading="lazy" />
+        <img src={productFileUrl(t.id, t.master?.preview ?? t.source.inputFile)} alt="" loading="lazy" />
         <div className="ot-card-body">
           <h3>{t.name}</h3>
+          {t.master && <p className="ot-small ot-muted">{REUSE_ASPECT_LABELS[t.master.aspectRatio]} master · {t.master.canvas.width} × {t.master.canvas.height}</p>}
           <div className="ot-row"><Badge tone={t.stage === 'ready' ? 'ok' : t.stage === 'detect-failed' ? 'danger' : 'neutral'}>{PRODUCT_STAGE_LABELS[t.stage]}</Badge>{t.draft && <Badge tone="warn">Draft · quality warnings</Badge>}
             <span className="ot-small ot-muted">{t.counts.products} product{t.counts.products === 1 ? '' : 's'} · {t.counts.characters} character{t.counts.characters === 1 ? '' : 's'} · {t.counts.text} text</span></div>
           <div className="ot-row">
@@ -92,8 +95,8 @@ export function ProductLibrary({ onNew, onSetup, onUse, onGenerate, onReuse }: {
   </section>;
 }
 
-export function Steps({ current }: { current: 1 | 2 | 3 | 4 | 5 }) {
-  const steps = ['Upload', 'Review', 'Choose', 'Decompose', 'Save'];
+export function Steps({ current }: { current: 1 | 2 | 3 | 4 | 5 | 6 }) {
+  const steps = ['Upload', 'Review', 'Choose', 'Decompose', 'Size', 'Save'];
   return <ol className="ot-steps" aria-label="Steps">{steps.map((s, i) => <li key={s} className={i + 1 === current ? 'is-current' : i + 1 < current ? 'is-done' : ''} aria-current={i + 1 === current ? 'step' : undefined}>
     <span>{i + 1 < current ? <Check size={12} aria-hidden="true" /> : i + 1}</span>{s}</li>)}</ol>;
 }
@@ -157,6 +160,8 @@ function SheetCrop({ url, sheet, box }: { url: string; sheet: SheetAnswer; box: 
 function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }: { id: string; onBack: () => void; onUse: (id: string) => void; initialChoosing?: boolean; onOpenRunInEditor?: (runId: string) => Promise<void> }) {
   const [view, setView] = useState<ProductView>(), [error, setError] = useState(''), [reviewing, setReviewing] = useState(false), [choosing, setChoosing] = useState(!!initialChoosing), [retryAi, setRetryAi] = useState(false);
   const [inspecting, setInspecting] = useState(false), [opening, setOpening] = useState(false), [fitted, setFitted] = useState(0);
+  // The Size step: the master previewed in a common ratio after its original is saved.
+  const [sizing, setSizing] = useState<OfferAspectRatio>();
   const live = useRef(true);
   const load = useCallback(async () => { const v = await productApi.get(id); if (live.current) setView(v); return v; }, [id]);
   useEffect(() => { live.current = true; void load().catch((e: Error) => setError(e.message)); return () => { live.current = false; }; }, [load]);
@@ -172,7 +177,7 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
   const retrieve = () => void productApi.detect(id, { force: true, useAi: false, recover: true }).then(r => { setError(''); setView(r.template); }).catch((e: Error) => setError(e.message));
   const recovery = view.recovery?.retrievable && <p><button type="button" className="ws-btn ws-btn-primary" onClick={retrieve}>Retrieve existing request (no new detection charge)</button> The saved response ID is reused; no new analysis is submitted.</p>;
   const from = view.product.variation;
-  const head = (step: 1 | 2 | 3 | 4 | 5, title: string, text: string) => <><div className="ot-head"><div><p className="ot-kicker">{view.template.name}</p><h2>{title}</h2><p>{text}</p></div>
+  const head = (step: 1 | 2 | 3 | 4 | 5 | 6, title: string, text: string) => <><div className="ot-head"><div><p className="ot-kicker">{view.template.name}</p><h2>{title}</h2><p>{text}</p></div>
     <button type="button" className="ws-btn ws-btn-quiet" onClick={onBack}>Back to templates</button></div><Steps current={step} />{error && <Alert>{error}</Alert>}{view.product.detection?.lastFailure && <Alert>{view.product.detection.lastFailure.message} Your previous successful analysis is still available.</Alert>}
     {from && <div className="prt-note prt-journey" role="status" data-testid="from-variation"><strong>Edit Individual Elements</strong>
       <ol><li>Check what we found in your creative <span>(free)</span></li><li>Separate it into layers with AI <span>(you’ll approve the cost first)</span></li><li>Open it in the editor to move, resize and edit</li></ol>
@@ -213,17 +218,22 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
     {view.product.detection?.ai?.offline && <p role="status">Offline fixture detections — not verified AI provider results.</p>}
     {view.product.detection?.ai?.model?.includes('(recorded answer') && <p role="status">A recorded AI answer for this exact image, replayed: no new AI request was made.</p>}
     <ProductReview key={`${view.product.objectsRevision}:${fitted}`} view={view} onSaved={async (v, next) => { setView(v); if (next) { setReviewing(false); setChoosing(true); } }} onError={setError} /></div>;
+  if (sizing && view.product.revisions.length) return <div className="ot-page prt-page-wide">{head(5, `Your master in ${REUSE_ASPECT_LABELS[sizing]}`, 'Preview the master in the size you chose, made from your saved original. Save it when it looks right, or keep the original size.')}
+    <MasterSize key={sizing} view={view} ratio={sizing} onRatio={setSizing} onSaved={v => { setSizing(undefined); setInspecting(false); setView(v); }} onKeepOriginal={() => { setSizing(undefined); setInspecting(false); }} /></div>;
   if (view.stage === 'prepared' || inspecting) return <div className="ot-page prt-page-wide">{head(4, 'Inspect the layers and the background', 'Compare it with your original, look at each layer and at the background on its own, then save it as your master template.')}
     {view.product.editorDraft && <p className="ot-muted">These checks describe the original separation. Open in Editor to inspect and continue your saved editing draft. Opening it does not approve quality.</p>}
     {view.product.revisions.length > 0 && <button type="button" className="ws-btn" onClick={() => onUse(id)}>Use a saved revision</button>}
-    <ProductPrepare view={view} onChange={setView} onError={setError} onBackToReview={() => setReviewing(true)} onChangeSelection={() => setChoosing(true)} onOpenEditor={onOpenRunInEditor ? openInEditor : undefined} /></div>;
+    <ProductPrepare view={view} onChange={setView} onError={setError} onBackToReview={() => setReviewing(true)} onChangeSelection={() => setChoosing(true)} onOpenEditor={onOpenRunInEditor ? openInEditor : undefined} onSize={setSizing} /></div>;
   // Saved.
-  const latest = view.product.revisions.at(-1);
-  return <div className="ot-page">{head(5, 'Your template is saved', `Version ${latest?.revision ?? 1} is ready to use. Earlier versions stay as they were.`)}
+  const latest = view.product.revisions.at(-1), sized = latest?.aspectRatio;
+  return <div className="ot-page">{head(6, sized ? `Your ${REUSE_ASPECT_LABELS[sized]} master template is saved` : 'Your template is saved', `Version ${latest?.revision ?? 1} is ready to use. Earlier versions stay as they were.`)}
     <section className="ts-card"><div className="ts-card-body prt-done">
-      <img src={productFileUrl(id, view.product.prepared?.previews.recombined ?? view.template.source.inputFile)} alt="The saved template, its layers over each other" />
+      <img src={productFileUrl(id, (sized && latest?.preview) || (view.product.prepared?.previews.recombined ?? view.template.source.inputFile))} alt="The saved template, its layers over each other" />
       <div className="prt-done-text"><h3><Check size={18} aria-hidden="true" /> {view.counts.products} products, {view.counts.characters} character{view.counts.characters === 1 ? '' : 's'}, {view.counts.text} text blocks and {view.counts.logos} logos, each its own layer</h3>
         <p className="ot-muted">Use the template to swap products, change the offer and make variations. Each creative opens in the editor with every element editable.</p>
+        <p className="prt-size-note" data-testid="master-size">{sized && latest?.canvas ? <><Check size={14} aria-hidden="true" />{REUSE_ASPECT_LABELS[sized]} master · {latest.canvas.width} × {latest.canvas.height} px · made from your original (version {latest.fromRevision}, {view.template.source.width} × {view.template.source.height}, kept unchanged).</>
+          : <>Original size · {formatName(view.template.source.width, view.template.source.height)} · {view.template.source.width} × {view.template.source.height} px.</>}
+          {' '}<button type="button" className="ws-btn ws-btn-quiet prt-inline" onClick={() => setSizing(view.product.masterRatio ?? '16:9')}>{sized ? 'Change the master’s size' : 'Make the master another size'}</button></p>
         <div className="ot-row">{onOpenRunInEditor && <button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={opening} onClick={() => void openInEditor()}>{opening ? 'Opening…' : 'Open in Editor'}</button>}
           <button type="button" className={`ws-btn ${from ? '' : 'ws-btn-primary '}ws-btn-large`} onClick={() => onUse(id)}><Package size={15} aria-hidden="true" />Use this template</button>
           <button type="button" className="ws-btn ws-btn-quiet" onClick={() => setReviewing(true)}>Change what was found</button>

@@ -76,6 +76,21 @@ the continued area (never over the artwork or a band) and read back with the loc
 refuses it. Without approval, an OpenAI key, or after a failure, the free continuation is used: the block's own edge
 colours, softly (plain edges continue exactly), reported as a share of the canvas.
 
+**Master size (first-time master creation).** *OpenAI + Seedream test → Offer Templates → New product template* →
+Upload → Review → Choose → Decompose → **Size** → Save. On the Inspect screen, **Size of the master template** offers
+Original (today's behaviour, unchanged) and the four common ratios. With a ratio, *Save and preview …* saves the
+original as version 1 (the source, never changed afterwards), then composes the chosen size from it with this same
+engine (`POST /product-templates/:id/master-size`, free) and shows it with its checks; *Design this size with AI…* is the
+approved AI composition above (the reuse compose route on the master's own draft, `master: true`, never listed with
+reuse drafts). *Save … master template* (`POST …/master-size/save`) writes version 2: `editorCreative` holds every
+layer at the exact canvas (text as editable words again; plates and the offer panel as their own layers), objects and
+background structure are mapped into it, words / logo slots / plates stay the original's source evidence, and
+`adaptation: { fromRevision, ratio, source, layout, validation }` links it to the original; the revision ref carries
+`aspectRatio`, `canvas`, `preview`, `fromRevision`, and `product.masterRatio` the choice. *Open in Editor* opens the
+adapted master; *Use template* creatives are that size; Create Offer Creative shows it as its format and reuses it as
+designed (Original), while any other common ratio is composed from the original version (same element ids, so a
+draft's choices apply to both). *Change the master's size* on the saved screen makes another size from the same original.
+
 **Checked before saving** (`ReuseOutput.validation`, shown on the result): exact size; every kept logo, text group and
 product shown, whole and unchanged (its own picture, its exact words); readability (text size; contrast measured on the
 finished poster); clipping. A recomposed size that fails its size or protected-element check cannot be saved.
@@ -88,7 +103,9 @@ artwork placement, boxes, refused boxes, the continuation file `prx-*`), outputs
 
 **Tests (offline).** `reuseCompose.test.ts` (rules plan per ratio, AI-plan checks, AI pixels never over the artwork, the
 HTTP journey with a mocked planner and image editor, refused lettering, legacy drafts, the derived template's ratio);
-`tests/e2e-image-templates/aspect-ratio.spec.ts` (choose 9:16 → approve → checks → save; reuse keeps 9:16, switch to 16:9).
+`tests/e2e-image-templates/aspect-ratio.spec.ts` (choose 9:16 → approve → checks → save; reuse keeps 9:16, switch to 16:9);
+`tests/e2e-image-templates/master-aspect-ratio.spec.ts` (first-time master: upload → review → decompose → 16:9 →
+preview → AI design approved → save → editor → reuse in 9:16).
 
 **Limits.** The live layout planner and image edit are unverified (test doubles only); their output quality and real
 cost need a check on your own template, with approval. Without AI, a landscape size of a square template continues
