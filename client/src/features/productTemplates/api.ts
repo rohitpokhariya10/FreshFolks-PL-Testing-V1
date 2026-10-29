@@ -173,7 +173,8 @@ export const productApi = {
   aiVariations: (id: string) => call<AiVariationsInfo>(`/${id}/ai-variations`),
   startAiVariations: (id: string, input: { ratio: ProductAspectRatio; theme: AiVariationTheme; customTheme?: string; count: number; approveUsd: number }) => call<AiVariationJob>(`/${id}/ai-variations`, json('POST', input)),
   aiVariation: (id: string, jid: string) => call<AiVariationJob>(`/${id}/ai-variations/${jid}`),
-  continueAiVariation: (id: string, jid: string, index: number, input: { approved: boolean; useAi: boolean }) => call<{ templateId: string; reused: boolean }>(`/${id}/ai-variations/${jid}/${index}/continue`, json('POST', input)),
+  retryAiVariation: (id: string, jid: string, index: number, input: { approveUsd: number }) => call<AiVariationJob>(`/${id}/ai-variations/${jid}/${index}/retry`, json('POST', input)),
+  continueAiVariation: (id: string, jid: string, index: number, input: { approved: boolean; useAi: boolean; acceptWarnings: boolean }) => call<{ templateId: string; reused: boolean }>(`/${id}/ai-variations/${jid}/${index}/continue`, json('POST', input)),
   reuseOpen: (id: string, did: string, ratio: ReuseAspectRatio) => call<{ runId: string; creativeId: string }>(`/${id}/reuse/${did}/outputs/${ratio.replace(':', 'x')}/open`, { method: 'POST' }),
   reuseDecompose: (id: string, did: string, ratio: ReuseAspectRatio) => call<{ templateId: string; creativeId: string; reused?: boolean }>(`/${id}/reuse/${did}/outputs/${ratio.replace(':', 'x')}/decomposition`, { method: 'POST' }),
 };

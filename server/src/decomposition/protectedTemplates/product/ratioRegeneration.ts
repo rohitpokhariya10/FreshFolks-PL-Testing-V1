@@ -55,13 +55,17 @@ export function regenerationPrompt(ratio: OfferAspectRatio, texts: string[] = []
   ].join(' ');
 }
 
-/** The design directions of AI variations, one per variation (in turn): genuinely different layouts of the same family. */
+/**
+ * The design directions of AI variations, one per variation (in turn): genuinely different arrangements of the creative's
+ * own elements. None names a headline, an offer or a panel for words: told "the headline and offer in a bold rounded
+ * panel", the model gave a text-free creative a panel of invented offers ("Festive Bonanza … cashback … scan to offer").
+ */
 export const VARIATION_DIRECTIONS = [
-  'Same layout family, refreshed: keep the original arrangement of the elements and give it a new background treatment, decoration and colour styling.',
-  'Product hero: the products larger and central on a striking stage, the headline above them, the offer and terms in a clean structured panel.',
-  'Split layout: the characters and products together on one side, the headline and offer in a bold rounded panel on the other.',
-  'Framed composition: a rich decorative frame or arch around the content on a patterned backdrop, the headline crowning it.',
-  'Bold modern: a large headline band, colour-blocked rounded panels and a dynamic arrangement of the products.',
+  'Same arrangement, refreshed: keep the original placement of the elements and give it a new background treatment, decoration and colour styling.',
+  'Product focus: the products larger and more central on a striking stage, the other existing elements rearranged around them.',
+  'Split composition: the characters and products grouped on one side, the rest of the existing elements balanced on the other side.',
+  'Framed composition: a rich decorative frame or arch around the existing elements, on a patterned backdrop.',
+  'Bold modern: bold colour-blocked shapes and a dynamic, asymmetric arrangement of the existing elements.',
 ] as const;
 const THEMES: Record<Exclude<AiVariationTheme, 'custom'>, string> = {
   original: 'Keep the original festival or theme and its mood.',
@@ -83,10 +87,12 @@ export function variationPrompt(input: { shape: string; theme: AiVariationTheme;
     `Create design variation ${input.index + 1} of ${input.count} of this exact advertising creative, as a ${input.shape} canvas filled edge to edge.`,
     VARIATION_DIRECTIONS[input.index % VARIATION_DIRECTIONS.length],
     theme,
-    'It must stay recognisably the same campaign from the same brand: a professional, polished promotional design with a clear hierarchy from headline to products to offer to terms, readable typography and strong colours. Do not stretch, squash, letterbox or add borders.',
+    'It must stay recognisably the same campaign from the same brand: a professional, polished design with strong colours; any text of the original keeps its hierarchy and readable typography. Do not stretch, squash, letterbox or add borders.',
     'You may change the background, decoration, colours, layout, hierarchy, and the placement and relative scale of the elements. Keep every element of the original: the same logos, unchanged and whole; the same products and devices with their printed details; the same illustrated characters; the same QR codes.',
     named.length ? `The products (${named.join(', ')}) stay exactly these products.` : '',
-    quoted.length ? `Keep every piece of text with exactly the same words, spelling, numbers and symbols — exactly these texts: ${quoted.join('; ')}.` : 'Keep every piece of text with exactly the same words, spelling, numbers and symbols.',
+    quoted.length
+      ? `The only text allowed anywhere in the result is exactly these texts of the original, each exactly once, with the same words, spelling, numbers and symbols: ${quoted.join('; ')}. No other words, letters or numbers may appear — no new headline, slogan, offer, price, discount, cashback, date, label, call to action, or panel, banner or badge with writing.`
+      : 'This creative has no text: the result must contain no words, letters or numbers anywhere — no headline, slogan, offer, price, discount, cashback, date, label, call to action, or panel, banner or badge with writing — apart from what is printed on the products and logos themselves.',
     'Do not add, remove, translate or rewrite any text, offer, price, date or term. Do not add any new logo, brand name, QR code, product or person. Decoration for the theme is the only new content allowed, and it never contains text.',
     input.trimmed ? 'Keep a thin band along the top and bottom edges (about 2 % of the height each) as continued background only: no text, logo, product or character may touch it.' : '',
   ].filter(Boolean).join(' ');
@@ -113,7 +119,13 @@ export function liveRatioRegenerator(): RatioRegenerator {
       // The cost from the response's own usage (gpt-image-2's per-token prices: text in $5, image in $8, image out $30 per million).
       const costUsd = u ? Math.round(((u.input_tokens_details?.text_tokens ?? 0) * 5 + (u.input_tokens_details?.image_tokens ?? 0) * 8 + (u.output_tokens ?? 0) * 30) / 1e6 * 1000) / 1000 : undefined;
       return { image: Buffer.from(b64, 'base64'), ...(requestId ? { requestId } : {}), ...(costUsd !== undefined ? { costUsd } : {}), ...(u ? { usage: u } : {}) };
-    } catch (error) { save('ratio-regeneration.openai-error.json', { message: error instanceof Error ? error.message : String(error) }); throw error; }
+    } catch (error) {
+      // (With its cause: "terminated" alone — a connection closed mid-response — says nothing of which side or why.)
+      const cause = (error as { cause?: { code?: string; message?: string } })?.cause;
+      save('ratio-regeneration.openai-error.json', { message: error instanceof Error ? error.message : String(error), ...(error instanceof Error ? { name: error.name } : {}), ...(cause ? { cause: { code: cause.code, message: cause.message } } : {}) });
+      if (error instanceof Error && (cause?.code || cause?.message)) error.message = `${error.message} (${[cause.code, cause.message].filter(Boolean).join(': ')})`;
+      throw error;
+    }
   } };
 }
 /** The result at exactly the ratio's size (the model is asked for it; anything else is fitted, never stretched past 2 %). */

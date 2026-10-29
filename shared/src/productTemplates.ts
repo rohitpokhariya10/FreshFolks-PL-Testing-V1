@@ -506,6 +506,14 @@ export interface AiVariationResult {
   file?: string; checks?: RegenerationChecks; requestId?: string; costUsd?: number; error?: string;
   /** Made editable: the template it became (detected, reviewed and decomposed there). */
   templateId?: string;
+  /** Requests made for this variation (more than one: made again on its own, approved). */
+  attempts?: number;
+}
+/** What a person must accept explicitly before a variation is used: words added or missing, products or logos not put back. */
+export function aiVariationWarnings(c?: RegenerationChecks): string[] {
+  if (!c) return [];
+  return [...(c.extraWords?.length ? [`words not in your template: ${c.extraWords.join(', ')}`] : []), ...(c.missingWords.length ? [`words of your template not read in it: ${c.missingWords.join(', ')}`] : []),
+    ...(c.assets.some(a => a.status === 'not-found') ? [`not put back with their own pixels: ${c.assets.filter(a => a.status === 'not-found').map(a => a.label).join(', ')}`] : [])];
 }
 export interface AiVariationJob {
   id: string; templateId: string; revision: number; ratio: ProductAspectRatio; theme: AiVariationTheme; customTheme?: string; count: number;

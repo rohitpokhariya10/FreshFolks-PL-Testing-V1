@@ -60,6 +60,9 @@ async function generateAndUse(page: Page, request: APIRequestContext, size: RegE
   const use = card.getByRole('button', { name: /Use this variation: make it editable/ });
   await expect(use).toBeDisabled();
   await card.getByRole('checkbox', { name: /I have looked at this variation/ }).check();
+  // A questionable result (a word or product the checks could not confirm) needs its warnings accepted explicitly.
+  const accept = card.getByRole('checkbox', { name: /I accept these warnings/ });
+  if (await accept.isVisible()) { await expect(use).toBeDisabled(); await accept.check(); }
   await use.click();
   await expect(panel.getByRole('heading', { name: 'Here’s what we found' })).toBeVisible({ timeout: 120000 });
   const made = ((await (await request.get(`${API}/${id}/ai-variations/${job.id}`)).json()) as AiVariationJob).results[1].templateId!;
