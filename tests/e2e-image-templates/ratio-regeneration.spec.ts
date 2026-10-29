@@ -75,7 +75,13 @@ test('first-time master: regenerated in 16:9 at upload, approved, then found, re
   await expect.poll(async () => (await stored()).variants.some(x => x.importedFrom?.runId === runId), { timeout: 60000 }).toBe(true);
   const design = (await stored()).variants.find(x => x.importedFrom?.runId === runId)!;
   expect(design.canvas).toMatchObject({ width: 2048, height: 1152 }); expect(design.layers!.length).toBeGreaterThan(2);
+  await page.reload();
+  expect((await stored()).variants.find(x => x.id === design.id)!.canvas).toEqual(design.canvas);
   await page.screenshot({ path: `${OUT}/04-editor-16x9.png` });
+  const exported = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export PNG', exact: true }).click();
+  await (await exported).saveAs(`${OUT}/04b-master-export.png`);
+  expect(await sharp(`${OUT}/04b-master-export.png`).metadata()).toMatchObject({ width: 2048, height: 1152 });
 });
 
 /** Upload with the regeneration in `ratio` approved and AI detection left unticked; wait for the regenerated creative. */
@@ -203,4 +209,38 @@ test('Create Offer Creative: size 9:16 at the start, a product, regenerated with
   const d = (await (await request.get(`${API}/${id}/reuse/${drafts.find(x => x.simple)!.id}`)).json()).draft as ReuseDraft;
   const made = (await (await request.get(`${API}/${d.regenImages!['9:16']!.templateId}`)).json()) as ProductView;
   expect(exact(made.template.source, 9, 16)).toBe(true); expect(made.product.regeneration).toMatchObject({ status: 'approved', ratio: '9:16', from: { templateId: id } });
+});
+
+test('Create Offer Creative: 16:9 at the start, AI regeneration chosen at Generate (cost shown), its result first, the basic layout labelled', async ({ page, request }, info) => {
+  test.skip(info.project.name !== 'desktop', 'One run of this long flow.');
+  mkdirSync(OUT, { recursive: true });
+  await page.route(url => /^https?:$/.test(url.protocol) && url.hostname !== '127.0.0.1', r => r.abort());
+  const name = `Regenerated at generate ${Date.now().toString(36)}`;
+  await savedTemplate(request, name);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Create Offer Creative' }).click();
+  const app = page.getByRole('dialog', { name: 'Create Offer Creative' });
+  await app.getByRole('region', { name: 'Choose your size' }).getByRole('radio', { name: /Landscape 16:9/ }).click();
+  await app.getByRole('article', { name: `Template ${name}` }).getByRole('button', { name: 'Use This Template' }).click();
+  const packshot = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="360" height="520"><rect x="10" y="10" width="340" height="500" rx="24" fill="#c9ced6"/><rect x="50" y="50" width="260" height="150" rx="10" fill="#20252c"/><circle cx="180" cy="340" r="90" fill="#5b7fb6"/></svg>')).png().toBuffer();
+  await app.getByLabel('Upload product photos').setInputFiles({ name: 'washing-machine.png', mimeType: 'image/png', buffer: packshot });
+  await expect(app.getByRole('list', { name: 'Your products' }).getByRole('listitem', { name: /Product washing machine/ })).toBeVisible({ timeout: 60000 });
+  await app.getByRole('button', { name: 'Generate Creative' }).click();
+  // The chosen size's own AI creative is offered first, with its cost; the free path says it is a basic layout, not AI.
+  const ask = page.getByRole('dialog', { name: 'Design Your Creative with AI' });
+  const offer = ask.getByRole('group', { name: 'Regenerate the whole creative for Landscape 16:9 with AI' });
+  await expect(offer).toContainText('at most about $');
+  await expect(ask.getByRole('button', { name: /Generate Automatically \(Free\) · basic layout, not AI/ })).toBeVisible();
+  await page.screenshot({ path: `${OUT}/12-generate-offers-ai-regeneration-16x9.png` });
+  await offer.getByRole('button', { name: 'Approve & Regenerate with AI' }).click();
+  // Shown first: the AI result beside the basic layout, with its checks; the basic layout's panel is labelled as such.
+  const panel = app.getByRole('region', { name: 'Regenerate with AI' });
+  const result = panel.getByRole('region', { name: 'Regenerated in Landscape 16:9' });
+  await expect(result.getByRole('list', { name: 'Checked before you use it' })).toContainText('exactly 16:9', { timeout: 180000 });
+  await expect(result.getByRole('list', { name: 'Checked before you use it' })).toContainText('washing machine: your own picture put back');
+  await expect(result.getByRole('figure').filter({ hasText: 'Basic layout (free, not AI)' })).toBeVisible();
+  await expect(app.getByRole('heading', { name: 'Basic layout (free, not AI)' })).toBeVisible();
+  const first = await panel.evaluate(p => { const r = p.ownerDocument.querySelector('section.sr-result'); return !!r && !!(p.compareDocumentPosition(r) & Node.DOCUMENT_POSITION_FOLLOWING); });
+  expect(first).toBe(true);
+  await page.screenshot({ path: `${OUT}/13-ai-regenerated-first-16x9.png`, fullPage: true });
 });

@@ -31,8 +31,9 @@ export const asMasterSnapshot = (s: ProductSnapshot): MasterSnapshot => ({ schem
 
 /**
  * A new creative of a revision: its text, logos and plates (as a Text & Graphics creative) and its objects. `artwork`
- * (artworkText.ts): the revision's background with a decoration's own lettering restored from the original (a badge), and
- * those groups — their words are kept, hidden, never set again over it.
+ * (artworkText.ts, revisions prepared before EDITABLE_LETTERING_SINCE only): the revision's background with a decoration's
+ * own lettering restored from the original (a badge), and those groups — their words are kept, hidden, never set again
+ * over it.
  */
 export function productCreativeFromSnapshot(snapshot: ProductSnapshot, input: { id: string; name: string; at: string; origin?: ProductCreative['origin'] }, artwork?: { file: string; sha256: string; groups: ReadonlySet<string> }): ProductCreative {
   if (snapshot.editorCreative) {

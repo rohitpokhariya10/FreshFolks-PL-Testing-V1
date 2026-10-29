@@ -46,7 +46,7 @@ export interface ProductListItem { id: string; name: string; createdAt: string; 
   targetRatio?: OfferAspectRatio }
 export interface SheetAnswer { sheet: boolean; width: number; height: number; boxes: PixelRect[] }
 /** What fitting the text did, line by line (letters: read on this computer; strokes: by the picture; kept: unchanged). */
-export interface TextFit { moved: number; lines: { text: string; method: 'letters' | 'strokes' | 'kept'; moved: number; reason?: string }[] }
+export interface TextFit { moved: number; lines: { text: string; method: 'letters' | 'strokes' | 'kept'; moved: number; needsReview?: boolean; reason?: string }[] }
 export interface ReviewBody {
   expectedRevision: number;
   /** `layer`, for a podium or stand: its own layer (separated, movable) or part of the background; null clears it. `hidden`: kept but not used. */

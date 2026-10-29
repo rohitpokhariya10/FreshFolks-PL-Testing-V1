@@ -19,7 +19,7 @@ import type { CreativeGroup, CreativeImage, CreativeShape, CreativeText, TextPla
 
 export const PRODUCT_SCHEMA_VERSION = 1;
 /** Version of the preparing (overlay removal, separation, base): a revision records the one that made it. */
-export const PRODUCT_PREPARE_VERSION = 6;
+export const PRODUCT_PREPARE_VERSION = 7;
 
 export const PRODUCT_OBJECT_KINDS = ['character', 'product', 'brand-logo', 'podium', 'frame', 'decoration'] as const;
 export type ProductObjectKind = typeof PRODUCT_OBJECT_KINDS[number];
@@ -471,6 +471,8 @@ export interface RegenerationChecks {
   assets: { label: string; status: 'restored' | 'not-found'; score: number }[];
   /** Words read in the original (on this computer) that the regenerated creative lacks: for the person to check. */
   missingWords: string[];
+  /** Words read in the regenerated creative that the original does not have (copy the model may have invented): for the person to check. Absent on older results. */
+  extraWords?: string[];
   /** What keeps it from being used. */
   blocking: string[];
 }

@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import type { DetectedWord, SceneDescription } from '@frameflow/shared';
 import type { Rgba } from '../pixels.js';
 import { fakeRecognizer } from '../../../textRecognition/recognizer.js';
-import { fitLines, letterColumns, lineLimits, lineShift } from './wordFit.js';
+import { fitLines, fitSceneWords, letterColumns, lineLimits, lineShift } from './wordFit.js';
 import { fakeProductAnalyzer, PRODUCT_WORDS, productPosterPng } from './productPoster.fixture.js';
 import { setup, type View } from './productServer.fixture.js';
 
@@ -104,6 +104,18 @@ describe('fitting AI text lines to their letters', () => {
     expect(strokes.method).toBe('kept');
   });
 
+  it('flags a 45-pixel error beyond the safe reach of a small line for manual review', async () => {
+    const truth = line(120, 20, ['Get', 100, 60], ['cashback', 180, 120]);
+    const given = ai(truth, w => ({ ...w, y: w.y - 45 }));
+    const source = picture(500, 240, truth);
+    const [fit] = await fitLines(source, [given], reader(truth));
+    expect(fit).toMatchObject({ method: 'kept', moved: 0, needsReview: true });
+    expect(fit.boxes).toEqual(given.map(w => w.box));
+    expect(fit.reason).toMatch(/letters were read for 0/);
+    const scene = await fitSceneWords(source, given.map(w => ({ ...w, group: 'offer', line: '0' })), reader(truth));
+    expect(scene.reviewIndexes).toEqual([0, 1]);
+  });
+
   it('keeps a rule read with a word out of the word\'s box', async () => {
     // "of" read together with the rule beside it, three times as wide as its letters: its edges come from its letters.
     const truth = line(100, 50, ['A', 100, 40], ['season', 160, 240], ['of', 420, 70]), rule = { x: 495, y: 124, width: 160, height: 4 };
@@ -147,6 +159,12 @@ describe('fitting text in a template', { timeout: 120_000 }, () => {
     return a;
   };
   const shape = (b: Box) => ({ x: b.x, y: b.y, width: b.width, height: b.height });
+  // On its letters: inside the reader's box for the word (a little slack), centred on it, most of its width — the box of
+  // the word's own ink (fitWordsToInk), tighter than the reader's padded one.
+  const onLetters = (b: Box, text: string) => { const t = truth(text);
+    expect(b.x, text).toBeGreaterThanOrEqual(t.x - 10); expect(b.y, text).toBeGreaterThanOrEqual(t.y - 10); expect(b.x + b.width, text).toBeLessThanOrEqual(t.x + t.width + 10); expect(b.y + b.height, text).toBeLessThanOrEqual(t.y + t.height + 10);
+    expect(Math.abs(b.x + b.width / 2 - t.x - t.width / 2), text).toBeLessThanOrEqual(t.width * 0.1); expect(Math.abs(b.y + b.height / 2 - t.y - t.height / 2), text).toBeLessThanOrEqual(t.height * 0.2);
+    expect(b.width, text).toBeGreaterThanOrEqual(t.width * 0.7); };
 
   it('fits the AI words while detecting, and fits an older template\'s text only when asked', async () => {
     const s = await setup({ analyzer: analyzer() });
@@ -154,13 +172,14 @@ describe('fitting text in a template', { timeout: 120_000 }, () => {
       const made = await s.form('', await productPosterPng(), { name: 'Fit' });
       let v = await s.detected(made.body.template.id);
       const id = v.template.id, file = join(s.protectedDir, id, 'template.json');
-      // Detection: every AI word on its letters (the misplaced lines moved; the legal line as given).
+      // Detection: every AI word on its letters (the misplaced lines moved; the legal line where it was given, its boxes
+      // made its letters').
       const t = JSON.parse(readFileSync(file, 'utf8')) as { revision: number; textAnalysis: { revision: number; words: DetectedWord[]; history: { action: string; detail?: string }[] }; product: { history: { action: string; detail?: string }[] } };
-      for (const l of LINES) for (const text of l.words) { const w = t.textAnalysis.words.find(x => x.text === text)!; expect(w.origin).toBe('ai'); expect(shape(w.box), text).toEqual(truth(text)); }
-      // An older template: the offer line saved 45 px above its letters with the panel's colour as its ink; "T&Cs" moved
-      // by a person (kept as they put it).
+      for (const l of LINES) for (const text of l.words) { const w = t.textAnalysis.words.find(x => x.text === text)!; expect(w.origin).toBe('ai'); onLetters(shape(w.box), text); }
+      // An older template (its boxes the reader's, before they were made their letters'): the offer line saved 45 px
+      // above its letters with the panel's colour as its ink; "T&Cs" moved by a person (kept as they put it).
       const offer = t.textAnalysis.words.filter(w => ['Get', '26%', 'cashback'].includes(w.text)), panel = '#bdf0dc';
-      for (const w of offer) { w.box = { ...w.box, y: w.box.y - 45 }; w.source = { ...w.source!, box: { ...w.box } }; w.style = { ...w.style, color: panel }; }
+      for (const w of offer) { w.box = { ...truth(w.text), y: truth(w.text).y - 45, rotation: 0 }; w.source = { ...w.source!, box: { ...w.box } }; w.style = { ...w.style, color: panel }; }
       const tcs = t.textAnalysis.words.find(w => w.text === 'T&Cs')!; tcs.box = { ...tcs.box, y: tcs.box.y - 12 }; tcs.source = { ...tcs.source!, box: { ...tcs.box } }; tcs.corrected = { at: new Date().toISOString(), box: true };
       writeFileSync(file, JSON.stringify(t));
       v = (await s.call<View>(`/${id}`)).body;
@@ -176,7 +195,7 @@ describe('fitting text in a template', { timeout: 120_000 }, () => {
       expect(after.product.history.at(-1)).toMatchObject({ action: 'reviewed', detail: expect.stringMatching(/no AI request/) });
       const source = await sharp(readFileSync(join(s.protectedDir, id, (JSON.parse(readFileSync(file, 'utf8')) as { source: { inputFile: string } }).source.inputFile))).raw().toBuffer({ resolveWithObject: true });
       for (const w of after.textAnalysis.words.filter(x => ['Get', '26%', 'cashback'].includes(x.text))) {
-        expect(shape(w.box), w.text).toEqual(truth(w.text));
+        onLetters(shape(w.box), w.text);
         expect(w.source!.box).toEqual(w.box);
         // Its ink measured where its letters are (not the panel), and its crop is the source's pixels there.
         expect(w.style.color).not.toBe(panel);

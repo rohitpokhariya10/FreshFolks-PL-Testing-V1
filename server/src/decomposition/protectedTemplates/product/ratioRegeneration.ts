@@ -14,6 +14,10 @@
  *   text    the words read in the original that the result lacks are listed for the person to check.
  *
  * The person then looks at the result and approves it; nothing is used before that. One request, never retried.
+ *
+ * A first-time master knows no logo before its elements are found, so its logos are restored after the detection of the
+ * approved result (restoreLogosFromOriginal): each logo found in the regenerated creative is found again in the upload and
+ * its layer cut from the upload's own pixels, at the regenerated creative's coordinates.
  */
 import sharp from 'sharp';
 import jsqrModule, { type Options as QrOptions, type QRCode } from 'jsqr';
@@ -28,14 +32,22 @@ type Box = { x: number; y: number; width: number; height: number };
 const jsQR = ((jsqrModule as unknown as { default?: unknown }).default ?? jsqrModule) as (data: Uint8ClampedArray, width: number, height: number, options?: QrOptions) => QRCode | null;
 type Save = (file: string, value: object) => void;
 
-const SHAPE: Record<OfferAspectRatio, string> = { '1:1': 'square 1:1', '4:5': 'portrait 4:5', '9:16': 'tall vertical 9:16 story', '16:9': 'wide landscape 16:9' };
-/** The instruction: recompose for the shape, keep everything (the exact words when they are known). */
-export function regenerationPrompt(ratio: OfferAspectRatio, texts: string[] = []) {
+const SHAPE: Record<OfferAspectRatio, string> = { '1:1': 'square 1:1', '4:5': 'portrait 4:5', '9:16': 'tall vertical 9:16', '16:9': 'wide landscape 16:9' };
+/**
+ * The instruction: a faithful adaptation of this creative to the shape — the same design, only what the new shape needs
+ * changed — and nothing that is not in it (the exact words when they are known). It names no kind of element the
+ * creative may not have: an instruction to "keep partner logos in rows" invites a creative without any to get some.
+ * `products`: the products it shows (Create Offer Creative: the person's), named so they are kept as they are.
+ */
+export function regenerationPrompt(ratio: OfferAspectRatio, texts: string[] = [], products: string[] = []) {
   const quoted = texts.map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 40).map(t => `"${t.replace(/"/g, '\'')}"`);
+  const named = [...new Set(products.map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean))].slice(0, 12);
   return [
-    `Recompose this exact advertising poster as a ${SHAPE[ratio]} poster that fills the whole new canvas.`,
-    'Redesign the layout for the new shape the way a professional designer would: rearrange and resize the existing elements so they are balanced and fill the format naturally. Do not stretch, squash, crop, letterbox or add borders.',
-    'Keep everything in the original exactly as it is, only repositioned and resized: the same products, devices and their printed details, the same illustrated characters, the same logos, the same QR codes, the same colours, illustration style and decorations.',
+    `Convert this exact advertising creative to a ${SHAPE[ratio]} canvas, keeping the same design.`,
+    'This is an aspect-ratio adaptation, not a redesign: keep the original composition, visual identity, colours, illustration style, typography, characters, products and every element as they are. Extend the existing background naturally to the new edges and move or resize the existing elements only as much as the new shape requires, so the whole canvas is filled. Do not stretch, squash, crop, letterbox or add borders.',
+    'Use only what is in this image. Do not add any text, offer, price, date, logo, brand name, QR code, product, person, character, decoration or prop that is not in it, and do not remove any element.',
+    named.length ? `Keep the products (${named.join(', ')}) exactly as they are, at the same size relative to the other elements.` : 'Keep the products exactly as they are, at the same size relative to the other elements.',
+    'Keep every logo unchanged, whole and legible, never cropped, including any small words printed beside it.',
     quoted.length ? `Keep every piece of text with exactly the same words, spelling, numbers and symbols — exactly these texts: ${quoted.join('; ')}.` : 'Keep every piece of text with exactly the same words, spelling, numbers and symbols.',
     'Do not add, remove, translate or rewrite any text. Do not add any new products, logos, people or QR codes.',
   ].join(' ');
@@ -132,16 +144,16 @@ function bestAt(t: Gray, p: Gray, area: { x0: number; y0: number; x1: number; y1
   return best;
 }
 /**
- * Where an exact picture (`png`, its alpha respected) stands in `target`, at any size from about half to twice
- * `expected` (its expected width there): its box in the target's pixels and the match's score (−1…1).
+ * Where an exact picture (`png`, its alpha respected) stands in `target`, at any size from `least` (about half) to `most`
+ * times `expected` (its expected width there): its box in the target's pixels and the match's score (−1…1).
  */
-export async function locate(target: Buffer, png: Buffer, expected: number): Promise<{ box: Box; score: number } | undefined> {
+export async function locate(target: Buffer, png: Buffer, expected: number, most = 2.2, least = 0.45): Promise<{ box: Box; score: number } | undefined> {
   const tm = await sharp(target).metadata(), pm = await sharp(png).metadata(), TW = tm.width ?? 1, TH = tm.height ?? 1, aspect = (pm.width ?? 1) / (pm.height ?? 1);
   // Each level sized from the picture's expected size, not the canvas: about 28 px across it coarsely, 110 px finely.
   const longest = Math.max(1, expected, expected / aspect);
   const kc = Math.min(1, 28 / longest, 480 / Math.max(TW, TH)), coarse = await grayOf(target, Math.round(TW * kc), Math.round(TH * kc));
   let best: { s: number; x: number; y: number; score: number } | undefined;
-  for (let s = expected * 0.45; s <= expected * 2.2; s *= 1.09) {
+  for (let s = expected * least; s <= expected * most; s *= 1.09) {
     const w = Math.round(s * kc), h = Math.round(s * kc / aspect);
     if (w < 6 || h < 6 || w >= coarse.w || h >= coarse.h) continue;
     const r = bestAt(coarse, await grayOf(png, w, h, true), { x0: 0, y0: 0, x1: coarse.w, y1: coarse.h });
@@ -183,6 +195,56 @@ async function putBack(target: Buffer, png: Buffer, box: Box, rim: boolean): Pro
   return sharp(target).composite([{ input: piece, left: Math.max(0, box.x), top: Math.max(0, box.y) }]).png().toBuffer();
 }
 
+/** Whether two words differ by at most one letter (one replaced, added or left out). */
+function oneEdit(a: string, b: string) {
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++edits > 1) return false;
+    if (a.length > b.length) i++; else if (b.length > a.length) j++; else { i++; j++; }
+  }
+  return edits + (a.length - i) + (b.length - j) <= 1;
+}
+
+// --- A first-time master's logos, after its elements are found in the approved result -------------------------------------
+/** How far two same-sized crops' backdrops are apart: the mean difference per channel (0–255) over their outer 2-pixel ring. */
+async function ringDifference(a: Buffer, b: Buffer): Promise<number> {
+  const [p, q] = await Promise.all([a, b].map(x => sharp(x).removeAlpha().raw().toBuffer({ resolveWithObject: true })));
+  const { width: w, height: h } = p.info;
+  let sum = 0, n = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (x >= 2 && y >= 2 && x < w - 2 && y < h - 2) continue;
+    const i = (y * w + x) * 3;
+    for (let c = 0; c < 3; c++) { sum += Math.abs(p.data[i + c] - q.data[i + c]); n++; }
+  }
+  return n ? sum / n : 255;
+}
+/**
+ * Each logo found in the regenerated creative (`logos`: its crop there, as the model drew it) found again in the original
+ * upload — at half to twice the size the two pictures' scales give it, a strong match (a part of a logo, or a logo a few
+ * pixels off, scores lower), its colours agreeing — and returned as the upload's own pixels, sized to the crop: the logo
+ * layer shows the brand's artwork, not the model's redrawing (the live 16:9 Ganesh master, 2026-10-29: the model drew
+ * "AU SMALL FINANCE BANK" illegibly). Only where the logo's backdrop is the same in both (its crop's outer ring): the LG
+ * logo on the upload's white, moved onto the 9:16 creative's mint, would bring a white plate. Any other logo keeps its
+ * crop and is reported.
+ */
+export async function restoreLogosFromOriginal(input: { original: Buffer; regenerated: { width: number; height: number }; logos: { id: string; png: Buffer }[] }): Promise<{ id: string; png?: Buffer; score: number; status: 'restored' | 'not-found' }[]> {
+  const om = await sharp(input.original).metadata(), k = Math.sqrt(((om.width ?? 1) * (om.height ?? 1)) / Math.max(1, input.regenerated.width * input.regenerated.height));
+  const out: { id: string; png?: Buffer; score: number; status: 'restored' | 'not-found' }[] = [];
+  for (const l of input.logos) {
+    const m = await sharp(l.png).metadata(), w = m.width ?? 1, h = m.height ?? 1;
+    const found = w >= 12 && h >= 8 ? await locate(input.original, l.png, w * k, 2, 0.5) : undefined;
+    if (!found || found.score < 0.72 || (await colourDistance(input.original, l.png, found.box)) > 40) { out.push({ id: l.id, score: found?.score ?? -1, status: 'not-found' }); continue; }
+    const b = found.box, left = Math.max(0, b.x), top = Math.max(0, b.y), width = Math.min((om.width ?? 1) - left, b.width - (left - b.x)), height = Math.min((om.height ?? 1) - top, b.height - (top - b.y));
+    if (width < b.width * 0.95 || height < b.height * 0.95) { out.push({ id: l.id, score: found.score, status: 'not-found' }); continue; }
+    const png = await sharp(await sharp(input.original).extract({ left, top, width, height }).png().toBuffer()).resize(w, h, { fit: 'fill' }).ensureAlpha().png({ compressionLevel: 9 }).toBuffer();
+    if ((await ringDifference(png, l.png)) > 14) { out.push({ id: l.id, score: found.score, status: 'not-found' }); continue; }
+    out.push({ id: l.id, png, score: found.score, status: 'restored' });
+  }
+  return out;
+}
+
 // --- The protection, before the person sees the result --------------------------------------------------------------------
 /**
  * The result made safe to show (see the top of this file): QR codes decoding to their payloads (restored from the original
@@ -190,7 +252,9 @@ async function putBack(target: Buffer, png: Buffer, box: Box, rim: boolean): Pro
  * `assets`: each exact picture (its own pixels, a cut-out or a crop) and its box in the original. Blocking: what keeps
  * the result from being used (a QR code not decoding to its payload, an asset not found).
  */
-export async function protectRegenerated(input: { original: Buffer; result: Buffer; assets?: { label: string; png: Buffer; box: Box; required?: boolean; minScore?: number }[]; recognizer?: WordRecognizer }): Promise<{ png: Buffer; checks: RegenerationChecks }> {
+export async function protectRegenerated(input: { original: Buffer; result: Buffer; assets?: { label: string; png: Buffer; box: Box; required?: boolean; minScore?: number }[]; recognizer?: WordRecognizer;
+  /** The creative's own copy when it is known exactly (a template's words, logo and product names): words in it are never new. */
+  knownWords?: string[] }): Promise<{ png: Buffer; checks: RegenerationChecks }> {
   let png = input.result;
   const om = await sharp(input.original).metadata(), rm = await sharp(png).metadata(), k = Math.sqrt(((rm.width ?? 1) * (rm.height ?? 1)) / ((om.width ?? 1) * (om.height ?? 1)));
   const checks: RegenerationChecks = { qr: [], assets: [], missingWords: [], blocking: [] };
@@ -198,7 +262,8 @@ export async function protectRegenerated(input: { original: Buffer; result: Buff
   // the result; another (a logo) is put back only on a clear match — a doubtful one is left for the person to look at,
   // never pasted where it might not belong.
   for (const a of input.assets ?? []) {
-    const found = await locate(png, a.png, a.box.width * k), required = a.required !== false;
+    // (A product may come back up to three times as large: the model is asked to make the products the hero.)
+    const required = a.required !== false, found = await locate(png, a.png, a.box.width * k, required ? 3 : 2.2);
     // A match by pattern alone is not enough (stripes can correlate with a panel): its colours must agree too.
     if (!found || found.score < (a.minScore ?? 0.45) || (await colourDistance(png, a.png, found.box)) > (required ? 45 : 40)) {
       checks.assets.push({ label: a.label, status: 'not-found', score: found?.score ?? -1 });
@@ -234,8 +299,13 @@ export async function protectRegenerated(input: { original: Buffer; result: Buff
       .filter(w => w.confidence >= 0.75).map(w => w.text.normalize('NFKD').replace(/[^\p{L}\p{N}₹%]/gu, '')).filter(w => /\p{L}/u.test(w) && w.replace(/[^\p{L}\p{N}]/gu, '').length >= 3); };
     const before = await read(input.original), after = new Map<string, number>();
     for (const w of await read(png)) after.set(w.toLowerCase(), (after.get(w.toLowerCase()) ?? 0) + 1);
+    const result = [...after.entries()].flatMap(([w, n]) => Array<string>(n).fill(w));
     for (const w of before) { const n = after.get(w.toLowerCase()) ?? 0; if (n > 0) after.set(w.toLowerCase(), n - 1); else if (!checks.missingWords.includes(w)) checks.missingWords.push(w); }
     checks.missingWords = checks.missingWords.slice(0, 20);
+    // And the other way: words read in the result that the original does not have — copy the model may have invented.
+    // (A word one letter off one of the original's, or part of one, is a misreading, not new copy.)
+    const known = new Set([...before, ...(input.knownWords ?? []).flatMap(t => t.normalize('NFKD').split(/\s+/)).map(w => w.replace(/[^\p{L}\p{N}₹%]/gu, ''))].map(w => w.toLowerCase()).filter(Boolean)), near = (a: string, b: string) => a.includes(b) || b.includes(a) || oneEdit(a, b);
+    checks.extraWords = [...new Set(result.filter(w => !known.has(w) && ![...known].some(k => near(w, k))))].slice(0, 20);
   }
   return { png, checks };
 }

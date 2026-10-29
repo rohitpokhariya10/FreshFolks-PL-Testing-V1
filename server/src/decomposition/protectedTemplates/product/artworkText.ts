@@ -5,6 +5,9 @@
  * original picture's own pixels: where the master's text removal changed it (a flat panel fill, ghost letters, the
  * ribbon's dots), the original is put back. Only those changed pixels near the lettering; nothing else of the base
  * (a removed product or stand beside the badge) comes back. The words stay in the data (hidden).
+ *
+ * Only for revisions prepared before EDITABLE_LETTERING_SINCE: preparing now keeps all lettering editable and out of the
+ * base (a headline whose signboard was just under the size limit was baked in and hidden this way).
  */
 import sharp from 'sharp';
 import { createHash } from 'node:crypto';
@@ -90,11 +93,20 @@ export async function restoreArtwork(sourceImage: Buffer, basePng: Buffer, group
 
 const sha256 = (b: Buffer | string) => createHash('sha256').update(b).digest('hex');
 /**
+ * Preparing from this version on takes every word out of the base and keeps it editable (a badge's and a signboard's
+ * lettering too): nothing is artwork any more.
+ */
+export const EDITABLE_LETTERING_SINCE = 7;
+
+/**
  * A saved template revision's background with its artwork lettering restored (a cached file of its own,
  * `pbadge-<revision>-<hash>.png`; the template's files are never changed), and the groups that are artwork. Undefined:
- * none, an edited master (its own creative decides), or no original picture to restore from.
+ * none, an edited master (its own creative decides), no original picture to restore from, or a revision prepared since
+ * EDITABLE_LETTERING_SINCE (its lettering is editable text, removed from its base). An older revision's base still has
+ * that lettering in it, so its words stay hidden there (shown twice otherwise).
  */
 export async function artworkBase(files: { has: (f: string) => boolean; read: (f: string) => Buffer; write: (f: string, b: Buffer) => void }, snapshot: ProductSnapshot): Promise<{ file: string; sha256: string; groups: Set<string> } | undefined> {
+  if ((snapshot.prepareVersion ?? 0) >= EDITABLE_LETTERING_SINCE) return undefined;
   if (snapshot.editorCreative || !snapshot.source?.file || !files.has(snapshot.source.file) || !files.has(snapshot.base.file)) return undefined;
   const decorations = [...(snapshot.backgroundStructure ?? []), ...snapshot.objects].filter(o => o.kind === 'decoration').map(o => ({ label: o.label, box: o.box }));
   const groups = artworkGroups(snapshot.canvas, decorations, snapshot.words.map(w => ({ groupId: w.groupId, box: w.box })));

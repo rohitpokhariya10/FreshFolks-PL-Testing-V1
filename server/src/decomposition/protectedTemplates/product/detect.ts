@@ -26,7 +26,7 @@ import { buildMasterAnalysis } from '../master/analysis.js';
 import type { SceneAnalyzer } from '../../creativeTemplates/smartProviders.js';
 
 import { ProductAnalysisError, type ProductScene } from './analyzer.js';
-import { fitSceneWords } from './wordFit.js';
+import { fitSceneWords, fitWordsToInk } from './wordFit.js';
 import { measureWord } from '../../../textRecognition/measure.js';
 import { productInkBounds } from './typography.js';
 import { matchLineFont, offerFontFile } from '../../../textRecognition/fontMatch.js';
@@ -46,8 +46,10 @@ const pixels = (b: SceneBox, size: { width: number; height: number }): Box => {
  * line so; a word whose box the reviewer corrected is styled again so, alone (service.ts), from where its letters are.
  */
 export async function styleLine(source: Rgba, lineWords: { text: string; box: Box }[]): Promise<{ style: DetectedWord['style']; confidence: number }[]> {
-  const tight = lineWords.map(w => productInkBounds(source, w.box, measureWord(source, w.box, w.text).color));
-  const first = lineWords[0], measured = measureWord(source, tight[0], first.text);
+  // Each word's colour from its whole box (the ring around it is its ground). Measured again on its ink box, inside the
+  // box, the ring could run through its own letters' soft edges: "GANESH" (dark teal) was stored as its yellow plate.
+  const colours = lineWords.map(w => measureWord(source, w.box, w.text).color);
+  const tight = lineWords.map((w, i) => productInkBounds(source, w.box, colours[i]));
   // Small print (under 16 px) is matched among the sans families only: serifs and display faces were picked for blurry
   // 8–12 px legal lines on the real LG creative.
   // Only faces that draw every character of the line (no missing-glyph boxes, e.g. for ₹); small print (under 16 px)
@@ -56,18 +58,26 @@ export async function styleLine(source: Rgba, lineWords: { text: string; box: Bo
   // (74 px at 4096 px) is small print too.
   const small = [...tight.map(b => b.height)].sort((a, b) => a - b)[tight.length >> 1] < Math.max(16, 0.026 * Math.max(source.width, source.height)), chars = [...new Set([...lineWords.map(w => w.text).join('')])];
   const families = OFFER_FONTS.filter(f => (!small || f.category === 'sans') && chars.every(ch => offerFontFile(f.faces[0]).charToGlyph(ch).index > 0)).map(f => f.family);
-  const font = await matchLineFont(source, lineWords.map((w, i) => ({ text: w.text, box: tight[i] })), measured.color, families.length ? { families } : {});
+  const font = await matchLineFont(source, lineWords.map((w, i) => ({ text: w.text, box: tight[i] })), colours[0], families.length ? { families } : {});
   // Each word drawn no wider than its own measured box (words of 4+ letters decide): a face a little wider than the
   // creative's own made neighbours collide ("equallygrand"). First the letters close up (to −7 % of the size), then
   // the line's size shrinks together (to 90 % at most): the words keep the creative's height.
   let fit = 1, tighten = 0;
-  const face = font && offerFace(font.family, font.weight, font.style);
+  const face = font && offerFace(font.family, font.weight, font.style), measured = lineWords.map((w, i) => measureWord(source, tight[i], w.text));
+  // A word set bold in a lighter line ("Get 26% cashback", "up to ₹26,000"): its strokes half as thick again as the line's
+  // usual ones, and thick (bold), takes the family's bold face — the line's one face drew those figures regular. It is
+  // fitted to its own box with that face (its own spacing), apart from the line's.
+  const strokes = measured.map(m => m.evidence.strokeEm), usual = [...strokes].sort((a, b) => a - b)[strokes.length >> 1];
+  const boldFace = font && font.weight < 700 ? offerFace(font.family, 700, font.style) : undefined;
+  const bold = strokes.map(s => !!boldFace && lineWords.length > 1 && s >= 0.135 && s >= usual * 1.45), own = new Map<number, number>();
   if (face) {
     const file = offerFontFile(face);
     for (const [i, w] of lineWords.entries()) {
-      const size = font.words[i]?.fontSize ?? 0, n = [...w.text].length, adv = size ? file.getAdvanceWidth(w.text, size) + (font.words[i]?.letterSpacing ?? 0) * (n - 1) : 0;
-      if (n < 4 || adv <= tight[i].width * 1.03 + 1) continue;
+      const f = bold[i] ? offerFontFile(boldFace!) : file;
+      const size = font.words[i]?.fontSize ?? 0, n = [...w.text].length, adv = size ? f.getAdvanceWidth(w.text, size) + (font.words[i]?.letterSpacing ?? 0) * (n - 1) : 0;
+      if (n < 2 || (n < 4 && !bold[i]) || adv <= tight[i].width * 1.03 + 1) continue;
       const spacing = Math.max(-0.07 * size, (tight[i].width * 1.02 + 1 - adv) / (n - 1));
+      if (bold[i]) { own.set(i, spacing); continue; }
       tighten = Math.min(tighten, spacing);
       const left = adv + spacing * (n - 1);
       if (left > tight[i].width * 1.03 + 1) fit = Math.min(fit, (tight[i].width * 1.03 + 1) / left);
@@ -77,10 +87,10 @@ export async function styleLine(source: Rgba, lineWords: { text: string; box: Bo
   const baselines = font?.words.map((p,i) => tight[i].y+p.baseline).sort((a,b)=>a-b);
   const commonBaseline = baselines?.[baselines.length >> 1];
   return lineWords.map((w, i) => {
-    const m = measureWord(source, tight[i], w.text), place = font?.words[i];
+    const m = measured[i], place = font?.words[i];
     return { confidence: Math.min(m.confidence, Math.max(0, font?.score ?? m.confidence)),
-      style: { fontFamily: font?.family ?? 'Inter', fontMatch: 'estimated', fontSize: (place?.fontSize ?? m.fontSize) * fit, fontWeight: font?.weight ?? m.fontWeight,
-        fontStyle: font?.style ?? 'normal', color: m.color, opacity: 1, lineHeight: 1.2, letterSpacing: ((place?.letterSpacing ?? 0) + tighten) * fit,
+      style: { fontFamily: font?.family ?? 'Inter', fontMatch: 'estimated', fontSize: (place?.fontSize ?? m.fontSize) * fit, fontWeight: bold[i] ? 700 : font?.weight ?? m.fontWeight,
+        fontStyle: font?.style ?? 'normal', color: colours[i], opacity: 1, lineHeight: 1.2, letterSpacing: ((place?.letterSpacing ?? 0) + (bold[i] ? own.get(i) ?? 0 : tighten)) * fit,
         baseline: commonBaseline !== undefined ? commonBaseline - w.box.y : tight[i].y - w.box.y + m.baseline, align: 'left', ...(place ? { originDx: tight[i].x - w.box.x + place.originDx } : {}) } };
   });
 }
@@ -176,10 +186,13 @@ export async function detectProduct(input: ProductDetectInput): Promise<ProductD
   // The model's word boxes moved onto their letters before anything is measured from them or calibrated against them
   // (wordFit.ts: read by the on-device recognizer, else by the letter strokes; kept when unsure). What each line did is
   // saved beside the analysis.
+  const uncertainWords = new Set<string>();
   if (scene?.words && !input.exact) {
-    const fit = await fitSceneWords(source, scene.words, input.recognizer);
-    scene = { ...scene, words: fit.words };
-    input.save('product.word-fit.json', { note: 'The analysis\'s word boxes fitted to their letters in the picture, line by line (letters: read on this computer; strokes: by the picture\'s letter strokes; kept: left as given).', lines: fit.lines });
+    const fit = await fitSceneWords(source, scene.words, input.recognizer), inked = fitWordsToInk(source, fit.words);
+    for (const i of fit.reviewIndexes) uncertainWords.add(fit.words[i].id);
+    const toInk = inked.flatMap((w, i) => { const a = fit.words[i].box, b = w.box; return a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height ? [{ text: w.text, from: { x: a.x, y: a.y, width: a.width, height: a.height }, to: { x: b.x, y: b.y, width: b.width, height: b.height } }] : []; });
+    scene = { ...scene, words: inked };
+    input.save('product.word-fit.json', { note: 'The analysis\'s word boxes fitted to their letters in the picture, line by line (letters: read on this computer; strokes: by the picture\'s letter strokes; kept: left as given), then each made the box of its own letters\' ink (toInk).', lines: fit.lines, toInk });
   }
   // The model's fractional frame corrected (calibrateScene); the boxes as it gave them kept, to tell later which ones a
   // review left untouched.
@@ -210,7 +223,7 @@ export async function detectProduct(input: ProductDetectInput): Promise<ProductD
   if (scene) {
     // Logos on the artwork placed on what they name (snapLogoBoxes); marks on products stay as given.
     const overlayMarks = scene.marks.filter(m => m.overlay), raw = overlayMarks.map(m => pixels(rawBoxes.get(`m:${m.id}`) ?? m.box, size));
-    const snapped = new Map((input.exact ? raw : fitLogosToInk(source, snapLogoBoxes(source, raw))).map((b, k) => [overlayMarks[k], b]));
+    const snapped = new Map((input.exact ? raw : growLogosToArtwork(source, fitLogosToInk(source, snapLogoBoxes(source, raw)))).map((b, k) => [overlayMarks[k], b]));
     // Kept out of every provider's input: where the AI put each mark, and where it really is, both.
     analysis.sourceExclusions = scene.marks.map(m => { const a = pixels(m.box, size), b = snapped.get(m) ?? a, x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
       return { x, y, width: Math.max(a.x + a.width, b.x + b.width) - x, height: Math.max(a.y + a.height, b.y + b.height) - y, rotation: 0 }; });
@@ -289,7 +302,7 @@ export async function detectProduct(input: ProductDetectInput): Promise<ProductD
           recognized: { text: w.text, confidence: w.confidence, mode: 'ai-word-manifest' }, box: { ...w.box }, normalized: normalizeBox(w.box, size),
           elementId, groupId, lineId, order: words.length, confidence: w.confidence, styleConfidence: st.confidence, role, protected: role !== 'copy', origin: 'ai', locked: false,
           style: st.style,
-          review: { status: w.confidence >= LOW_WORD_CONFIDENCE ? 'approved' : 'needs-review', at } };
+          review: { status: w.confidence >= LOW_WORD_CONFIDENCE && !uncertainWords.has(w.id) ? 'approved' : 'needs-review', at } };
         words.push(word);
         let g = groups.get(groupId);
         if (!g) { g = { id: groupId, elementId, label: '', lines: [], align: 'left', category: ['headline', 'offer', 'legal', 'cta'].includes(w.role) ? w.role as MasterCategory : 'supporting' }; groups.set(groupId, g); }
@@ -320,7 +333,7 @@ export async function detectProduct(input: ProductDetectInput): Promise<ProductD
     const t = (scene?.overlays ?? []).map((o, i) => ({ o, s: inside(gb, overlayBoxes[i]) })).filter(x => x.s >= 0.5).sort((a, b) => b.s - a.s)[0];
     if (t) g.category = roleCategory[t.o.role] ?? g.category;
   }
-  for (const w of analysis.words) if (w.review.status === 'needs-review' && w.confidence >= LOW_WORD_CONFIDENCE) w.review = { status: 'approved', at };
+  for (const w of analysis.words) if (w.origin !== 'ai' && w.review.status === 'needs-review' && w.confidence >= LOW_WORD_CONFIDENCE) w.review = { status: 'approved', at };
   for (const s of analysis.logoSlots) if (s.review.status === 'needs-review' && s.confidence >= PRODUCT_ATTENTION_BELOW) s.review = { status: 'approved', at };
   // Text the analysis saw that the reading did not: for a quick check.
   const missingText = (scene?.overlays ?? []).flatMap((t, i) => {
@@ -523,6 +536,121 @@ export function fitLogosToInk(source: Rgba, boxes: Box[]): Box[] {
     }
   }
   return out;
+}
+
+/**
+ * Each logo box grown over its artwork where the artwork goes on past it, on a plain page: the pixels unlike the page
+ * (around each box, a ring three quarters of its height out: its median, plain when most of the ring is near it) joined
+ * to a box's own artwork, reached from all the boxes at once — each such pixel goes to the box nearest it, so two boxes
+ * on one card share it out — at most three quarters of a box's height up or down and a quarter of its width (its height,
+ * when more) sideways, never into another box; one pixel more for the artwork's soft edge. Two marks the analysis gave
+ * one card ("scapia | FEDERAL BANK", 9:16 Ganesh creative) left the card's edge and the top of its red half in the
+ * clean picture: a red block under the overlays. The small "CREDIT CARDS" beside the IDFC FIRST card was cut in two.
+ */
+export function growLogosToArtwork(source: Rgba, boxes: Box[]): Box[] {
+  const W = source.width, H = source.height, data = source.data, out = boxes.map(b => ({ ...b }));
+  const med = (v: number[]) => [...v].sort((p, q) => p - q)[v.length >> 1];
+  const diff = (i: number, g: number[]) => Math.max(Math.abs(data[i * 4] - g[0]), Math.abs(data[i * 4 + 1] - g[1]), Math.abs(data[i * 4 + 2] - g[2]));
+  const pages = boxes.map(b => {
+    const d = Math.max(6, Math.round(0.75 * b.height)), x0 = Math.floor(b.x) - d, y0 = Math.floor(b.y) - d, x1 = Math.ceil(b.x + b.width) + d, y1 = Math.ceil(b.y + b.height) + d, ring: number[] = [];
+    const at = (x: number, y: number) => { if (x >= 0 && y >= 0 && x < W && y < H) ring.push(y * W + x); };
+    for (let t = 0; t < 3; t++) { for (let x = x0 - t; x <= x1 + t; x++) { at(x, y0 - t); at(x, y1 + t); } for (let y = y0 - t; y <= y1 + t; y++) { at(x0 - t, y); at(x1 + t, y); } }
+    if (ring.length < 12) return undefined;
+    const g = [0, 1, 2].map(c => med(ring.map(i => data[i * 4 + c])));
+    return ring.filter(i => diff(i, g) <= 24).length >= ring.length * 0.6 ? g : undefined;
+  });
+  const inBox = (b: Box, x: number, y: number) => x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
+  const windows = boxes.map(b => { const gx = Math.max(b.width * 0.25, b.height), gy = 0.75 * b.height; return { x0: b.x - gx, y0: b.y - gy, x1: b.x + b.width + gx, y1: b.y + b.height + gy }; });
+  const owner = new Map<number, number>(); let frontier: number[] = [];
+  boxes.forEach((b, k) => {
+    const g = pages[k]; if (!g) return;
+    for (let y = Math.max(0, Math.floor(b.y)); y < Math.min(H, Math.ceil(b.y + b.height)); y++) for (let x = Math.max(0, Math.floor(b.x)); x < Math.min(W, Math.ceil(b.x + b.width)); x++) { const i = y * W + x; if (!owner.has(i) && diff(i, g) > 40) { owner.set(i, k); frontier.push(i); } }
+  });
+  const grown = boxes.map(() => ({ x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity }));
+  while (frontier.length) {
+    const next: number[] = [];
+    for (const i of frontier) {
+      const k = owner.get(i)!, x = i % W, y = (i - x) / W, win = windows[k], g = pages[k]!;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= W || Y >= H || X < win.x0 || X >= win.x1 || Y < win.y0 || Y >= win.y1) continue;
+        const j = Y * W + X; if (owner.has(j) || boxes.some(b => inBox(b, X, Y)) || diff(j, g) <= 40) continue;
+        owner.set(j, k); next.push(j);
+        const e = grown[k]; e.x0 = Math.min(e.x0, X); e.x1 = Math.max(e.x1, X); e.y0 = Math.min(e.y0, Y); e.y1 = Math.max(e.y1, Y);
+      }
+    }
+    frontier = next;
+  }
+  boxes.forEach((b, k) => {
+    const e = grown[k]; if (e.x1 < 0) return;
+    const x0 = Math.max(0, Math.min(b.x, e.x0 - 1)), y0 = Math.max(0, Math.min(b.y, e.y0 - 1)), x1 = Math.min(W, Math.max(b.x + b.width, e.x1 + 2)), y1 = Math.min(H, Math.max(b.y + b.height, e.y1 + 2));
+    out[k] = { ...b, x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+  });
+  return out;
+}
+
+/**
+ * Logo boxes that end inside their artwork finished (reviewed boxes too): on a plain page (a ring 1–3 px outside the
+ * box), a side whose first outside line has ink crossing it is moved out line by line until a blank line — at most
+ * three fifths of the box's height, never into another box; artwork going on further (a band, a card) leaves the side
+ * as it was. Unlike growLogosToArtwork this reads only the box's own edge, so a dense grid of partner logos (rows a
+ * few pixels apart) is no obstacle. The administrator's IDFC FIRST box stopped 4 px into the small "CREDIT CARDS"
+ * beside the card: "CREDI CARD".
+ */
+export function finishClippedLogoBoxes(source: Rgba, boxes: Box[]): Box[] {
+  const W = source.width, H = source.height, data = source.data;
+  const med = (v: number[]) => [...v].sort((p, q) => p - q)[v.length >> 1];
+  const diff = (x: number, y: number, g: number[]) => { const i = (y * W + x) * 4; return Math.max(Math.abs(data[i] - g[0]), Math.abs(data[i + 1] - g[1]), Math.abs(data[i + 2] - g[2])); };
+  return boxes.map((b0, k) => {
+    const b = { x0: Math.max(0, Math.floor(b0.x)), y0: Math.max(0, Math.floor(b0.y)), x1: Math.min(W, Math.ceil(b0.x + b0.width)), y1: Math.min(H, Math.ceil(b0.y + b0.height)) };
+    const ring: [number, number][] = [];
+    for (let t = 1; t <= 3; t++) {
+      for (let x = b.x0 - t; x < b.x1 + t; x++) for (const y of [b.y0 - t, b.y1 - 1 + t]) if (x >= 0 && y >= 0 && x < W && y < H) ring.push([x, y]);
+      for (let y = b.y0 - t; y < b.y1 + t; y++) for (const x of [b.x0 - t, b.x1 - 1 + t]) if (x >= 0 && y >= 0 && x < W && y < H) ring.push([x, y]);
+    }
+    if (ring.length < 12) return b0;
+    const page = [0, 1, 2].map(c => med(ring.map(([x, y]) => data[(y * W + x) * 4 + c])));
+    if (ring.filter(([x, y]) => diff(x, y, page) <= 24).length < ring.length * 0.6) return b0;
+    const others = boxes.filter((_, j) => j !== k), reach = Math.max(4, Math.round((b.y1 - b.y0) * 0.6));
+    const inOther = (x: number, y: number) => others.some(o => x >= o.x && x < o.x + o.width && y >= o.y && y < o.y + o.height);
+    // One side: the lines outside it, from the first, while each has ink; the side moved to the first blank one.
+    const side = (line: (n: number) => [number, number][] | undefined) => {
+      for (let n = 0; n <= reach; n++) {
+        const px = line(n); if (!px) return 0;
+        if (px.some(([x, y]) => inOther(x, y))) return 0;
+        if (!px.some(([x, y]) => diff(x, y, page) > 40)) return n;
+      }
+      return 0;
+    };
+    const col = (x: number) => (x < 0 || x >= W ? undefined : Array.from({ length: b.y1 - b.y0 }, (_, i) => [x, b.y0 + i] as [number, number]));
+    const row = (y: number) => (y < 0 || y >= H ? undefined : Array.from({ length: b.x1 - b.x0 }, (_, i) => [b.x0 + i, y] as [number, number]));
+    const right = side(n => col(b.x1 + n)), left = side(n => col(b.x0 - 1 - n));
+    b.x1 += right; b.x0 -= left;
+    const down = side(n => row(b.y1 + n)), up = side(n => row(b.y0 - 1 - n));
+    b.y1 += down; b.y0 -= up;
+    // (One pixel more where a side moved: the artwork's soft edge.)
+    if (!right && !left && !down && !up) return b0;
+    const x0 = Math.max(0, b.x0 - (left ? 1 : 0)), y0 = Math.max(0, b.y0 - (up ? 1 : 0)), x1 = Math.min(W, b.x1 + (right ? 1 : 0)), y1 = Math.min(H, b.y1 + (down ? 1 : 0));
+    return { ...b0, x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+  });
+}
+
+/**
+ * A revision's logos each cut whole (writeSnapshot): a box ending inside its artwork (finishClippedLogoBoxes) cut again
+ * from the creative as a file of its own, so every creative, editor layer and export shows the whole logo. The reviewed
+ * slot and its saved crop are not changed; a replaced or rotated logo stays as it is.
+ */
+export async function wholeLogoSlots(source: Rgba, slots: LogoSlot[], store: (file: string, png: Buffer) => void): Promise<LogoSlot[]> {
+  const size = { width: source.width, height: source.height }, finished = finishClippedLogoBoxes(source, slots.map(s => ({ x: s.box.x, y: s.box.y, width: s.box.width, height: s.box.height })));
+  return Promise.all(slots.map(async (s, k) => {
+    const g = finished[k], rect = { x: Math.max(0, Math.floor(g.x)), y: Math.max(0, Math.floor(g.y)), width: 0, height: 0 };
+    rect.width = Math.min(size.width, Math.ceil(g.x + g.width)) - rect.x; rect.height = Math.min(size.height, Math.ceil(g.y + g.height)) - rect.y;
+    const was = s.original.placement;
+    if (s.replacement || s.box.rotation || (rect.x >= was.x && rect.y >= was.y && rect.x + rect.width <= was.x + was.width && rect.y + rect.height <= was.y + was.height)) return s;
+    const png = await sharp(source.data, { raw: { width: source.width, height: source.height, channels: 4 } }).extract({ left: rect.x, top: rect.y, width: rect.width, height: rect.height }).png({ compressionLevel: 9 }).toBuffer();
+    const hash = sha256(png), file = `logo-${s.id}-${hash.slice(0, 12)}.png`, b: SourceBox = { ...rect, rotation: 0 };
+    store(file, png);
+    return { ...s, box: b, normalized: normalizeBox(b, size), original: { ...s.original, file, sha256: hash, width: rect.width, height: rect.height, bytes: png.length, placement: rect } };
+  }));
 }
 
 export async function logoSlot(source: Rgba, box: Box, label: string, category: MasterCategory, store: (file: string, png: Buffer) => void, order: number): Promise<LogoSlot> {

@@ -1,6 +1,6 @@
 import sharp from 'sharp';
 import { describe, expect, it } from 'vitest';
-import type { ProductObject } from '@frameflow/shared';
+import type { ProductObject, TextAnalysis } from '@frameflow/shared';
 import { decodeRgba, sha256 } from '../pixels.js';
 import { prepareProduct } from './prepare.js';
 import { standInProductLayerizer } from './aiDecompose.js';
@@ -8,6 +8,15 @@ import { standInProductLayerizer } from './aiDecompose.js';
 // A provider can return plausible object masks while leaving the same products in its background.
 // Test that failure independently of the real LG files; these fixtures never write to a saved template.
 describe('replacement background quality and provenance', () => {
+  it('checks logo leftovers even when a caller supplies a known composition', async () => {
+    const source = await decodeRgba(await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="300" height="160"><rect width="300" height="160" fill="white"/><rect x="100" y="60" width="72" height="40" fill="#c8501e"/></svg>')).png().toBuffer());
+    const clean = await decodeRgba(await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="300" height="160"><rect width="300" height="160" fill="white"/><rect x="100" y="60" width="10" height="40" fill="#c8501e"/></svg>')).png().toBuffer());
+    const box = { x: 112, y: 60, width: 60, height: 40, rotation: 0 };
+    const analysis = { words: [], groups: [], plates: [], logoSlots: [{ id: 'logo', label: 'Short logo', box, original: { placement: box }, category: 'partner-logo', review: { status: 'approved' } }] } as unknown as TextAnalysis;
+    const result = await prepareProduct({ source, analysis, objects: [], paidApproved: false, save: () => undefined, known: { verifiedComposition: true, background: clean, clean, layers: [] } });
+    expect(result.quality.issues).toContainEqual(expect.objectContaining({ id: 'leftover-logo', blocking: true }));
+  });
+
   it('blocks residue for every selected product and retains the actual provider background for diagnosis', async () => {
     const png = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600"><rect width="600" height="600" fill="#e9e5dd"/><rect x="100" y="160" width="100" height="160" fill="#122438"/><rect x="350" y="160" width="130" height="160" fill="#652717"/></svg>')).png().toBuffer();
     const source = await decodeRgba(png), objects: ProductObject[] = [

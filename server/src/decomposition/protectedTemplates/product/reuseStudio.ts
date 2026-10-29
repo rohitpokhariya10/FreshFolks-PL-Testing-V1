@@ -31,7 +31,7 @@ import { shadowPng } from './stage.js';
 import { cleanStage } from './stageCleanup.js';
 import { cleanFootprints, FOOTPRINT_VERSION, type Footprint } from './footprint.js';
 import { clearResidue, inkColours, textArt } from './textArt.js';
-import { artworkBase } from './artworkText.js';
+import { artworkBase, EDITABLE_LETTERING_SINCE } from './artworkText.js';
 import { refineCluster } from './reuseCluster.js';
 import { fontMeasure } from './ratioLayout.js';
 import { fitGroup } from './composition.js';
@@ -131,6 +131,24 @@ export function slotAnchors(snapshot: ProductSnapshot, products: ReuseItem[], he
 }
 
 /**
+ * The template's display stands (their own layers) left abandoned: every template product that stood on one is gone
+ * from its place (left out, its place not taken). Drawn, they read as a broken display — one replacement product among
+ * thirteen empty risers (the 16:9 Ganesh creative). A product stands on a stand when its foot is at the stand's top (a
+ * little above or inside it) over part of its width. A stand that held no product in the template stays as designed.
+ */
+export function abandonedStands(snapshot: ProductSnapshot, standing: ReadonlySet<string>): Set<string> {
+  const products = snapshot.objects.filter(o => o.kind === 'product'), out = new Set<string>();
+  for (const s of snapshot.objects.filter(o => o.kind === 'podium' && o.cutout)) {
+    const held = products.filter(p => {
+      const foot = p.box.y + p.box.height, overlap = Math.min(p.box.x + p.box.width, s.box.x + s.box.width) - Math.max(p.box.x, s.box.x);
+      return overlap >= Math.min(p.box.width, s.box.width) * 0.3 && foot >= s.box.y - p.box.height * 0.15 && foot <= s.box.y + s.box.height * 0.6;
+    });
+    if (held.length && held.every(p => !standing.has(p.id))) out.add(s.id);
+  }
+  return out;
+}
+
+/**
  * A product in a template product's slot ("contain"): as tall as the product it replaces (the slot's target height)
  * unless that makes it wider than the slot holds, centred on the slot, standing on its contact line, its proportions
  * kept. On the template's stage a wide product may use up to half again the slot's width (a washing machine where a slim
@@ -205,8 +223,9 @@ export function createReuseStudio(deps: {
     let ctx = contexts.get(key);
     if (!ctx) {
       ctx = (async () => {
-        // A decoration's own lettering (a badge) restored from the original into the background, never set again as live
-        // text (artworkText.ts; a cached file of its own, the template's are unchanged).
+        // A revision prepared before EDITABLE_LETTERING_SINCE: a decoration's own lettering (a badge) restored from the
+        // original into the background, never set again as live text (artworkText.ts; a cached file of its own, the
+        // template's are unchanged). Since then it is editable text, out of the base: nothing is restored.
         const snapshot = deps.snapshot(id, revision), artwork = await artworkBase({ has: f => store.has(id, f), read: f => store.read(id, f), write: (f, b) => store.write(id, f, b) }, snapshot);
         const baseFile = artwork?.file ?? snapshot.editorCreative?.background?.file ?? snapshot.base.file, basePng = store.read(id, baseFile);
         const structure = [...(snapshot.backgroundStructure ?? []), ...snapshot.objects.filter(o => !o.cutout)];
@@ -250,7 +269,7 @@ export function createReuseStudio(deps: {
         }
         // The template's own lettering (textArt.ts): unchanged copy is shown in its original typeface and spacing, which the
         // editable words (estimated fonts) only approximate. Not for a master saved from the editor (its copy may differ).
-        const lettered = !snapshot.editorCreative && !!snapshot.source?.file && store.has(id, snapshot.source.file) && (baseFile === snapshot.base.file || baseFile === artwork?.file);
+        const lettered = (snapshot.prepareVersion ?? 0) < EDITABLE_LETTERING_SINCE && !snapshot.editorCreative && !!snapshot.source?.file && store.has(id, snapshot.source.file) && (baseFile === snapshot.base.file || baseFile === artwork?.file);
         let sourceImage: Buffer | undefined;
         const box = (w: { box: Box }) => ({ x: w.box.x, y: w.box.y, width: w.box.width, height: w.box.height });
         // (Artwork lettering stays in the background as it is: never taken out, never cut as lettering of its own.)
@@ -575,22 +594,33 @@ export function createReuseStudio(deps: {
       const place = a.slot?.box ?? snapshot.objects.find(o => o.id === a.objectId)?.box, b = place && mapBox(frame, place);
       if (b && (b.x < -1 || b.y < -1 || b.x + b.width > frame.canvas.width + 1 || b.y + b.height > frame.canvas.height + 1)) { anchors = undefined; break; }
     }
+    // A display the person's products leave partly empty is arranged anew: an added product in one of the template's places,
+    // among stands nothing stands on any more and no larger than the small product it replaced, is not a designed creative.
+    // Arranged anew, the products stand as one group on the podium, sized for it, and the template's stands are left out.
+    let rearranged = false;
+    if (anchors && added && abandonedStands(snapshot, new Set([...anchors.values()].map(a => a.objectId))).size) {
+      anchors = undefined; rearranged = true;
+      notes.push('Your products leave part of the template’s display empty, so they were arranged again as one group on its podium (the template’s display stands are left out).');
+    }
     if (anchors) {
       const taking = products.filter(i => !i.objectId).length;
       if (taking) notes.push(`${taking === 1 ? 'Your product stands' : `Your ${taking} products stand`} in the template’s own product ${taking === 1 ? 'place' : 'places'}: centred on ${taking === 1 ? 'it' : 'them'}, on the same base line, at most as large as the original.`);
       if (mode === 'ai' && plan) notes.push('The AI placement is not used: products that take the template’s own places stay in them.');
       mode = 'original';
     } else {
-      if (mode === 'original' && (ratio !== 'original' || added)) { mode = 'geometry'; if (!opts.geometryOnly) notes.push(added ? 'More products than the template has places for: the products were arranged again.' : 'In this format the products are arranged again on its stage.'); }
+      if (mode === 'original' && (ratio !== 'original' || added)) { mode = 'geometry'; if (!opts.geometryOnly && !rearranged) notes.push(added ? 'More products than the template has places for: the products were arranged again.' : 'In this format the products are arranged again on its stage.'); }
       if (mode === 'ai' && !planFresh) { mode = 'geometry'; notes.push(plan ? 'The AI placement was made for other products or another main product: arranged on this computer instead. Run AI placement again.' : 'No AI placement for this format yet: arranged on this computer.'); }
     }
-    // Objects: characters and decorations of the template as they are (a replaced character fitted to its place), stands only in the template's own arrangement.
+    // Objects: characters and decorations of the template as they are (a replaced character fitted to its place), stands only
+    // in the template's own arrangement — and only those a product still stands on (abandonedStands).
     const objects: ProductCreativeObject[] = [];
+    const abandoned = abandonedStands(snapshot, new Set(anchors ? [...anchors.values()].map(a => a.objectId) : products.flatMap(i => (i.objectId ? [i.objectId] : []))));
+    if (mode === 'original' && d.placement.keepStands && abandoned.size) notes.push(`${abandoned.size === 1 ? 'One display stand' : `${abandoned.size} display stands`} of the template’s products you left out ${abandoned.size === 1 ? 'is' : 'are'} not shown (nothing stands on ${abandoned.size === 1 ? 'it' : 'them'} any more).`);
     for (const o of c.objects) {
       if (o.kind === 'product') continue;
       // (An adapted master's product shadows belong to the products it was saved with: placed products get their own.)
       if (o.kind === 'decoration' && snapshot.adaptation && /^Shadow · /.test(o.label)) continue;
-      if (o.kind === 'podium') { if (mode === 'original' && d.placement.keepStands) objects.push(o); continue; }
+      if (o.kind === 'podium') { if (mode === 'original' && d.placement.keepStands && !abandoned.has(o.objectId ?? o.id)) objects.push(o); continue; }
       if (o.kind === 'character') {
         const item = items.find(i => i.id === o.id);
         if (item && (!item.included || item.removed)) continue;
@@ -1006,11 +1036,13 @@ export function createReuseStudio(deps: {
   // --- Create Offer Creative regenerated by AI in a common ratio (ratioRegeneration.ts) ----------------------------------
   /**
    * The draft regenerated by the image model in a common ratio (one approved request, never retried): the creative as
-   * composed in the template's own size — the person's products in their places, the template's own text, logos and
-   * characters, every one its exact layer — drawn and sent to be recomposed for the ratio, with its exact words in the
-   * instruction. Before the person sees it: the products (the person's photos, the template's own) put back with their
-   * own pixels (one not found blocks it), the logos too on a clear match, QR codes made to scan to their payloads, the
-   * words checked. Kept with the draft (its revision unchanged) for the person to look at.
+   * composed in the template's own size — the person's products in their places (arranged anew on the podium, its stands
+   * left out, when they leave part of the display empty: sent with the instruction to keep everything as it is, an
+   * abandoned display would be kept abandoned), the template's own text, logos and characters, every one its exact layer
+   * — drawn and sent to be recomposed for the ratio, with its exact words and the products' names in the instruction.
+   * Before the person sees it: the products (the person's photos, the template's own) put back with their own pixels
+   * (one not found blocks it), the logos too on a clear match, QR codes made to scan to their payloads, the words
+   * checked. Kept with the draft (its revision unchanged) for the person to look at.
    */
   const regenerateImage = (id: string, did: string, input: { ratio?: unknown; approveUsd?: unknown }) => locked(`${id}:reuse:${did}`, async () => {
     const d = read(id, did), r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI regeneration is not configured on this server (no OpenAI key). The basic layout (free, not AI) is available.');
@@ -1037,7 +1069,7 @@ export function createReuseStudio(deps: {
     const next: ReuseDraft = structuredClone(d), cents = (v: number) => Math.round(v * 1000) / 1000;
     next.ai.requests += 1;
     let result: Awaited<ReturnType<RatioRegenerator['regenerate']>>;
-    try { result = await r.regenerate({ image: original, prompt: regenerationPrompt(ratio, texts), size: RATIO_REGEN_SIZES[ratio] }, save, op); }
+    try { result = await r.regenerate({ image: original, prompt: regenerationPrompt(ratio, texts, c.objects.filter(x => x.kind === 'product' && !x.hidden).map(x => x.label)), size: RATIO_REGEN_SIZES[ratio] }, save, op); }
     catch (error) {
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 300);
       // (A failed request may still have been charged: counted at its estimate.)
@@ -1046,7 +1078,8 @@ export function createReuseStudio(deps: {
       fail('PROVIDER_FAILED', `AI regeneration did not complete: ${message}. Nothing was retried.`);
     }
     next.ai.costUsd = cents(next.ai.costUsd + (result.costUsd ?? estimateUsd));
-    const { png, checks } = await protectRegenerated({ original, result: await atRatioSize(result.image, ratio), assets, ...(deps.recognizer ? { recognizer: deps.recognizer() } : {}) });
+    const knownWords = [...texts, ...c.images.map(i => i.label), ...c.objects.filter(x => x.kind === 'product').map(x => x.label)];
+    const { png, checks } = await protectRegenerated({ original, result: await atRatioSize(result.image, ratio), assets, knownWords, ...(deps.recognizer ? { recognizer: deps.recognizer() } : {}) });
     const hash = sha256(png), file = `prri-${did.slice(3)}-${ratioKey(ratio)}-${hash.slice(0, 12)}.png`, size = RATIO_REGEN_SIZES[ratio];
     if (!store.has(id, file)) store.write(id, file, png);
     next.regenImages = { ...next.regenImages, [ratio]: { ratio, at: nowIso(), file, sha256: hash, width: size.width, height: size.height, model: r.model, offline: r.offline, operationId: op, ...(result.requestId ? { requestId: result.requestId } : {}), estimateUsd, ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}), checks, draftRevision: d.revision } };

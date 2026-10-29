@@ -29,8 +29,8 @@ import { OverlayGateError, prepareProduct } from './prepare.js';
 import { createProductCreatives } from './creatives.js';
 import { createProductVariations, type ProductVariationPlanner } from './variations.js';
 import type { ArtworkGenerator } from './artwork.js';
-import { detectProduct, logoSlot, styleLine } from './detect.js';
-import { fitLines } from './wordFit.js';
+import { detectProduct, logoSlot, styleLine, wholeLogoSlots } from './detect.js';
+import { fitLines, fitWordsToInk } from './wordFit.js';
 import { productSceneFromResponse, replayProductAnalyzer, type ProductAnalysisJob, type RecoverableProductAnalyzer } from './analyzer.js';
 import { findSheetCreatives } from './sheet.js';
 import { decompositionPlan, deriveBrief, type DetectionAnswer } from './brief.js';
@@ -39,7 +39,7 @@ import { paletteOf } from './artwork.js';
 import { createReuseStudio } from './reuseStudio.js';
 import type { ReusePlacementPlanner } from './reusePlacement.js';
 import type { ReuseComposer } from './reuseCompose.js';
-import { atRatioSize, protectRegenerated, regenerationPrompt, type RatioRegenerator } from './ratioRegeneration.js';
+import { atRatioSize, protectRegenerated, regenerationPrompt, restoreLogosFromOriginal, type RatioRegenerator } from './ratioRegeneration.js';
 import { mapBox, mapY } from './reuseLayout.js';
 import { measureWord } from '../../../textRecognition/measure.js';
 
@@ -327,6 +327,21 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       const recognizer: WordRecognizer = fromVariation ? { engine: { name: 'composition', version: '1', model: 'the variation\'s own text (no reading)', modes: ['composition'] }, recognize: async () => [] } : options.recognizer();
       const result = await detectProduct({ template: t, source, png: input, recognizer, analyzer, previous: t.textAnalysis, ...(fromVariation ? { exact: true } : {}),
         store: (f, bytes) => store.write(id, f, bytes), save: (f, value) => store.write(id, `analysis-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 80)}.json`, Buffer.from(JSON.stringify(value, null, 2))), at: nowIso() });
+      // An approved AI-regenerated creative: each logo found in it gets its layer from the upload's own pixels (the model
+      // redraws small logos; the coordinates stay the regenerated creative's). Before the review, so it shows them.
+      const g = t.product.regeneration;
+      if (g?.status === 'approved' && g.original && store.has(id, g.original.file) && !fromVariation) {
+        const logos = result.analysis.logoSlots.filter(l => !l.replacement && !l.box.rotation && l.review.status !== 'rejected' && store.has(id, l.original.file));
+        const restored = await restoreLogosFromOriginal({ original: store.read(id, g.original.file), regenerated: { width: t.source.width, height: t.source.height }, logos: logos.map(l => ({ id: l.id, png: store.read(id, l.original.file) })) });
+        for (const r of restored) {
+          const l = logos.find(x => x.id === r.id)!;
+          if (!r.png) continue;
+          const hash = sha256(r.png), file = `logo-${l.id}-${hash.slice(0, 12)}.png`;
+          if (!store.has(id, file)) store.write(id, file, r.png);
+          l.original = { ...l.original, file, sha256: hash, bytes: r.png.length };
+        }
+        store.write(id, 'analysis-regeneration-logos.json', Buffer.from(JSON.stringify({ note: 'Logos found in the approved regenerated creative, found again in the upload and cut from its own pixels (restored), or kept as drawn (not-found).', logos: restored.map(r => ({ id: r.id, label: logos.find(x => x.id === r.id)!.label, status: r.status, score: r.score })) }, null, 2)));
+      }
       // Run again on a reviewed template: the administrator's corrections win over what was found again at their place.
       const prior = !t.textAnalysis && cached?.owner.product?.detection?.status === 'done' ? cached.owner : t;
       if (prior.id !== id) {
@@ -392,7 +407,9 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       const before = next.objects.length;
       // A newly found object gives way to a kept one in the same place (not to a small one inside it: a sweet in a hand).
       const iou = (p: PixelRect, q: PixelRect) => { const ix = Math.max(0, Math.min(p.x + p.width, q.x + q.width) - Math.max(p.x, q.x)), iy = Math.max(0, Math.min(p.y + p.height, q.y + q.height) - Math.max(p.y, q.y)); return (ix * iy) / Math.max(1, p.width * p.height + q.width * q.height - ix * iy); };
-      next.objects = [...next.objects.filter(n => !mine.some(m => iou(m.box, n.box) > 0.5)), ...mine.map(o => ({ ...o }))];
+      // (Or to a kept one of the same name and kind over most of it: a small speaker accepted in the review, its box a few
+      // pixels off the one found again — the scene's frame is calibrated on the text — was kept twice.)
+      next.objects = [...next.objects.filter(n => !mine.some(m => iou(m.box, n.box) > 0.5 || (m.label === n.label && m.kind === n.kind && overlap(m.box, n.box) > 0.5))), ...mine.map(o => ({ ...o }))];
       kept.objects += mine.length; kept.replaced += before - (next.objects.length - mine.length);
       next.objects = orderProductObjects(next.objects); next.objects.forEach((o, i) => { o.z = i; });
       for (const o of next.objects) o.covers = next.objects.filter(q => q.z < o.z && overlap(o.box, q.box) > 0).map(q => q.id);
@@ -583,13 +600,18 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     const lines = a.groups.flatMap(g => g.lines.map(l => l.wordIds.map(w => a.words.find(x => x.id === w)).filter((w): w is DetectedWord => !!w && w.review.status !== 'rejected'))).filter(l => l.length);
     const keep = lines.map(ws => ws.some(w => w.origin !== 'ai' || !!w.box.rotation || !!w.corrected?.box));
     const fits = await fitLines(source, lines.map(ws => ws.map(w => ({ text: w.text, box: w.source?.box ?? w.box }))), options.recognizer(), keep);
-    const report = lines.map((ws, i) => ({ text: ws.map(w => w.text).join(' ').slice(0, 120), method: fits[i].method, moved: fits[i].moved, ...(keep[i] ? { reason: 'corrected by a person, rotated or not read by the analysis' } : fits[i].reason ? { reason: fits[i].reason } : {}) }));
+    // Then each word's box made its letters' ink box (fitWordsToInk), on the lines not kept.
+    const placed = lines.map((ws, i) => ws.map((w, k) => (fits[i].method === 'kept' ? w.source?.box ?? w.box : fits[i].boxes[k])));
+    const inked = fitWordsToInk(source, lines.flatMap((ws, i) => ws.map((w, k) => ({ text: w.text, group: String(i), line: '0', box: { ...placed[i][k], rotation: w.box.rotation } }))));
+    let at0 = 0; const boxesOf = lines.map((ws, i) => { const b = keep[i] || fits[i].needsReview ? placed[i] : inked.slice(at0, at0 + ws.length).map(x => x.box); at0 += ws.length; return b; });
+    const shift = (i: number) => Math.max(0, ...lines[i].map((w, k) => { const a = w.source?.box ?? w.box, b = boxesOf[i][k]; return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y), Math.abs(a.x + a.width - b.x - b.width), Math.abs(a.y + a.height - b.y - b.height)); }));
+    const report = lines.map((ws, i) => ({ text: ws.map(w => w.text).join(' ').slice(0, 120), method: fits[i].method, moved: keep[i] ? 0 : shift(i), needsReview: !keep[i] && !!fits[i].needsReview, ...(keep[i] ? { reason: 'corrected by a person, rotated or not read by the analysis' } : fits[i].reason ? { reason: fits[i].reason } : {}) }));
     let moved = 0;
     for (const [i, ws] of lines.entries()) {
-      if (fits[i].method === 'kept' || fits[i].moved < 1) continue;
+      if (keep[i] || shift(i) < 1) continue;
       moved++;
       for (const [k, w] of ws.entries()) {
-        const b = fits[i].boxes[k], box = { x: b.x, y: b.y, width: b.width, height: b.height, rotation: 0 };
+        const b = boxesOf[i][k], box = { x: b.x, y: b.y, width: b.width, height: b.height, rotation: 0 };
         const rect = { left: Math.max(0, Math.floor(box.x)), top: Math.max(0, Math.floor(box.y)) }, crop = await sharp(sourceBytes).extract({ ...rect, width: Math.max(1, Math.min(Math.ceil(box.width), size.width - rect.left)), height: Math.max(1, Math.min(Math.ceil(box.height), size.height - rect.top)) }).png().toBuffer();
         const file = `word-${w.id}-${sha256(crop).slice(0, 12)}.png`;
         if (!store.has(id, file)) store.write(id, file, crop);
@@ -885,6 +907,12 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       preparation: p.prepared, selectedObjects: p.objects,
       ...(draft ? { draft: { warnings: p.prepared.quality.issues.map(i => ({ id: i.id, message: i.message, blocking: i.blocking })) } } : {}),
       generation, decomposition: decompositionPlan(p.objects, a, p.prepared.separation.method) };
+    // Each logo cut whole for the revision (a reviewed box ending inside its artwork: the reviewed slot itself unchanged) —
+    // not one restored from the upload's own pixels (runDetect): cut again from the regenerated creative, it would be the
+    // model's drawing again.
+    const fromUpload = new Set(store.has(id, 'analysis-regeneration-logos.json') ? (JSON.parse(store.read(id, 'analysis-regeneration-logos.json').toString('utf8')) as { logos: { id: string; status: string }[] }).logos.filter(l => l.status === 'restored').map(l => l.id) : []);
+    const whole = await wholeLogoSlots(await decodeRgba(store.read(id, t.source.inputFile)), snapshot.logoSlots.filter(l => !fromUpload.has(l.id)), (f, png) => { if (!store.has(id, f)) store.write(id, f, png); });
+    snapshot.logoSlots = snapshot.logoSlots.map(l => whole.find(w => w.id === l.id) ?? l);
     const edit = p.editorDraft;
     if (edit && edit.objectsRevision === p.objectsRevision && edit.analysisRevision === p.prepared.analysisRevision && edit.baseSha256 === p.prepared.base.sha256) {
       const edited = JSON.parse(store.read(id, `product-r${edit.revision}.json`).toString('utf8')) as ProductSnapshot;

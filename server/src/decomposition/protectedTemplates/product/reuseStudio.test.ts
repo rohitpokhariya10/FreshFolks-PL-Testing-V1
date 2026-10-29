@@ -212,6 +212,8 @@ describe('Reuse Template studio (HTTP, temporary store, fake planner)', { timeou
         expect(p.creative.objects.filter(o => o.kind === 'product').map(o => o.id).sort()).toEqual([products[0].id, added.id].sort());
         for (const o of p.creative.objects.filter(x => x.kind === 'product')) expect(inter(o.box, { x: 0, y: 0, ...p.creative.canvas })).toBeCloseTo(o.box.width * o.box.height, -2);
         expect(p.checks.status).not.toBe('failed');
+        expect(p.creative.texts.filter(t => t.hidden)).toEqual([]);
+        expect(p.creative.objects.some(o => o.label.startsWith('Text · '))).toBe(false);
       }
       // AI placement: the cost must be approved; one request per format; never retried. In the template's own format (and a
       // recomposed common ratio) the dishwasher takes the removed product's place (slot-anchored), so those are not sent.

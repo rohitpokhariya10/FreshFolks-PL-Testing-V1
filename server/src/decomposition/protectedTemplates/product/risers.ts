@@ -178,9 +178,7 @@ export function findRisers(rgb: Uint8Array, w: number, h: number, input: RiserIn
   const found: { px: number[]; source: 'auto' | 'user'; hint?: string }[] = [];
   const inside = (px: number[], b: Box) => { let c = 0; for (const i of px) { const x = i % w; if (within(b, x, (i - x) / w)) c++; } return c / Math.max(1, px.length); };
   const bounds = (px: number[]) => { let x0 = w, y0 = h, x1 = -1, y1 = -1; for (const i of px) { const x = i % w, y = (i - x) / w; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; } return { x0, y0, x1, y1 }; };
-  // The products standing on it: over it (a third of their width at least), their feet on it — not below its bottom (a
-  // dishwasher in front of a refrigerator's lower door, both grey, is one smooth region ending above their feet: no stand).
-  const standingOn = (b: { x0: number; y0: number; x1: number; y1: number }) => objects.flatMap((o, j) => (o.kind === 'product' && Math.min(o.box.x + o.box.width, b.x1 + 1) - Math.max(o.box.x, b.x0) >= o.box.width * 0.3 && o.box.y + o.box.height >= b.y0 - 6 && o.box.y + o.box.height <= b.y1 ? [j] : []));
+  const standingOn = standingOnOf(objects);
   for (const ks of groups.values()) {
     const px = ks.flatMap(k => regions[k].px);
     if (px.length < minSize || hints.some(x => inside(px, x.box) >= 0.5) || !standingOn(bounds(px)).length) continue;
@@ -227,7 +225,21 @@ export function findRisers(rgb: Uint8Array, w: number, h: number, input: RiserIn
       }
     }
   }
-  // 6 Completed behind what is in front: objects, and stands nearer (lower bottom) than this one.
+  return completeStands(rgb, w, h, found, objects, ground);
+}
+
+/**
+ * The products standing on a stand: over it (a third of their width at least), their feet on it — not below its bottom (a
+ * dishwasher in front of a refrigerator's lower door, both grey, is one smooth region ending above their feet: no stand).
+ */
+const standingOnOf = (objects: RiserInput['objects']) => (b: { x0: number; y0: number; x1: number; y1: number }) => objects.flatMap((o, j) => (o.kind === 'product' && Math.min(o.box.x + o.box.width, b.x1 + 1) - Math.max(o.box.x, b.x0) >= o.box.width * 0.3 && o.box.y + o.box.height >= b.y0 - 6 && o.box.y + o.box.height <= b.y1 ? [j] : []));
+
+/**
+ * 6 Stands (their seen pixels, `px`) completed behind what is in front of them: the objects, and stands nearer (lower
+ * bottom) than each. Shared by findRisers and by the stands an AI background shows were there (prepare.ts).
+ */
+export function completeStands(rgb: Uint8Array, w: number, h: number, found: { px: number[]; source: 'auto' | 'user'; hint?: string }[], objects: RiserInput['objects'], ground: Uint8Array): Riser[] {
+  const n = w * h, standingOn = standingOnOf(objects);
   const anyStand = new Uint8Array(n); for (const f of found) for (const i of f.px) anyStand[i] = 1;
   const objectPixel = new Uint8Array(n);
   for (const o of objects) {

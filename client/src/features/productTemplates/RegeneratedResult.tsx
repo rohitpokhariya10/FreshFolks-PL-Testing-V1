@@ -18,6 +18,7 @@ export function RegeneratedResult({ beforeUrl, beforeLabel, resultUrl, result, a
     ['QR codes', !c.qr.some(q => q.status === 'failed'), c.qr.length ? c.qr.map(q => (q.status === 'kept' ? 'Scans to the same link as your original.' : q.status === 'restored' ? 'Redrawn by the AI — your original QR code was put back; it scans to the same link.' : 'Does not scan to your original link.')).join(' ') : 'None in your original.'],
     ...(c.assets.length ? [['Products & logos', !c.assets.some(a => a.status === 'not-found'), c.assets.map(a => `${a.label}: ${a.status === 'restored' ? 'your own picture put back' : 'not found — check it'}`).join(' · ')] as [string, boolean, string]] : []),
     ['Text', !c.missingWords.length, c.missingWords.length ? `Not read in the regenerated creative — check these: ${c.missingWords.join(', ')}. You can also correct text in the review that follows.` : 'Every word read in your original was found again (read on this computer). You check every word again in the review that follows.'],
+    ...(c.extraWords ? [['Nothing added', !c.extraWords.length, c.extraWords.length ? `Read in the regenerated creative but not in your original — check for invented copy: ${c.extraWords.join(', ')}. Regenerate it, or continue with your original, if the AI added text.` : 'No word was read in it that your original does not have (read on this computer).'] as [string, boolean, string]] : []),
   ];
   return <section className="rg-result" aria-label={`Regenerated in ${label}`}>
     <div className="rg-compare">

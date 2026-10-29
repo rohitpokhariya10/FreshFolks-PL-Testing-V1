@@ -481,6 +481,10 @@
 .sr-cost div { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 10px; font-size: 13.5px; line-height: 1.45; }
 .sr-cost dt { color: var(--color-muted); }
 .sr-cost dd { margin: 0; }
+.sr-regen-offer { display: grid; gap: 8px; border: 1px solid color-mix(in srgb, var(--color-primary) 35%, var(--color-line)); border-radius: 14px; padding: 14px; background: color-mix(in srgb, var(--color-primary) 5%, #fff); }
+.sr-regen-offer p { margin: 0; font-size: 14px; line-height: 1.5; color: var(--color-muted); }
+.sr-regen-offer p strong { color: var(--color-text, inherit); }
+.sr-regen-offer .ws-btn { justify-content: center; width: 100%; }
 .sr-modal-actions { display: grid; gap: 8px; }
 .sr-modal-actions .ws-btn { justify-content: center; width: 100%; }
 .sr-lightbox { position: fixed; inset: 0; z-index: 1000; background: rgba(10, 14, 12, .9); display: grid; place-items: center; padding: 24px; }

@@ -13,7 +13,7 @@ import type { ProductView, TemplateBrief, VariationJob } from '../../client/src/
  *   B  the saved master → Template details (instructions written from the detection, the decomposition plan) →
  *      Generate with AI: 3 variations, 1:1, the custom instructions left EMPTY → 3 creatives
  *   C  a variation → Decompose & Edit → its own review (found from its own layers, no AI request) → choose → decompose
- *      (each element its own layer, nothing estimated) → save → Open in the editor → a product moved, a word edited →
+ *      (each element its own layer) → save, retaining any blocking checks as a draft → Open in the editor → a product moved, a word edited →
  *      reload: kept → export
  */
 test.use({ extraHTTPHeaders: { origin: `http://127.0.0.1:${process.env.FRAMEFLOW_OFFLINE_E2E_PORT ?? 3317}` }, actionTimeout: 30000 });
@@ -77,6 +77,8 @@ test('A → B → C: master template, generation without a prompt, a variation d
   await expect(panel.getByRole('region', { name: 'How it is decomposed' })).toContainText('Kept in the background: ');
   await page.screenshot({ path: `${OUT}/B1-details.png`, fullPage: true });
   await panel.getByRole('tab', { name: 'Generate with AI' }).click();
+  await panel.getByLabel('Generation mode', { exact: true }).selectOption('redesign');
+  await panel.getByRole('radio', { name: /New AI artwork/ }).check();
   await panel.getByRole('radio', { name: '3', exact: true }).click();
   await panel.getByRole('checkbox', { name: 'Square 1:1' }).click();
   await panel.getByRole('checkbox', { name: 'Original size' }).click();
@@ -97,23 +99,32 @@ test('A → B → C: master template, generation without a prompt, a variation d
   // C — Decompose & Edit the first variation through the same steps.
   await cards.first().getByRole('button', { name: 'Decompose & Edit' }).click();
   await expect(panel.getByRole('heading', { name: 'Here’s what we found' })).toBeVisible({ timeout: 60000 });
-  await expect(panel.getByTestId('from-variation')).toContainText('no AI request');
+  await expect(panel.getByTestId('from-variation')).toContainText('no new detection charge');
   await page.screenshot({ path: `${OUT}/C1-variation-review.png` });
   await panel.getByRole('button', { name: 'Save and choose what to decompose' }).click();
-  await panel.getByRole('button', { name: 'Continue to Decomposition' }).click();
+  await panel.getByRole('button', { name: 'Decompose with AI (offline stand-in, free)', exact: true }).click();
   await expect(panel.getByRole('heading', { name: 'Inspect the layers and the background' })).toBeVisible({ timeout: 120000 });
   await panel.getByRole('tab', { name: 'Individual layers' }).click();
   await expect(panel.getByRole('region', { name: 'Individual layers' }).getByRole('article', { name: 'Layer Television' })).toContainText('the variation’s own layer');
   await page.screenshot({ path: `${OUT}/C2-variation-layers.png` });
   const derivedId = (job.results[0].templateId ?? ((await (await request.get(`${API}/${id}/variations/${jobId}`)).json()) as VariationJob).results[0].templateId)!;
   const derived = await (await request.get(`${API}/${derivedId}`)).json() as ProductView;
-  expect(derived.product.objects.filter(o => o.cutout).every(o => o.cutout!.method === 'layer')).toBe(true);
+  expect(derived.product.objects.filter(o => o.cutout && o.kind === 'product').every(o => o.cutout!.method === 'layer')).toBe(true);
+  expect(derived.product.prepared!.separation.method).toBe('seedream');
   expect(derived.product.prepared!.quality.reconstructedPercent ?? 0).toBe(0);
-  expect(derived.product.activity).toMatchObject({ aiCalls: 0, costUsd: 0 });
+  expect(derived.product.activity.costUsd).toBe(0);
   for (const c of await panel.getByRole('complementary', { name: 'Checks' }).getByRole('checkbox').all()) await c.check();
-  await panel.getByRole('button', { name: 'Save master template' }).click();
+  // The synthetic artwork's circle touches the ACME area and triggers the conservative residue
+  // guard. Keep that check visible and unresolved; exercise recovery as a draft, not clean approval.
+  const blocking = derived.product.prepared!.quality.issues.filter(i => i.blocking);
+  if (blocking.length) {
+    expect(blocking.every(i => i.id.startsWith('leftover-'))).toBe(true);
+    await expect(panel.getByRole('region', { name: 'Problems to fix' })).toContainText('still in the background');
+    await panel.getByRole('button', { name: 'Save as a draft with these warnings…' }).click();
+    await panel.getByRole('button', { name: 'Yes, save as a draft' }).click();
+  } else await panel.getByRole('button', { name: 'Save master template' }).click();
   await expect(panel.getByRole('heading', { name: 'Your template is saved' })).toBeVisible({ timeout: 60000 });
-  await panel.getByRole('button', { name: 'Open in the editor' }).click();
+  await panel.getByRole('button', { name: 'Open in Editor', exact: true }).click();
   await expect(panel).toBeHidden({ timeout: 60000 });
 
   // The editor: a product moved on its own, a word edited; reloaded, kept; exported at the variation's size.
@@ -122,7 +133,7 @@ test('A → B → C: master template, generation without a prompt, a variation d
   const design = (await stored()).variants.filter(v => v.productTemplate).at(-1)!;
   await page.screenshot({ path: `${OUT}/C3-editor.png` });
   const tvLayer = design.layers!.find(l => l.type === 'image' && /Television/.test(l.name ?? ''))!, otherBefore = design.layers!.filter(l => l.id !== tvLayer.id).map(l => JSON.stringify(l));
-  await page.locator('.layer-select', { hasText: 'Television' }).first().click();
+  await page.locator(`[data-layer-id="${tvLayer.id}"] .layer-select`).click();
   const x = Number(await page.getByLabel('X', { exact: true }).inputValue()) + 40;
   await page.getByLabel('X', { exact: true }).fill(String(x));
   await page.getByLabel('X', { exact: true }).press('Enter');

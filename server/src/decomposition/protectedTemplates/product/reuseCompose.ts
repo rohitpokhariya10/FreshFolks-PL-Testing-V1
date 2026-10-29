@@ -457,8 +457,10 @@ export async function applyPlan(files: Files, c: ProductCreative, st: Structure,
     } else if (f.kind === 'text') {
       const gid = f.key.slice(2), before = groupBounds(out, gid, measure), word = out.texts.find(t => t.groupId === gid && !t.hidden && t.text.trim());
       if (!before || !word) continue;
-      // Already in its box (a format of the template's own shape): left exactly as designed.
-      if (Math.abs(before.x - target.x) <= 2 && Math.abs(before.y - target.y) <= 2 && Math.abs(before.width - target.width) <= 2 && Math.abs(before.height - target.height) <= 2) continue;
+      // Already in its box (a format of the template's own shape): left exactly as designed — its plates too, where they
+      // are (with no move of their owner they were left out: the 9:16 Ganesh creative lost its validity pill and the
+      // divider of its EMI line in its own size).
+      if (Math.abs(before.x - target.x) <= 2 && Math.abs(before.y - target.y) <= 2 && Math.abs(before.width - target.width) <= 2 && Math.abs(before.height - target.height) <= 2) { moves.set(f.key, { from: before, to: before, k: 1 }); continue; }
       // A one-line text on a plate (a pill, a ribbon) stays one line, made smaller to fit: re-wrapped, its plate (moved
       // with it, its own shape) would no longer go round it. Wrapped only when that would make it too small to read.
       // Its plate is wider than its words: the words are fitted so that the plate, moved with them, fits across the box

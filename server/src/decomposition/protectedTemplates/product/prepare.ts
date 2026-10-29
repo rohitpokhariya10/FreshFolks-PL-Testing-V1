@@ -34,12 +34,11 @@ import { fillLevels, levelsOf, unmix } from '../master/artworkRebuild.js';
 import { groundColours, groundMask } from '../master/artworkObjects.js';
 import { inpaint } from './inpaint.js';
 import { fullSizeFill, guidedFill, type BackgroundGuide, type GuidedFill } from './backgroundGuide.js';
-import { burstAtFullSize } from './burst.js';
-import { findRisers, type Riser } from './risers.js';
+import { burstAtFullSize, burstFill, findBurst } from './burst.js';
+import { completeStands, findRisers, type Riser } from './risers.js';
 import { binDown, dilate, maskDown, sampleRgb, upsampleLabels, workIndex, workSize, type WorkSize } from './multiscale.js';
 import { sentSize, type AiDecomposition, type ProductLayerizer } from './aiDecompose.js';
 import { refineMasks } from './segment.js';
-import { artworkGroups, restoreArtworkRaw } from './artworkText.js';
 import type { Segmenter } from '../../creativeTemplates/segmenter.js';
 
 type Box = PixelRect;
@@ -159,8 +158,10 @@ export function sweepPlainLines(source: Rgba, analysis: TextAnalysis, mask: Uint
     let swept = 0;
     // Only around each word (padded): a divider or ornament between words on the same plate is the plate's, not text.
     if (plain) for (const b of boxes) for (let y = Math.max(y0, Math.floor(b.y) - py); y < Math.min(y1, Math.ceil(b.y + b.height) + py); y++) for (let x = Math.max(x0, Math.floor(b.x) - px); x < Math.min(x1, Math.ceil(b.x + b.width) + px); x++) {
-      const i = y * w + x, p = i * 4;
-      if (Math.max(Math.abs(data[p] - bg[0]), Math.abs(data[p + 1] - bg[1]), Math.abs(data[p + 2] - bg[2])) > 16) { if (!mask[i]) swept++; mask[i] = 1; }
+      const i = y * w + x;
+      // Include the quiet pixels between and around strokes too: low-contrast antialiasing and
+      // JPEG ringing otherwise survive as readable ghosts below the colour threshold.
+      if (!mask[i]) swept++; mask[i] = 1;
     }
     // Letters a box missed at the line's ends ("Va" left of a box drawn a little to the right): marks within the line's
     // band, each no wider than a letter or two and no taller than the line, joined letter by letter to the line's text.
@@ -183,7 +184,11 @@ export function sweepPlainLines(source: Rgba, analysis: TextAnalysis, mask: Uint
       comps.push(comp);
     }
     // Inside the line's band; a letter or two wide, or (letters joined by their soft edges into a word) mostly text already.
-    const inBand = (c: typeof comps[number]) => c.y0 > y0 && c.y1 < y1 - 1, letter = (c: typeof comps[number]) => inBand(c) && c.x1 - c.x0 + 1 <= 1.5 * lh;
+    // Not a thin upright rule taller than the words (a divider between two blocks on the line, "12 | (HDFC exclusive"): it
+    // is the layout's, and taken with the text it vanished from the creative.
+    const wordHeight = [...boxes.map(b => b.height)].sort((p, q) => p - q)[boxes.length >> 1];
+    const rule = (c: typeof comps[number]) => c.x1 - c.x0 + 1 <= Math.max(3, 0.12 * lh) && c.y1 - c.y0 + 1 >= 1.15 * wordHeight;
+    const inBand = (c: typeof comps[number]) => c.y0 > y0 && c.y1 < y1 - 1, letter = (c: typeof comps[number]) => inBand(c) && c.x1 - c.x0 + 1 <= 1.5 * lh && !rule(c);
     const accepted = new Set(comps.filter(c => c.masked && (letter(c) || (inBand(c) && c.masked >= c.px.length * 0.3))));
     for (let grew = true; grew;) {
       grew = false;
@@ -282,17 +287,42 @@ export function fillOverlayPixels(rgb: Uint8Array, w: number, h: number, mask: U
     if (!area.plate) for (let y = ry0; y < ry1; y++) for (let x = rx0; x < rx1; x++) { if (x >= x0 && x < x1 && y >= y0 && y < y1) continue; const i = y * w + x; if (!mask[i]) sample(i); }
     // On a plate, too little ring (at the picture's edge, or text on text): what is not masked inside, as before.
     if (samples < 20) { buckets.clear(); samples = 0; for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) { const i = y * w + x; if (!mask[i]) sample(i); } }
+    // A fully padded text mask may leave no sample inside its plate. The most common source
+    // colour inside the line still identifies its ground (letters occupy a minority of the area).
+    if (area.plate) { buckets.clear(); samples = 0; for (let y = y0; y < y1; y += 2) for (let x = x0; x < x1; x += 2) sample(y * w + x); }
     const ranked = [...buckets.values()].sort((a,b) => b.length - a.length), dominant = ranked[0] ?? [];
     // A two-colour pattern around it (the stripes of a radial burst): continued by refillPatterned, not by one colour.
     const second = ranked[1]?.length ?? 0, twoTone = dominant.length >= samples * 0.2 && second >= samples * 0.2 && dominant.length + second >= samples * 0.75;
     const flat = dominant.length / Math.max(1, samples) >= 0.7;
     const color = [0,1,2].map(c => { const v = dominant.map(p => p[c]).sort((a,b) => a-b); return v[v.length >> 1] ?? 255; });
+    // Continue a smooth background field, excluding contrasting borders and ornaments. Direct row
+    // interpolation can pull a signboard's dark rim right through the erased text as a horizontal stripe.
+    let plane: number[][] | undefined;
+    if (area.plate) {
+      const matrix = Array.from({ length: 3 }, () => new Array<number>(6).fill(0)); let count = 0;
+      for (let y = ry0; y < ry1; y += 2) for (let x = rx0; x < rx1; x += 2) {
+        const i = y * w + x;
+        if (mask[i] || Math.max(...color.map((v, c) => Math.abs(rgb[i * 3 + c] - v))) > 24) continue;
+        const row = [1, (x - b.x) / Math.max(1, b.width), (y - b.y) / Math.max(1, b.height)]; count++;
+        for (let j = 0; j < 3; j++) { for (let k = 0; k < 3; k++) matrix[j][k] += row[j] * row[k]; for (let c = 0; c < 3; c++) matrix[j][c + 3] += row[j] * rgb[i * 3 + c]; }
+      }
+      let valid = count >= 20;
+      for (let j = 0; j < 3 && valid; j++) {
+        const pivot = matrix[j][j]; if (Math.abs(pivot) < 1e-6) { valid = false; break; }
+        for (let k = j; k < 6; k++) matrix[j][k] /= pivot;
+        for (let r = 0; r < 3; r++) if (r !== j) { const factor = matrix[r][j]; for (let k = j; k < 6; k++) matrix[r][k] -= factor * matrix[j][k]; }
+      }
+      plane = valid ? matrix.map(row => row.slice(3)) : [color, [0, 0, 0], [0, 0, 0]];
+    }
     if (!flat) uncertain.push(area);
     // (Also when the box is mostly one stripe: the letters crossing into the other one would take the wrong colour.)
     if (twoTone && !area.plate) patterned.push(area);
     for (let y = y0; y < y1; y++) for (let x = x0, left = -1, right = -1; x < x1; x++) {
       const i = y * w + x; if (!mask[i]) continue;
-      if (flat) { for (let c=0;c<3;c++) out[i*3+c] = color[c]; continue; }
+      if (plane) { for (let c = 0; c < 3; c++) out[i * 3 + c] = Math.round(Math.max(0, Math.min(255, color[c] + Math.max(-24, Math.min(24, plane[0][c] + plane[1][c] * (x - b.x) / Math.max(1, b.width) + plane[2][c] * (y - b.y) / Math.max(1, b.height) - color[c]))))); continue; }
+      if (flat && !area.plate) { for (let c=0;c<3;c++) out[i*3+c] = color[c]; continue; }
+      // Even an apparently flat panel has gradients and grain. A single median colour in letter-shaped
+      // holes leaves readable silhouettes; continue the surrounding row through each masked run instead.
       // The masked run this pixel is in, found once per run (a scan per pixel is quadratic in the run's length).
       if (x >= right) { left = x - 1; while (left >= 0 && mask[y*w+left]) left--; right = x + 1; while (right < w && mask[y*w+right]) right++; }
       for (let c=0;c<3;c++) out[i*3+c] = left >= 0 && right < w ? Math.round(rgb[(y*w+left)*3+c] + (rgb[(y*w+right)*3+c] - rgb[(y*w+left)*3+c]) * (x-left)/(right-left)) : color[c];
@@ -356,12 +386,19 @@ export function assertOverlaysGone(source: Uint8Array, clean: Uint8Array, mask: 
   const h = source.length / 3 / w, failed: Box[] = [];
   const far = (a: Uint8Array, i: number, c: number[], t: number) => Math.abs(a[i * 3] - c[0]) > t || Math.abs(a[i * 3 + 1] - c[1]) > t || Math.abs(a[i * 3 + 2] - c[2]) > t;
   for (const a of areas) {
-    // What is around the area: the median of a 4 px ring outside it (not itself an overlay).
-    const ring: number[][] = [[], [], []], x0 = Math.max(0, a.box.x - 4), y0 = Math.max(0, a.box.y - 4), x1 = Math.min(w, a.box.x + a.box.width + 4), y1 = Math.min(h, a.box.y + a.box.height + 4);
-    for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-      if (x >= a.box.x && x < a.box.x + a.box.width && y >= a.box.y && y < a.box.y + a.box.height) continue;
-      const i = y * w + x; if (mask[i]) continue;
-      for (let c = 0; c < 3; c++) ring[c].push(source[i * 3 + c]);
+    // What is around the area: unmasked samples from a ring starting four pixels outside it.
+    const ring: number[][] = [[], [], []];
+    // The removal mask includes padding. Find actual unmasked background beyond it; an empty
+    // four-pixel ring used to default to black and mistake the untouched green panel for lettering.
+    for (let pad = 4; pad <= Math.max(32, a.box.height); pad *= 2) {
+      ring.forEach(c => { c.length = 0; });
+      const x0 = Math.max(0, a.box.x - pad), y0 = Math.max(0, a.box.y - pad), x1 = Math.min(w, a.box.x + a.box.width + pad), y1 = Math.min(h, a.box.y + a.box.height + pad);
+      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+        if (x >= a.box.x && x < a.box.x + a.box.width && y >= a.box.y && y < a.box.y + a.box.height) continue;
+        const i = y * w + x; if (mask[i]) continue;
+        for (let c = 0; c < 3; c++) ring[c].push(source[i * 3 + c]);
+      }
+      if (ring[0].length >= Math.max(20, a.box.width + a.box.height)) break;
     }
     const around = ringColours(ring);
     let own = 0, kept = 0;
@@ -991,6 +1028,222 @@ async function aiLayers(layerizer: ProductLayerizer, rgb: Uint8Array, clean: Uin
   return { result, masks, unmatched, background, sent: { width: W, height: H } };
 }
 
+/** Square neighbourhood (side 2r+1) dilation: separable running counts, linear in the picture whatever `r` is. */
+export function boxDilate(m: Uint8Array, w: number, h: number, r: number): Uint8Array {
+  const t = new Uint8Array(w * h), out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const row = y * w; let c = 0;
+    for (let x = 0; x < Math.min(w, r); x++) c += m[row + x];
+    for (let x = 0; x < w; x++) { if (x + r < w) c += m[row + x + r]; if (x - r - 1 >= 0) c -= m[row + x - r - 1]; t[row + x] = c > 0 ? 1 : 0; }
+  }
+  for (let x = 0; x < w; x++) {
+    let c = 0;
+    for (let y = 0; y < Math.min(h, r); y++) c += t[y * w + x];
+    for (let y = 0; y < h; y++) { if (y + r < h) c += t[(y + r) * w + x]; if (y - r - 1 >= 0) c -= t[(y - r - 1) * w + x]; out[y * w + x] = c > 0 ? 1 : 0; }
+  }
+  return out;
+}
+/** Square neighbourhood erosion (the picture's border does not erode). */
+export function boxErode(m: Uint8Array, w: number, h: number, r: number): Uint8Array {
+  const grown = boxDilate(Uint8Array.from(m, v => (v ? 0 : 1)), w, h, r);
+  return Uint8Array.from(grown, v => (v ? 0 : 1));
+}
+
+/**
+ * A logo's artwork left in the clean picture just past its box (the box stopped short of the logo: a card's edge, the
+ * top of its other half): on a plain page around the box (a ring three quarters of its height out, mostly one colour),
+ * what is unlike the page within 4 px of the box and joined to that, within half the box's height of it. Each logo
+ * with that much left (at least 20 px and 1.5 % of its box), and the band it was found in.
+ */
+export function overlayLeftovers(clean: Uint8Array, w: number, h: number, logos: { id: string; label: string; box: Box }[]): { id: string; label: string; area: Box; pixels: number }[] {
+  const found: { id: string; label: string; area: Box; pixels: number }[] = [];
+  const diff = (i: number, g: number[]) => Math.max(Math.abs(clean[i * 3] - g[0]), Math.abs(clean[i * 3 + 1] - g[1]), Math.abs(clean[i * 3 + 2] - g[2]));
+  for (const l of logos) {
+    const b = { x: Math.round(l.box.x), y: Math.round(l.box.y), width: Math.round(l.box.width), height: Math.round(l.box.height) }, d = Math.max(6, Math.round(0.75 * b.height)), ring: number[] = [];
+    for (let x = b.x - d; x <= b.x + b.width + d; x++) for (const y of [b.y - d, b.y + b.height + d]) if (x >= 0 && y >= 0 && x < w && y < h) ring.push(y * w + x);
+    for (let y = b.y - d; y <= b.y + b.height + d; y++) for (const x of [b.x - d, b.x + b.width + d]) if (x >= 0 && y >= 0 && x < w && y < h) ring.push(y * w + x);
+    if (ring.length < 12) continue;
+    const page = [0, 1, 2].map(c => ring.map(i => clean[i * 3 + c]).sort((p, q) => p - q)[ring.length >> 1]);
+    if (ring.filter(i => diff(i, page) <= 24).length < ring.length * 0.6) continue;
+    const m = Math.max(4, Math.round(b.height / 2)), area = { x: Math.max(0, b.x - m), y: Math.max(0, b.y - m), width: 0, height: 0 };
+    area.width = Math.min(w, b.x + b.width + m) - area.x; area.height = Math.min(h, b.y + b.height + m) - area.y;
+    const inside = (x: number, y: number) => x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height, inArea = (x: number, y: number) => x >= area.x && y >= area.y && x < area.x + area.width && y < area.y + area.height;
+    // (From within 4 px of the box: the removal's fill reaches a pixel or two past it.)
+    const seen = new Set<number>(), stack: number[] = [];
+    for (let x = b.x - 4; x < b.x + b.width + 4; x++) for (let y = b.y - 4; y < b.y + b.height + 4; y++) {
+      if (inside(x, y) || !inArea(x, y)) continue; const i = y * w + x; if (!seen.has(i) && diff(i, page) > 48) { seen.add(i); stack.push(i); }
+    }
+    while (stack.length) {
+      const i = stack.pop()!, x = i % w, y = (i - x) / w;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const X = x + dx, Y = y + dy; if (!inArea(X, Y) || inside(X, Y)) continue; const j = Y * w + X; if (!seen.has(j) && diff(j, page) > 48) { seen.add(j); stack.push(j); } }
+    }
+    if (seen.size >= Math.max(20, b.width * b.height * 0.015)) found.push({ id: l.id, label: l.label, area, pixels: seen.size });
+  }
+  return found;
+}
+
+/**
+ * Where an AI background (Seedream's) stands in for the creative behind the decomposed objects: the whole cluster it took
+ * out with them, not their outlines alone. Seedream's background is drawn again, never pixel-aligned with the creative
+ * (every edge in it lies a pixel or two off), and it leaves out what the products stand on or in front of too: display
+ * stands, a TV's backdrop panel. Pasted only inside each object's outline, it cut product-shaped windows of the back wall
+ * into the stands kept in the picture and left the strips between the products standing as "table legs" (the 9:16 Ganesh
+ * creative, 2026-10-28).
+ *
+ *   region   the objects' pixels; the AI background's differences from the creative just around them (soft edges,
+ *            shadows); and, in the display area around the products, each solid difference (opened by `r`: thin ones are
+ *            edges drawn a pixel off; and only what the plate has nowhere near: not a structure it drew shifted) touching
+ *            a product or a character there, with the thin differences joined to it (a
+ *            stand's outline: left behind, it stood in the background as a sliver of the stand) and the solid ones a short
+ *            gap away (a stand's foot past a highlight band where the plate and the creative agree)
+ *   stands   each of those differences seen in the creative and not an object (closed, its holes filled; at least
+ *            `minSize`; not mostly inside a decoration or frame kept in the picture; never the shared podium's front, below
+ *            its top surface — `stage`, kept as the creative has it): a stand layer of its own (completed
+ *            behind the objects: risers.ts), so the base is the AI's clean plate and the creative as recombined loses
+ *            nothing
+ *   weight   the plate's share of each pixel: all of it in the region, but where the creative is plain background like
+ *            the plate (no object, no stand) faded in across the region's edge, `r` + 1 px inside and 2`r` + 2 outside (no
+ *            seam of slightly another tone)
+ *   offset   the AI background's colours matched to the creative's (the median difference in a ring around the objects)
+ */
+export function aiPlate(clean: Uint8Array, bg: { rgb: Uint8Array; alpha: Uint8Array }, w: number, h: number, hole: Uint8Array, objects: { kind: ProductObject['kind']; box: Box; mask: Uint8Array }[], structures: Box[], stage?: Box): { region: Uint8Array; weight: Uint8Array; offset: number[]; stands: number[][] } {
+  const n = w * h, r = Math.max(2, Math.round(Math.max(w, h) * 0.0018)), T = 32, minSize = Math.max(60, Math.round(n * 0.00015));
+  const near = boxDilate(hole, w, h, r + 2), ring = boxDilate(hole, w, h, 3 * r + 4), d: number[][] = [[], [], []];
+  for (let i = 0; i < n; i += 2) if (ring[i] && !near[i] && bg.alpha[i] >= 128) for (let c = 0; c < 3; c++) d[c].push(clean[i * 3 + c] - bg.rgb[i * 3 + c]);
+  const offset = d.map(v => { v.sort((p, q) => p - q); return v.length ? v[v.length >> 1] : 0; });
+  const differs = new Uint8Array(n), apart = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    if (hole[i] || bg.alpha[i] < 128) continue;
+    let far = 0; for (let c = 0; c < 3; c++) far = Math.max(far, Math.abs(clean[i * 3 + c] - Math.max(0, Math.min(255, bg.rgb[i * 3 + c] + offset[c]))));
+    apart[i] = Math.min(255, far); if (far > T) differs[i] = 1;
+  }
+  const region = Uint8Array.from(hole), edge = boxDilate(hole, w, h, r), standPx = new Uint8Array(n);
+  for (let i = 0; i < n; i++) if (edge[i] && differs[i]) region[i] = 1;
+  const products = objects.filter(o => o.kind === 'product'), stands: number[][] = [];
+  if (products.length) {
+    // The display area: around the products, below them to the stands' feet (a product's height at least: a small product
+    // on a tall pedestal).
+    const mid = (v: number[]) => [...v].sort((p, q) => p - q)[v.length >> 1], mw = mid(products.map(o => o.box.width)), mh = mid(products.map(o => o.box.height));
+    const X0 = Math.max(0, Math.floor(Math.min(...products.map(o => o.box.x)) - Math.max(0.04 * w, mw / 2))), X1 = Math.min(w, Math.ceil(Math.max(...products.map(o => o.box.x + o.box.width)) + Math.max(0.04 * w, mw / 2)));
+    const Y0 = Math.max(0, Math.floor(Math.min(...products.map(o => o.box.y)) - 0.03 * h)), Y1 = Math.min(h, Math.ceil(Math.max(...products.map(o => o.box.y + o.box.height)) + Math.max(0.04 * h, mh)));
+    const inArea = (x: number, y: number) => x >= X0 && y >= Y0 && x < X1 && y < Y1;
+    // What the AI took out, not what it drew a few pixels off: a difference whose colour the plate has nowhere within 3r
+    // (the podium's bands, drawn shifted, are in the plate just beside; a stand or a backdrop panel is not). Taken in as a
+    // stand, the podium's end was replaced by the plate's, a step in its bands.
+    const removed = new Uint8Array(n), k3 = 3 * r, stride = n > 4e6 ? 3 : 2;
+    const plateAt = (j: number, c: number) => Math.max(0, Math.min(255, bg.rgb[j * 3 + c] + offset[c]));
+    for (let y = Y0; y < Y1; y++) for (let x = X0; x < X1; x++) {
+      const i = y * w + x; if (!differs[i]) continue;
+      let seen = false;
+      for (let dy = -k3; dy <= k3 && !seen; dy += stride) for (let dx = -k3; dx <= k3; dx += stride) {
+        const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= w || Y >= h) continue; const j = Y * w + X;
+        if (Math.abs(clean[i * 3] - plateAt(j, 0)) <= 20 && Math.abs(clean[i * 3 + 1] - plateAt(j, 1)) <= 20 && Math.abs(clean[i * 3 + 2] - plateAt(j, 2)) <= 20) { seen = true; break; }
+      }
+      if (!seen) removed[i] = 1;
+    }
+    const solid = boxDilate(boxErode(removed, w, h, r), w, h, r), objectPx = new Uint8Array(n);
+    for (const o of objects) for (let i = 0; i < n; i++) if (o.mask[i]) objectPx[i] = 1;
+    const touching = boxDilate(objectPx, w, h, 2);
+    // The solid differences in the area, each a component; those touching an object are what the AI took out with it.
+    const solidOf = new Int32Array(n).fill(-1), found: { px: number[]; touches: boolean }[] = [];
+    for (let y = Y0; y < Y1; y++) for (let x = X0; x < X1; x++) {
+      const s = y * w + x; if (!solid[s] || solidOf[s] !== -1) continue;
+      const k = found.length, px = [s], stack = [s]; solidOf[s] = k; let touches = false;
+      while (stack.length) {
+        const i = stack.pop()!, xx = i % w, yy = (i - xx) / w; if (touching[i]) touches = true;
+        for (const [X, Y] of [[xx - 1, yy], [xx + 1, yy], [xx, yy - 1], [xx, yy + 1]]) { if (!inArea(X, Y)) continue; const j = Y * w + X; if (solid[j] && solidOf[j] === -1) { solidOf[j] = k; px.push(j); stack.push(j); } }
+      }
+      found.push({ px, touches });
+    }
+    // Each grown through the thin differences joined to it (up to `r` + 1 px from a solid one), and across short gaps (3`r`:
+    // a highlight band where the plate and the creative agree) to the solid ones beyond, taken in whole (a stand's foot):
+    // one stand with it.
+    const owner = new Int32Array(n).fill(-1), via = new Int32Array(n).fill(-1), comps: number[][] = found.map(() => []), gap = new Uint8Array(n).fill(255);
+    let frontier: number[] = [];
+    found.forEach((f, k) => { if (!f.touches) return; for (const i of f.px) { owner[i] = k; via[i] = k; gap[i] = 0; comps[k].push(i); } frontier.push(...f.px); });
+    while (frontier.length) {
+      const next: number[] = [];
+      for (const i of frontier) {
+        const xx = i % w, yy = (i - xx) / w, k = via[i];
+        for (const [X, Y] of [[xx - 1, yy], [xx + 1, yy], [xx, yy - 1], [xx, yy + 1]]) {
+          if (!inArea(X, Y)) continue; const j = Y * w + X; if (owner[j] !== -1 || hole[j]) continue;
+          const s = solidOf[j];
+          if (s >= 0) { for (const p of found[s].px) if (owner[p] === -1) { owner[p] = k; via[p] = k; gap[p] = 0; comps[k].push(p); next.push(p); } continue; }
+          const g = gap[i] + 1; if (g > 3 * r || g >= gap[j]) continue;
+          gap[j] = g; via[j] = k; next.push(j);
+          if (removed[j] && g <= r + 1) { owner[j] = k; comps[k].push(j); }
+        }
+      }
+      frontier = next;
+    }
+    // And along its own colour (neighbours stepping by little, as risers.ts joins a stand's region) where the creative is
+    // still a little unlike the plate: a pale stand's foot on a cream podium differs from the plate by less than `T` and
+    // stood as a pink fragment beside it. At most doubling it.
+    const step = (i: number, j: number) => Math.max(Math.abs(clean[i * 3] - clean[j * 3]), Math.abs(clean[i * 3 + 1] - clean[j * 3 + 1]), Math.abs(clean[i * 3 + 2] - clean[j * 3 + 2]));
+    comps.forEach((px, k) => {
+      if (!px.length) return;
+      const cap = px.length * 2; let queue = [...px];
+      while (queue.length && px.length < cap) {
+        const next: number[] = [];
+        for (const i of queue) {
+          const xx = i % w, yy = (i - xx) / w;
+          for (const [X, Y] of [[xx - 1, yy], [xx + 1, yy], [xx, yy - 1], [xx, yy + 1]]) {
+            if (!inArea(X, Y)) continue; const j = Y * w + X;
+            if (owner[j] !== -1 || hole[j] || apart[j] <= 8 || step(i, j) > 6) continue;
+            owner[j] = k; px.push(j); next.push(j);
+          }
+        }
+        queue = next;
+      }
+    });
+    for (const px of comps) {
+      if (!px.length) continue;
+      // Its shape, closed and with its holes filled (a stand's colour near the wall's leaves gaps in the differences).
+      let bx0 = w, by0 = h, bx1 = -1, by1 = -1; for (const i of px) { const xx = i % w, yy = (i - xx) / w; bx0 = Math.min(bx0, xx); bx1 = Math.max(bx1, xx); by0 = Math.min(by0, yy); by1 = Math.max(by1, yy); }
+      // (Two r of room: grown by r, the shape must not reach the edge, where the erosion does not take it back.)
+      bx0 = Math.max(0, bx0 - 2 * r); by0 = Math.max(0, by0 - 2 * r); bx1 = Math.min(w - 1, bx1 + 2 * r); by1 = Math.min(h - 1, by1 + 2 * r);
+      const bw = bx1 - bx0 + 1, bh = by1 - by0 + 1, m = new Uint8Array(bw * bh);
+      for (const i of px) { const xx = i % w, yy = (i - xx) / w; m[(yy - by0) * bw + xx - bx0] = 1; }
+      const closed = boxErode(boxDilate(m, bw, bh, r), bw, bh, r), outside = new Uint8Array(bw * bh), q: number[] = [];
+      for (let k = 0; k < bw * bh; k++) { const xx = k % bw, yy = (k - xx) / bw; if (!closed[k] && !m[k] && (xx === 0 || yy === 0 || xx === bw - 1 || yy === bh - 1)) { outside[k] = 1; q.push(k); } }
+      while (q.length) { const k = q.pop()!, xx = k % bw; for (const j of [xx > 0 ? k - 1 : -1, xx < bw - 1 ? k + 1 : -1, k - bw, k + bw]) if (j >= 0 && j < bw * bh && !closed[j] && !m[j] && !outside[j]) { outside[j] = 1; q.push(j); } }
+      const stand: number[] = []; let inStructure = 0;
+      // (The shared podium below its top surface is the stage's own front, kept: the stands' feet end on its top.)
+      const front = stage ? stage.y + stage.height * 0.3 : Infinity;
+      for (let k = 0; k < bw * bh; k++) {
+        if (outside[k]) continue;
+        const xx = k % bw + bx0, yy = (k - (k % bw)) / bw + by0, i = yy * w + xx; if (hole[i]) continue;
+        if (stage && yy > front && xx >= stage.x && xx < stage.x + stage.width) continue;
+        stand.push(i);
+        if (structures.some(b => xx >= b.x && xx < b.x + b.width && yy >= b.y && yy < b.y + b.height)) inStructure++;
+      }
+      // (A decoration kept in the picture that the AI drew differently stays as the creative has it. Not a stand partly
+      // behind a badge: the badge's box is no outline, and the stand there is the stand.)
+      if (!stand.length || inStructure >= stand.length * 0.85) continue;
+      for (const i of px) { const xx = i % w, yy = (i - xx) / w; if (!(stage && yy > front && xx >= stage.x && xx < stage.x + stage.width)) region[i] = 1; }
+      for (const i of stand) { region[i] = 1; standPx[i] = 1; }
+      if (stand.length >= minSize) stands.push(stand);
+    }
+  }
+  // Faded in across the region's edge where the creative is plain background like the plate: inside it (not where
+  // something was taken out) and outside it (the wall just past an object's outline: its few levels of another tone made a
+  // faint box of each product).
+  const weight = Uint8Array.from(region, v => (v ? 255 : 0)), F = r + 1, G = 2 * r + 2;
+  let inner: Uint8Array = region;
+  for (let k = 0; k < F; k++) {
+    const next = boxErode(inner, w, h, 1);
+    for (let i = 0; i < n; i++) if (inner[i] && !next[i] && !hole[i] && !differs[i] && !standPx[i]) weight[i] = Math.round(255 * (k + 1) / (F + 1));
+    inner = next;
+  }
+  let outer: Uint8Array = region;
+  for (let k = 1; k <= G; k++) {
+    const next = boxDilate(outer, w, h, 1);
+    for (let i = 0; i < n; i++) if (next[i] && !outer[i] && !differs[i] && bg.alpha[i] >= 128) weight[i] = Math.round(255 * (G + 1 - k) / (G + 2));
+    outer = next;
+  }
+  return { region, weight, offset, stands };
+}
+
 export interface PrepareInput {
   source: Rgba; analysis: TextAnalysis | undefined; objects: ProductObject[];
   /** A segmentation provider, used only when `paidApproved`; its inputs are individually masked character/product crops. */
@@ -1040,7 +1293,15 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
     ...overlays.sweep.map(s => ({ id: s.id, box: s.box })),
   ].map(a => onPlate(a.box) ? { ...a, plate: true } : a);
   const overlayFill = fillOverlayPixels(rgb, w, h, overlays.mask, fillAreas);
-  if (input.analysis?.words.some(w => w.origin === 'ai')) refillPatterned(overlayFill.rgb, w, h, overlays.mask, overlayFill.patterned);
+  if (input.analysis?.words.some(w => w.origin === 'ai')) {
+    refillPatterned(overlayFill.rgb, w, h, overlays.mask, overlayFill.patterned);
+    // Text and logos taken off a sunburst: its stripes continued straight from its own geometry (burst.ts) where they were.
+    // Patches left letter-shaped smears across the rays, read as text again ("Get 26% cashback", 9:16 Ganesh creative).
+    // Only what the burst reaches: text on a plate, a page or a badge is not a stripe's and keeps its fill.
+    const wsb = workSize(w, h, input.workSide), small = wsb ? binDown(rgb, w, h, wsb) : rgb, smallMask = wsb ? maskDown(overlays.mask, w, h, wsb, 0) : overlays.mask;
+    const found = findBurst(small, wsb?.w ?? w, wsb?.h ?? h, i => !smallMask[i]);
+    if (found) burstFill(rgb, w, h, overlays.mask, wsb ? burstAtFullSize(found, wsb.fx, wsb.fy) : found, { known: i => !overlays.mask[i], stage: () => false, through: () => false }, new Uint8Array(n), overlayFill.rgb);
+  }
   // Preserve the established pattern-aware fill for OCR-only legacy fixtures. AI word manifests use narrow patches.
   const cleanFill = input.analysis?.words.some(w => w.origin === 'ai')
     ? { rgb: overlayFill.rgb, structural: 0, estimated: overlays.mask.reduce((n,v) => n+v,0), trustedPercent: overlayFill.uncertain.length ? 0 : 100 }
@@ -1052,20 +1313,20 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
   // One check per text block (or logo), not one per word: where the background behind it was continued, an estimate.
   const logoIds = new Set(overlayLogos(input.analysis).map(l => l.id));
   const blockOf = (id: string) => (logoIds.has(id) ? 'logos' : input.analysis?.words.find(w => w.id === id)?.groupId ?? id.split(':')[0]);
-  // A decoration's own lettering (a badge's words): its artwork (artworkText.ts) — the original's pixels are put back in
-  // the base after the text removal, and its words are never drawn again as live text over it.
-  const artwork = artworkGroups({ width: w, height: h }, input.objects.filter(o => !o.hidden && o.kind === 'decoration').map(o => ({ label: o.label, box: o.box })),
-    (input.analysis?.words ?? []).filter(x => x.review.status !== 'rejected').map(x => ({ groupId: x.groupId, box: x.source?.box ?? x.box })));
-  const artworkIds = new Set(artwork.map(g => g.groupId));
+  // Every accepted word is editable text and out of the base, a badge's or a signboard's lettering too. (Lettering inside
+  // a "compact decoration" was once put back into the base as artwork: on the 9:16 Ganesh creative that took the whole
+  // headline, its signboard just under the size limit, and left it baked in and hidden from the editor.)
   const fills = new Map<string, Box[]>();
   for (const a of input.known ? [] : overlayFill.uncertain) fills.set(blockOf(a.id), [...(fills.get(blockOf(a.id)) ?? []), a.box]);
   for (const [block, boxes] of fills) {
-    if (artworkIds.has(block)) continue;
     const x = Math.min(...boxes.map(b => b.x)), y = Math.min(...boxes.map(b => b.y)), what = block === 'logos' ? `the ${boxes.length} logo${boxes.length === 1 ? '' : 's'}` : `“${(input.analysis?.groups.find(g => g.id === block)?.label ?? 'this text').slice(0, 50)}”`;
     issues.push({ id: `fill-${block}`, area: { x, y, width: Math.max(...boxes.map(b => b.x + b.width)) - x, height: Math.max(...boxes.map(b => b.y + b.height)) - y }, blocking: false,
       message: `Behind ${what} the artwork was continued where ${block === 'logos' ? 'they were' : 'the text was'} (an estimate, not the original pixels). Inspect it; correct the detection or supply clean artwork if needed.` });
   }
   assertOverlaysGone(rgb, clean, overlays.mask, w, overlays.areas);
+  // A logo whose box stops short of it leaves the rest in the background, under the logo and when it is moved.
+  for (const l of overlayLeftovers(clean, w, h, overlayLogos(input.analysis).map(s => ({ id: s.id, label: s.label, box: s.original.placement }))))
+    issues.push({ id: `leftover-${l.id}`, area: l.area, blocking: true, message: `Part of “${l.label}” is still in the background just outside its box (${l.pixels} px): it would stay behind when the logo is moved. Draw its box round all of it in the review, then prepare again.` });
   const cleanPng = await sharp(Buffer.from(clean), { raw: { width: w, height: h, channels: 3 } }).png().toBuffer();
   for (const area of overlays.areas) {
     const overlap = input.objects.find(o => decomposesObject(o) &&
@@ -1215,7 +1476,36 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
   // Behind the elements Seedream returned (and their soft edges): Seedream's own background layer, its colours matched to
   // the creative's just around them (a ring 2–5 px out) — an AI estimate, marked as such; elsewhere the local rebuild.
   const aiFilled = new Uint8Array(n);
-  if (ai?.background) {
+  if (ai?.background && !input.known) {
+    // An uploaded creative: the AI's clean plate over everything it took out with the objects (aiPlate), and what of that
+    // the creative shows besides the objects (stands, a backdrop panel) on stand layers of their own, over it.
+    const stage = input.objects.filter(o => !o.hidden && o.kind === 'podium' && o.layer !== 'own').sort((a, b) => b.box.width * b.box.height - a.box.width * a.box.height)[0]?.box;
+    const bg = ai.background, plate = aiPlate(clean, bg, w, h, hole, live.filter(o => o.kind === 'product' || o.kind === 'character').map(o => ({ kind: o.kind, box: o.box, mask: masks.get(o.id)! })),
+      input.objects.filter(o => !o.hidden && (o.kind === 'decoration' || o.kind === 'frame') && !decomposesObject(o)).map(o => o.box), stage);
+    for (let i = 0; i < n; i++) if (plate.weight[i] && !exact[i]) {
+      const t = plate.weight[i] / 255;
+      for (let c = 0; c < 3; c++) base[i * 3 + c] = Math.round(base[i * 3 + c] * (1 - t) + Math.max(0, Math.min(255, bg.rgb[i * 3 + c] + plate.offset[c])) * t);
+      if (plate.region[i]) { baseFill.patched[i] = 0; baseFill.unknown[i] = 1; aiFilled[i] = 1; }
+    }
+    if (plate.stands.length) {
+      // (Each object in front with the rim rebuilt around it: the stand is completed up to it, no seam of the plate between.)
+      const fronts = live.filter(o => o.kind === 'product' || o.kind === 'character').map(o => {
+        const m = masks.get(o.id)!, around = boxDilate(m, w, h, rimR + 1), own = Uint8Array.from(m);
+        for (let i = 0; i < n; i++) if (around[i] && hole[i]) own[i] = 1;
+        return { box: o.box, kind: o.kind as 'product' | 'character', mask: own };
+      });
+      risers.push(...completeStands(clean, w, h, plate.stands.map(px => ({ px, source: 'auto' as const })), fronts, new Uint8Array(n)));
+      risers.sort((a, b) => a.seenBottom - b.seenBottom);
+    }
+    for (let i = 0; i < n; i++) if (plate.region[i]) hole[i] = 1;
+    // (To see: the plate's region in violet, each stand in orange, over the creative without text.)
+    if (input.saveImage) {
+      const view = Buffer.alloc(n * 3), onStand = new Uint8Array(n); for (const px of plate.stands) for (const i of px) onStand[i] = 1;
+      for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++) view[i * 3 + c] = onStand[i] ? [234, 88, 12][c] * 0.6 + clean[i * 3 + c] * 0.4 : plate.region[i] ? [124, 58, 237][c] * 0.5 + clean[i * 3 + c] * 0.5 : clean[i * 3 + c] * 0.6;
+      input.saveImage('ai-plate.png', await sharp(view, { raw: { width: w, height: h, channels: 3 } }).png().toBuffer());
+    }
+    input.save('ai-plate.json', { offset: plate.offset, regionPercent: round(100 * plate.region.reduce((s2, v) => s2 + v, 0) / n, 2), stands: plate.stands.map(px => px.length) });
+  } else if (ai?.background) {
     const bg = ai.background, owned = new Uint8Array(n); for (const id of ai.masks.keys()) { const m = masks.get(id); if (m) for (let i = 0; i < n; i++) if (m[i]) owned[i] = 1; }
     const near = dilate(owned, w, h, Math.max(2, rimR + 1)), ring = dilate(owned, w, h, Math.max(5, rimR + 4)), d: number[][] = [[], [], []];
     for (let i = 0; i < n; i += 3) if (ring[i] && !near[i] && !hole[i] && bg.alpha[i] >= 128) for (let c = 0; c < 3; c++) d[c].push(clean[i * 3 + c] - bg.rgb[i * 3 + c]);
@@ -1246,7 +1536,6 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
     if (filled) issues.push({ id: 'ai-background', area: { x: 0, y: 0, width: w, height: h }, blocking: false, message: `Behind the elements Seedream decomposed, ${round(100 * filled / n, 1)}% of the canvas is Seedream's own reconstruction of the background (an AI estimate, never the original pixels): it shows only when they are moved or hidden. Inspect Background only.` });
     for (const id of ai.unmatched) { const o = input.objects.find(x => x.id === id)!; issues.push({ id: `ai-missing-${id}`, area: o.box, elementId: id, blocking: !!input.requireAiMatches, message: `Seedream returned no layer for “${o.label}”: it was cut out on this computer instead. Check its edges.` }); }
   }
-  if (artwork.length && !input.known) restoreArtworkRaw(rgb, base, 3, w, h, artwork);
   // Opaque everywhere: what was behind the objects is rebuilt (an estimate), never a transparent hole.
   const baseRgba=Buffer.alloc(n*4);
   for(let i=0;i<n;i++){ for(let c=0;c<3;c++)baseRgba[i*4+c]=base[i*3+c];baseRgba[i*4+3]=255; }
@@ -1382,7 +1671,7 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
     const png = await sharp(source.data, { raw: { width: w, height: h, channels: 4 } }).extract({ left: b.x, top: b.y, width: b.width, height: b.height }).png().toBuffer();
     overlayParts.push(`<image x="${logo.box.x}" y="${logo.box.y}" width="${logo.box.width}" height="${logo.box.height}" href="data:image/png;base64,${png.toString('base64')}"/>`);
   }
-  for (const word of input.analysis?.words ?? []) if (word.review.status !== 'rejected' && !artworkIds.has(word.groupId)) overlayParts.push(textSvg({
+  for (const word of input.analysis?.words ?? []) if (word.review.status !== 'rejected') overlayParts.push(textSvg({
     id: word.id, wordId: word.id, groupId: word.groupId, line: 0, order: word.order, text: word.text,
     x: word.box.x + (word.style.originDx ?? 0), baselineY: word.box.y + word.style.baseline, rotation: word.box.rotation,
     style: creativeStyleOf(word.style), hidden: false, locked: false, z: word.order }, 0, 0));
@@ -1392,7 +1681,7 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
   //   different  a word's letters drawn where the original's are not, or the other way round (a quarter of either ink out
   //              of a stroke's reach of the other): its face, size or box is off ("CHATURTHI" drawn twice the height)
   {
-    const live = (input.analysis?.words ?? []).filter(x => x.review.status !== 'rejected' && !artworkIds.has(x.groupId));
+    const live = (input.analysis?.words ?? []).filter(x => x.review.status !== 'rejected');
     const asText = (x: (typeof live)[number]) => ({ id: x.id, wordId: x.id, groupId: x.groupId, line: 0, order: x.order, text: x.text, x: x.box.x + (x.style.originDx ?? 0), baselineY: x.box.y + x.style.baseline, rotation: x.box.rotation, style: creativeStyleOf(x.style), hidden: false, locked: false, z: x.order });
     const inkOf = (x: (typeof live)[number]) => textInkExact(asText(x));
     const together: string[] = [], different = new Map<string, string[]>();

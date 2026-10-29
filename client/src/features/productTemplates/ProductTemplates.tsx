@@ -152,6 +152,7 @@ function ProductUpload({ onCancel, onCreated }: { onCancel: () => void; onCreate
         <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary ws-btn-large" disabled={!file || !!busy} onClick={() => void create()}>
           <Upload size={15} aria-hidden="true" />{busy === 'uploading' ? 'Uploading…' : busy === 'reading' ? 'Reading the picture…' : regenerate ? `Upload and regenerate in ${REUSE_ASPECT_LABELS[size]}` : 'Upload and find elements'}</button></div>
         <p className="ot-muted">Next you check what was found, then FrameFlow prepares the layers and you save the template{size !== 'original' ? ` in ${REUSE_ASPECT_LABELS[size]}` : ''}.</p>
+        {isOfferAspectRatio(size) && !regenerate && <p className="ot-muted ot-small" data-testid="basic-layout-note">Without AI regeneration, the {REUSE_ASPECT_LABELS[size]} master is laid out automatically from your original at the Size step: a basic layout (free), not an AI-redesigned creative.</p>}
       </div>
       {preview && <div className="prt-upload-preview">
         {sheet?.sheet ? <>
@@ -314,7 +315,9 @@ function FitText({ view, onDone, onError }: { view: ProductView; onDone: (v: Pro
     setBusy(true); setNote('');
     void productApi.fitText(view.template.id, view.template.revision).then(r => {
       onDone(r);
-      setNote(r.fit.moved ? `${r.fit.moved} line${r.fit.moved === 1 ? '' : 's'} moved onto ${r.fit.moved === 1 ? 'its' : 'their'} letters. Check the boxes, then prepare again.` : 'Every line already sits on its letters, or could not be read clearly enough to move: nothing was changed.');
+      const review = r.fit.lines.filter(l => l.needsReview);
+      const changed = r.fit.moved ? `${r.fit.moved} line${r.fit.moved === 1 ? '' : 's'} adjusted. Check the boxes, then prepare again.` : 'No text boxes changed.';
+      setNote(`${changed}${review.length ? ` Check and correct these lines manually: ${review.map(l => `“${l.text}” (${l.reason ?? 'placement uncertain'})`).join('; ')}.` : ''}`);
     }).catch((e: Error) => onError(e.message)).finally(() => setBusy(false));
   };
   return <div className="ot-row" data-testid="fit-text"><button type="button" className="ws-btn" disabled={busy} onClick={run}>{busy ? 'Fitting the text to its letters…' : 'Fit text to the letters (free)'}</button>
