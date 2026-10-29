@@ -37,6 +37,18 @@ For the template's own cut-out, the check uses the picture it was cut from (`sna
 
 A layer that differs almost everywhere was redrawn as a whole, so then only what is hidden counts. Everything else is **verified** and kept byte for byte. There is no such evidence for a replaced or refined picture, or for a master adapted to another canvas, so nothing is marked there.
 
+**The background plate's content in a product layer.** In a second real case, the backdrop's festive wheel (purple, green, yellow) stood in front of a refrigerator's top-right corner. It was cut out with the refrigerator, while the background plate (`snapshot.base`) also holds it, so the wheel moved with the refrigerator as a copy. The checks above cannot see this: the wheel was not a front layer, and its pixels are the picture's.
+
+The plate check (`plateContent`, products only) marks the layer's solid pixels that match the plate at the same place. Both are softened (σ 1.5) or compared as they are, within 2 px, at most 32 apart in a channel, because they are separate redraws. A patch is marked only when it:
+
+- reaches the layer's outline;
+- is mostly in colours rare among the object's own pixels, and only those pixels are marked;
+- belongs to a layer that matches the plate in no more than 30% of its pixels.
+
+The margin extends 4% into rare colours, catching the ring's dots, and 2% into the rest, catching its tinted soft edge. These pixels are rebuilt as the product, and its outline is kept.
+
+Characters and decorations are not plate-checked, because their outlines are not regular enough to rebuild in place. On the real right dancer, a brass pot and a border strip of the backdrop are baked into the layer. They would need to become transparent, which is a separate change. Fully clear pixels of a refined picture carry no colour.
+
 - **Free rebuild:** defects are continued from the nearest verified pixels along each row and column, weighted by 1/distance². The door's shading and divider line carry through. The outline is kept. One-pixel spurs of the estimated outline are cleared, and the inside of a defect is made solid.
 - **AI path:** the defects are painted magenta in the request and the prompt asks for them to be redrawn. Only verified pixels are put back over the answer. The earlier restore put back every solid pixel, which pasted the grey block over the repair. A defect the model left magenta or clear is rebuilt locally and counted (`unrepairedPixels`).
 
@@ -64,6 +76,7 @@ Routes are `GET /:id/creatives/:cid/objects/:oid/refine` (estimate) and `POST �
 ## Limits
 
 - Refine Cutout is in the product creative editor (Offer Templates → Use template → the creative, including the "· master editor" one), not in the main Konva editor. An applied refinement is a new creative revision: the next Edit master → Open in Editor opens it, and saving from either editor keeps it. A duplicate gets its own copy of the refined picture.
+- A decoration rebuilt out of a product stays in the background plate. In the composed creative it is behind the product, where it had overlapped the product's corner in the picture. Putting it in front would need a layer of its own.
 - The free rebuild is a continuation, not a redraw. Where the hidden part holds a feature the visible part does not continue, it carries the nearest feature across. On the real refrigerator, this leaves a small dark patch about 12 × 13 px beside the dispenser. The AI path redraws such areas.
 - The AI repair has not been checked live: its quality on real cut-outs is unverified.
 - Some templates have no regeneration record, so the word check does not apply to them. These are a text-free or Original-size variation, and a template made directly from an upload.

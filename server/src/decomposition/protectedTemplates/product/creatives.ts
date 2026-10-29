@@ -149,8 +149,8 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
   const refined = async (id: string, cid: string, png: Buffer) => { const file = `pcr-${cid.slice(3)}-${sha256(png).slice(0, 12)}.png`; if (!store.has(id, file)) store.write(id, file, png); return file; };
   /**
    * Where the object's picture is not verified (cutoutDefects): only for the template's own cut-out, checked against the
-   * picture it was cut from and the layers in front of it there (the template's placements). A replaced or refined
-   * picture, or a master adapted to another canvas, has no such evidence: nothing is marked.
+   * picture it was cut from, the layers in front of it there (the template's placements) and the background plate. A
+   * replaced or refined picture, or a master adapted to another canvas, has no such evidence: nothing is marked.
    */
   const defectsOf = async (id: string, c: ProductCreative, o: ProductCreativeObject, png: Buffer) => {
     if (o.asset.kind !== 'template') return undefined;
@@ -158,10 +158,13 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
     if (!own?.cutout || own.cutout.file !== o.asset.file || s.adaptation || !store.has(id, s.source.file)) return undefined;
     const p = own.cutout.placement, meets = (q: PixelRect) => q.x < p.x + p.width && p.x < q.x + q.width && q.y < p.y + p.height && p.y < q.y + q.height;
     const front = s.objects.filter(x => x.id !== o.id && x.cutout && x.z > own.z && meets(x.cutout.placement) && store.has(id, x.cutout.file)).map(x => ({ png: store.read(id, x.cutout!.file), placement: x.cutout!.placement }));
-    const d = await cutoutDefects(png, { picture: store.read(id, s.source.file), placement: p, front });
+    // (The plate's content is rebuilt as the object where it was — right for a product, whose hidden corner is still
+    // its own; a character's or a decoration's outline is not that regular, so the plate check is for products only.)
+    const plate = own.kind === 'product' && store.has(id, s.base.file) ? { plate: store.read(id, s.base.file) } : {};
+    const d = await cutoutDefects(png, { picture: store.read(id, s.source.file), placement: p, front, ...plate });
     return d.count ? d : undefined;
   };
-  const defectReport = (d: Awaited<ReturnType<typeof defectsOf>>) => ({ defectPixels: d?.count ?? 0, hiddenPixels: d?.hiddenPixels ?? 0, differingPixels: d?.differingPixels ?? 0 });
+  const defectReport = (d: Awaited<ReturnType<typeof defectsOf>>) => ({ defectPixels: d?.count ?? 0, hiddenPixels: d?.hiddenPixels ?? 0, differingPixels: d?.differingPixels ?? 0, foreignPixels: d?.foreignPixels ?? 0 });
   /** Free, on this computer: the cleaned picture to compare with the current one. The creative is not changed. */
   const refineLocal = (id: string, cid: string, objectId: string) => locked(`${id}:${cid}`, async () => {
     const { c, o, png } = refinable(id, cid, objectId), d = await defectsOf(id, c, o, png), r = await refineCutout(png, d?.mask);

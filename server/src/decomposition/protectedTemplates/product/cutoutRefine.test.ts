@@ -116,3 +116,48 @@ describe('Refine Cutout: what a front layer hid is rebuilt, never trusted', { ti
     expect(Math.abs(at(l, 100, 140)[0] - Math.round(200 - 140 * 0.6))).toBeLessThanOrEqual(6); expect(at(l, 100, 140)[1]).toBeGreaterThan(60);
   });
 });
+
+/**
+ * The second defect seen in a real creative: the backdrop's festive wheel (purple, green, yellow) in front of the
+ * refrigerator's top-right corner, cut out with it — while the background plate holds the wheel too, so it moved with the
+ * refrigerator as a copy; and three pixels of the green backdrop in a notch at the top of the door gap. Picture 240 × 200;
+ * the refrigerator at (40, 20), 120 × 170, a grey door with a dark gap at x 100; the wheel centred at (165, 30), r 34 (its left part in the layer), the notch at layer x 59–61.
+ */
+describe('Refine Cutout: the background plate\'s own content in a product layer is rebuilt as the product', { timeout: 60000 }, () => {
+  const PW = 240, PH = 200, FX = 40, FY = 20, FW = 120, FH = 170, CX = 165, CY = 30, RAD = 34;
+  const raw = (w: number, h: number, ch: number, f: (x: number, y: number) => number[]) => { const b = Buffer.alloc(w * h * ch); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) b.set(f(x, y), (y * w + x) * ch); return b; };
+  const png = (b: Buffer, w: number, h: number, ch: 3 | 4) => sharp(b, { raw: { width: w, height: h, channels: ch } }).png().toBuffer();
+  const door = (X: number, Y: number) => { const v = Math.round(200 - (Y - FY) * 0.5) - (X === 100 ? 110 : 0); return [v, v, v + 2]; };
+  /** The wheel: a yellow ring, a purple band, a green middle (shifted by `d` px and lifted by `lift` — the plate's redraw). */
+  const wheel = (X: number, Y: number, d = 0, lift = 0) => { const r = Math.hypot(X - CX - d, Y - CY); return r > RAD ? undefined : (r > RAD - 4 ? [240, 220, 20] : r > RAD - 14 ? [140, 70, 230] : [0, 180, 110]).map(v => Math.min(255, v + lift)); };
+  const backdrop = [10, 170, 115], speck = (x: number, y: number) => x >= 59 && x < 62 && y >= 1 && y < 4;
+  const plateOf = (wall?: number[]) => png(raw(PW, PH, 3, (X, Y) => wheel(X, Y, 1, 8) ?? wall ?? backdrop), PW, PH, 3);
+  /** The refrigerator's saved cut-out: its door, the wheel over its corner, the backdrop in the notch (row 0 of the notch clear). */
+  const saved = () => png(raw(FW, FH, 4, (x, y) => { const X = FX + x, Y = FY + y; if (speck(x, y)) return [...backdrop, 255]; if (x >= 59 && x < 62 && y === 0) return [0, 0, 0, 0]; return [...(wheel(X, Y) ?? door(X, Y)), 255]; }), FW, FH, 4);
+  const picture = () => png(raw(PW, PH, 3, (X, Y) => wheel(X, Y) ?? (X >= FX && X < FX + FW && Y >= FY && Y < FY + FH ? door(X, Y) : backdrop)), PW, PH, 3);
+  const rgba = async (p: Buffer) => sharp(p).ensureAlpha().raw().toBuffer(), at = (p: Buffer, x: number, y: number) => [...p.subarray((y * FW + x) * 4, (y * FW + x) * 4 + 4)];
+  const context = async (plate: Buffer) => ({ picture: await picture(), placement: { x: FX, y: FY, width: FW, height: FH }, front: [], plate });
+
+  it('marks the wheel and the backdrop speck — not the door — and rebuilds them as the door; the outline is kept', async () => {
+    const cut = await saved(), d = await cutoutDefects(cut, await context(await plateOf()));
+    expect(d.hiddenPixels).toBe(0); expect(d.foreignPixels).toBeGreaterThan(500);
+    // The wheel's ring, band and middle; the speck; never the door far from them.
+    for (const [x, y] of [[110, 10], [100, 10], [93, 10], [60, 2]]) expect(d.mask[y * FW + x]).toBe(1);
+    for (const [x, y] of [[20, 60], [60, 120], [110, 160], [40, 30]]) expect(d.mask[y * FW + x]).toBe(0);
+    const r = await refineCutout(cut, d.mask), a = await rgba(cut), b = await rgba(r.png);
+    // No purple, green or yellow left: every solid pixel grey (its channels within 12 of each other).
+    for (let i = 0; i < FW * FH; i++) if (b[i * 4 + 3] >= 128) expect(Math.max(b[i * 4], b[i * 4 + 1], b[i * 4 + 2]) - Math.min(b[i * 4], b[i * 4 + 1], b[i * 4 + 2])).toBeLessThanOrEqual(12);
+    // The corner is the door at that height; the gap carries on to the top; the outline (every alpha) is as it was.
+    expect(Math.abs(at(b, 110, 10)[0] - Math.round(200 - 10 * 0.5))).toBeLessThanOrEqual(8);
+    for (let i = 0; i < FW * FH; i++) expect(b[i * 4 + 3]).toBe(a[i * 4 + 3]);
+    for (let y = 0; y < FH; y += 3) for (let x = 0; x < FW; x += 3) if (!d.mask[y * FW + x]) expect(at(b, x, y)).toEqual(at(a, x, y));
+  });
+
+  it('never marks a grey door against a grey wall the plate continued behind it', async () => {
+    // The plate behind the refrigerator: a grey close to its door (no wheel, no backdrop): nothing of the door is foreign.
+    const wall = await png(raw(PW, PH, 3, (X, Y) => (X >= FX && X < FX + FW && Y >= FY && Y < FY + FH ? door(X, Y).map(v => v + 6) : backdrop)), PW, PH, 3);
+    const door1 = await png(raw(FW, FH, 4, (x, y) => [...door(FX + x, FY + y), 255]), FW, FH, 4);
+    const d = await cutoutDefects(door1, { picture: await png(raw(PW, PH, 3, (X, Y) => (X >= FX && X < FX + FW && Y >= FY && Y < FY + FH ? door(X, Y) : backdrop)), PW, PH, 3), placement: { x: FX, y: FY, width: FW, height: FH }, front: [], plate: wall });
+    expect(d.foreignPixels).toBe(0); expect(d.count).toBe(0);
+  });
+});
