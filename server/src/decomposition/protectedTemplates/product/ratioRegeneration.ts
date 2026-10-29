@@ -56,16 +56,18 @@ export function regenerationPrompt(ratio: OfferAspectRatio, texts: string[] = []
 }
 
 /**
- * The design directions of AI variations, one per variation (in turn): genuinely different arrangements of the creative's
- * own elements. None names a headline, an offer or a panel for words: told "the headline and offer in a bold rounded
- * panel", the model gave a text-free creative a panel of invented offers ("Festive Bonanza … cashback … scan to offer").
+ * The design directions of AI variations, one per variation (in turn): visibly different designs of the same template
+ * family — the products, characters, decorations and existing text containers placed and scaled differently, always one
+ * integrated campaign artwork. None names a headline, an offer or a panel for words (told "the headline and offer in a
+ * bold rounded panel", the model gave a text-free creative a panel of invented offers), and none splits the creative
+ * into a picture and a detached board of text.
  */
 export const VARIATION_DIRECTIONS = [
-  'Same arrangement, refreshed: keep the original placement of the elements and give it a new background treatment, decoration and colour styling.',
-  'Product focus: the products larger and more central on a striking stage, the other existing elements rearranged around them.',
-  'Split composition: the characters and products grouped on one side, the rest of the existing elements balanced on the other side.',
-  'Framed composition: a rich decorative frame or arch around the existing elements, on a patterned backdrop.',
-  'Bold modern: bold colour-blocked shapes and a dynamic, asymmetric arrangement of the existing elements.',
+  'Refreshed styling: close to the original arrangement, with a renewed background treatment, decoration and colour palette.',
+  'Product spotlight: the products larger and more prominent on a framed stage, the characters, decorations and existing text containers resized and repositioned around them.',
+  'Shifted balance: the characters and products moved to a different part of the canvas and the existing text containers rebalanced around them, all within one integrated composition.',
+  'Framed composition: a rich festive frame or arch around the content, the elements regrouped and rescaled inside it.',
+  'Alternate campaign palette: a different bold palette suited to the theme, the decorations, products and existing text containers re-proportioned for a fresh look.',
 ] as const;
 const THEMES: Record<Exclude<AiVariationTheme, 'custom'>, string> = {
   original: 'Keep the original festival or theme and its mood.',
@@ -75,23 +77,33 @@ const THEMES: Record<Exclude<AiVariationTheme, 'custom'>, string> = {
   'karwa-chauth': 'Restyle it for Karwa Chauth: a night sky with a glowing full moon, sieve (channi) and karwa motifs, deep red and gold, a soft warm glow.',
 };
 /**
- * The instruction for one AI design variation: a new design of this creative in its direction (VARIATION_DIRECTIONS, in
- * turn) and theme, for the shape — the same brand and business content, every word exactly (when known), nothing added
- * but the theme's decoration. `shape`: the canvas in words; `trimmed`: made wider than the model can and trimmed after.
+ * The instruction for one AI design variation: a distinct design within this creative's own template family — its brand
+ * identity, hierarchy, design grammar and integrated text containers kept (they may move and resize; text never goes to a
+ * detached side panel or board) — in its direction (VARIATION_DIRECTIONS, in turn) and theme, for the shape; the same brand and
+ * business content, every word exactly (when known), nothing added but the theme's decoration. `shape`: the canvas in
+ * words; `trimmed`: made wider than the model can and trimmed after.
  */
 export function variationPrompt(input: { shape: string; theme: AiVariationTheme; customTheme?: string; index: number; count: number; texts?: string[]; products?: string[]; trimmed?: boolean }) {
-  const quoted = (input.texts ?? []).map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 40).map(t => `"${t.replace(/"/g, '\'')}"`);
+  // Each text once in the list with how often it occurs in the original (a repeated logo line, a repeated price).
+  const occurrences = new Map<string, number>();
+  for (const t of (input.texts ?? []).map(x => x.replace(/\s+/g, ' ').trim()).filter(Boolean)) occurrences.set(t, (occurrences.get(t) ?? 0) + 1);
+  const quoted = [...occurrences].slice(0, 40).map(([t, n]) => `"${t.replace(/"/g, '\'')}"${n > 1 ? ` (×${n})` : ''}`);
   const named = [...new Set((input.products ?? []).map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean))].slice(0, 12);
   const theme = input.theme === 'custom' ? `Restyle it for this theme: ${(input.customTheme ?? '').replace(/\s+/g, ' ').trim().slice(0, 160)}.` : THEMES[input.theme];
   return [
-    `Create design variation ${input.index + 1} of ${input.count} of this exact advertising creative, as a ${input.shape} canvas filled edge to edge.`,
+    `Create variation ${input.index + 1} of ${input.count} of this exact campaign template, as a ${input.shape} canvas filled edge to edge: the same template family and design system restyled, not a new advertising composition.`,
     VARIATION_DIRECTIONS[input.index % VARIATION_DIRECTIONS.length],
-    theme,
-    'It must stay recognisably the same campaign from the same brand: a professional, polished design with strong colours; any text of the original keeps its hierarchy and readable typography. Do not stretch, squash, letterbox or add borders.',
-    'You may change the background, decoration, colours, layout, hierarchy, and the placement and relative scale of the elements. Keep every element of the original: the same logos, unchanged and whole; the same products and devices with their printed details; the same illustrated characters; the same QR codes.',
+    `${theme} The festival or theme changes the decoration, colours, motifs and atmosphere, never the content.`,
+    'Keep the original\'s template family: its brand identity, visual hierarchy, design grammar and composition style — one integrated campaign artwork. Within it, the placement and scale of the products, characters, decorations and existing text containers may vary as the direction says.',
+    quoted.length
+      ? 'Its text stays integrated inside the artwork, in the same kinds of banners, rounded boxes, pills, ribbons, badges or strips it sits in now (they may move or resize with the composition) — never moved into a detached side panel, a separate information board or a split layout of picture and text.'
+      : 'Keep the composition free of any text panel, box or board, exactly as the original.',
+    'Where the canvas shape differs from the original, adapt the composition to that shape, keeping it one integrated artwork of the same family rather than turning it into a different kind of poster.',
+    'Restyle the background treatment, colours, festive decoration and motifs, frames, lighting and atmosphere, in a bright, bold, polished campaign style. It must look like the same polished campaign template family from the same brand, any text keeping its hierarchy and readable typography. Do not stretch, squash or letterbox.',
+    'Keep every element of the original: the same logos, unchanged and whole; the same products and devices with their printed details; the same illustrated characters; the same QR codes.',
     named.length ? `The products (${named.join(', ')}) stay exactly these products.` : '',
     quoted.length
-      ? `The only text allowed anywhere in the result is exactly these texts of the original, each exactly once, with the same words, spelling, numbers and symbols: ${quoted.join('; ')}. No other words, letters or numbers may appear — no new headline, slogan, offer, price, discount, cashback, date, label, call to action, or panel, banner or badge with writing.`
+      ? `The only text allowed anywhere in the result is the original's own text, with the same words, spelling, numbers and symbols, each text appearing as many times as it does in the original (one that repeats there stays repeated, marked ×N): ${quoted.join('; ')}. No other words, letters or numbers may appear — no new headline, slogan, offer, price, discount, cashback, date, label, call to action, or panel, banner or badge with writing.`
       : 'This creative has no text: the result must contain no words, letters or numbers anywhere — no headline, slogan, offer, price, discount, cashback, date, label, call to action, or panel, banner or badge with writing — apart from what is printed on the products and logos themselves.',
     'Do not add, remove, translate or rewrite any text, offer, price, date or term. Do not add any new logo, brand name, QR code, product or person. Decoration for the theme is the only new content allowed, and it never contains text.',
     input.trimmed ? 'Keep a thin band along the top and bottom edges (about 2 % of the height each) as continued background only: no text, logo, product or character may touch it.' : '',
@@ -348,17 +360,22 @@ export async function protectRegenerated(input: { original: Buffer; result: Buff
   if (extra.length) checks.blocking.push(`The regenerated creative has a QR code that is not one of the original's (it scans to something else). Do not use this result: regenerate it.`);
   // Words of the original (read on this computer, confidently) that the result lacks: for the person to check.
   if (input.recognizer) {
-    const read = async (p: Buffer) => { const m = await sharp(p).metadata(); return (await input.recognizer!.recognize({ image: p, region: { x: 0, y: 0, width: m.width ?? 1, height: m.height ?? 1 }, purpose: 'template' }))
-      .filter(w => w.confidence >= 0.75).map(w => w.text.normalize('NFKD').replace(/[^\p{L}\p{N}₹%]/gu, '')).filter(w => /\p{L}/u.test(w) && w.replace(/[^\p{L}\p{N}]/gu, '').length >= 3); };
-    const before = await read(input.original), after = new Map<string, number>();
-    for (const w of await read(png)) after.set(w.toLowerCase(), (after.get(w.toLowerCase()) ?? 0) + 1);
-    const result = [...after.entries()].flatMap(([w, n]) => Array<string>(n).fill(w));
+    // Every confident word read; words of three or more letters for what is missing, and those plus any amount, price,
+    // percentage or date (a token with a digit, ₹ or %) for what was added — an invented "₹500" or "50%" has no letters.
+    const tokens = async (p: Buffer) => { const m = await sharp(p).metadata(); return (await input.recognizer!.recognize({ image: p, region: { x: 0, y: 0, width: m.width ?? 1, height: m.height ?? 1 }, purpose: 'template' }))
+      .filter(w => w.confidence >= 0.75).map(w => w.text.normalize('NFKD').replace(/[^\p{L}\p{N}₹%]/gu, '')); };
+    const wordy = (w: string) => /\p{L}/u.test(w) && w.replace(/[^\p{L}\p{N}]/gu, '').length >= 3, numeric = (w: string) => /[\d₹%]/u.test(w) && w.length >= 2;
+    const read0 = await tokens(input.original), read1 = await tokens(png);
+    const before = read0.filter(wordy), after = new Map<string, number>();
+    for (const w of read1.filter(wordy)) after.set(w.toLowerCase(), (after.get(w.toLowerCase()) ?? 0) + 1);
+    const result = read1.filter(w => wordy(w) || numeric(w)).map(w => w.toLowerCase());
     for (const w of before) { const n = after.get(w.toLowerCase()) ?? 0; if (n > 0) after.set(w.toLowerCase(), n - 1); else if (!checks.missingWords.includes(w)) checks.missingWords.push(w); }
     checks.missingWords = checks.missingWords.slice(0, 20);
     // And the other way: words read in the result that the original does not have — copy the model may have invented.
     // (A word one letter off one of the original's, or part of one, is a misreading, not new copy.)
-    const known = new Set([...before, ...(input.knownWords ?? []).flatMap(t => t.normalize('NFKD').split(/\s+/)).map(w => w.replace(/[^\p{L}\p{N}₹%]/gu, ''))].map(w => w.toLowerCase()).filter(Boolean)), near = (a: string, b: string) => a.includes(b) || b.includes(a) || oneEdit(a, b);
-    checks.extraWords = [...new Set(result.filter(w => !known.has(w) && ![...known].some(k => near(w, k))))].slice(0, 20);
+    const known = new Set([...read0, ...(input.knownWords ?? []).flatMap(t => t.normalize('NFKD').split(/\s+/)).map(w => w.replace(/[^\p{L}\p{N}₹%]/gu, ''))].map(w => w.toLowerCase()).filter(Boolean)), near = (a: string, b: string) => a.includes(b) || b.includes(a) || oneEdit(a, b);
+    // (An amount, price, percentage or date matches only exactly: "₹600" one digit from "₹500" is a new price, not a misreading.)
+    checks.extraWords = [...new Set(result.filter(w => !known.has(w) && (numeric(w) || ![...known].some(k => near(w, k)))))].slice(0, 20);
   }
   return { png, checks };
 }

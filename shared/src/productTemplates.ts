@@ -509,6 +509,15 @@ export interface AiVariationResult {
   /** Requests made for this variation (more than one: made again on its own, approved). */
   attempts?: number;
 }
+/**
+ * Words added to a variation that look like new business content — a price, an amount, a percentage, a date, an offer or
+ * a promotional claim. Never accepted with the general warnings: each is confirmed on its own (the reading on this
+ * computer can misread, so it is reviewed, never decided automatically).
+ */
+const BUSINESS_WORD = /[\d₹$€£%]|^(?:rs|inr|cash|cashback|back|offer|offers|discount|discounts|off|sale|sales|deal|deals|free|save|saving|savings|win|wins|prize|prizes|voucher|vouchers|coupon|coupons|bonanza|exclusive|limited|extra|instant|emi|price|prices|only|upto|flat|valid|validity|till|until|from|now|today|hurry|bonus|reward|rewards|gift|gifts|guaranteed|lowest|best|mega|super|jackpot|festive|scan|apply|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december|mon|tue|wed|thu|fri|sat|sun)$/i;
+export const aiVariationBusinessWords = (c?: RegenerationChecks): string[] => (c?.extraWords ?? []).filter(w => BUSINESS_WORD.test(w));
+/** Whether a variation may be made again on its own (approved): it failed, cannot be used or has warnings, and was not made editable. */
+export const aiVariationRetriable = (r: AiVariationResult) => !r.templateId && (r.status === 'failed' || !!r.checks?.blocking.length || aiVariationWarnings(r.checks).length > 0);
 /** What a person must accept explicitly before a variation is used: words added or missing, products or logos not put back. */
 export function aiVariationWarnings(c?: RegenerationChecks): string[] {
   if (!c) return [];

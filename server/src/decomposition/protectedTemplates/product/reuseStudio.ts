@@ -17,7 +17,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import {
-  aiVariationWarnings, AI_VARIATION_COUNTS, AI_VARIATION_THEME_LABELS, AI_VARIATION_THEMES, offerAspectRatioOf, PRODUCT_ASPECT_RATIOS, regenEstimateUsdForSize, type AiVariationJob, type AiVariationTheme, type ProductAspectRatio, type SourceSize,
+  aiVariationBusinessWords, aiVariationRetriable, aiVariationWarnings, AI_VARIATION_COUNTS, AI_VARIATION_THEME_LABELS, AI_VARIATION_THEMES, offerAspectRatioOf, PRODUCT_ASPECT_RATIOS, regenEstimateUsdForSize, type AiVariationJob, type AiVariationTheme, type ProductAspectRatio, type SourceSize,
   isOfferAspectRatio, isOfferFont, offerWeights, OFFER_ASPECT_RATIOS, RATIO_REGEN_SIZES, regenRequestSize, ratioRegenEstimateUsd, REUSE_ASPECT_LABELS, REUSE_ASPECT_RATIOS, REUSE_OFFERED_RATIOS, rewriteGroup, CREATIVE_SCHEMA_VERSION,
   type CreativeInstance, type OfferAspectRatio, type ReuseComposePlan, type ReuseValidation, type OfferWeight, type ProductCreative, type ProductCreativeObject, type ProductSlot, type ProductSnapshot, type ProductVariationCheck, type ReuseAiPlan, type ReuseAspectRatio,
   type ReuseDraft, type ReuseItem, type ReuseOutput, type ReuseOverride, type ReusePlacementBox, type ReusePlacementMode, type ReuseTextEdit,
@@ -1117,15 +1117,13 @@ export function createReuseStudio(deps: {
     return { request: reconstructionSize(final) ?? (final.width > final.height ? { width: 2496, height: 832 } : { width: 832, height: 2496 }), final };
   };
   const jobFile = (jid: string) => `pav-${jid}.json`, runningJobs = new Set<string>();
-  /** Words the template does not have, read in a variation, from which it is invented copy (an OCR misreading is one or two). */
-  const INVENTED_WORDS = 4;
   const writeJob = (id: string, j: AiVariationJob) => { store.write(id, jobFile(j.id), Buffer.from(JSON.stringify({ ...j, updatedAt: nowIso() }, null, 2))); return j; };
   const readJob = (id: string, jid: string): AiVariationJob => {
     deps.requireProduct(id);
     if (!/^[a-f0-9]{8}$/.test(jid) || !store.has(id, jobFile(jid))) fail('NOT_FOUND', 'Those AI variations were not found.');
     const j = JSON.parse(store.read(id, jobFile(jid)).toString('utf8')) as AiVariationJob;
-    // A result made before invented copy was refused is held to the same rule: several words the template does not have.
-    for (const r of j.results) if (r.checks && (r.checks.extraWords?.length ?? 0) >= INVENTED_WORDS && !r.checks.blocking.some(b => b.startsWith('The AI added text'))) r.checks.blocking.push(`The AI added text that is not in your template (${r.checks.extraWords!.slice(0, 8).join(', ')}…): this variation cannot be used. Retry it.`);
+    // (Added words are reviewed by the person, never refused by a count: a block a since-removed rule saved is a warning again.)
+    for (const r of j.results) if (r.checks) r.checks.blocking = r.checks.blocking.filter(b => !b.startsWith('The AI added text'));
     // Left running by a server that stopped: what did not finish has failed (nothing is retried; made ones are kept).
     if (j.status === 'running' && !runningJobs.has(`${id}:${jid}`)) {
       j.results = j.results.map(r => (r.status === 'pending' || r.status === 'running' ? { ...r, status: 'failed', error: 'Interrupted: the server stopped before this variation was made. Nothing was retried.' } : r));
@@ -1189,8 +1187,8 @@ export function createReuseStudio(deps: {
   }
   /**
    * One variation made (or made again, approved on its own): one request, its result at its size, protected and checked.
-   * Several words the template does not have (an invented headline or offer, read on this computer) make it unusable,
-   * whatever the instruction said; fewer are warnings the person must accept. A failure is recorded, never retried.
+   * Any word the template does not have is a warning the person reviews and accepts (the reading can misread); one that
+   * looks like a price, offer, date or claim is confirmed on its own. A failure is recorded, never retried.
    */
   async function makeVariation(id: string, job: AiVariationJob, index: number, inputs: Awaited<ReturnType<typeof variationInputs>>, r: RatioRegenerator, each: number) {
     const res = job.results.find(x => x.index === index)!, { original, assets, texts, products, knownWords, shape, request, trimmed } = inputs;
@@ -1199,7 +1197,6 @@ export function createReuseStudio(deps: {
     try {
       const out = await r.regenerate({ image: original, prompt: variationPrompt({ shape, theme: job.theme, customTheme: job.customTheme, index, count: job.count, texts, products, trimmed }), size: request }, save, op);
       const { png, checks } = await protectRegenerated({ original, result: await atSize(out.image, job.size), assets, knownWords, ...(deps.recognizer ? { recognizer: deps.recognizer() } : {}) });
-      if ((checks.extraWords?.length ?? 0) >= INVENTED_WORDS) checks.blocking.push(`The AI added text that is not in your template (${checks.extraWords!.slice(0, 8).join(', ')}…): this variation cannot be used. Retry it.`);
       const file = `pav-${job.id}-${index}-${sha256(png).slice(0, 12)}.png`;
       if (!store.has(id, file)) store.write(id, file, png);
       delete res.requestId; delete res.costUsd;
@@ -1220,14 +1217,15 @@ export function createReuseStudio(deps: {
     writeJob(id, job);
   }
   /**
-   * One variation that failed or cannot be used, made again on its own with its approved estimate: one request, never
-   * retried; the other variations, their pictures and the costs recorded are kept as they are.
+   * One variation that failed, cannot be used or has warnings (added or missing words, a product or logo not put back),
+   * made again on its own with its approved estimate: one request, never retried; the other variations, their pictures
+   * and the costs recorded are kept as they are.
    */
   const retryAiVariation = (id: string, jid: string, index: number, input: { approveUsd?: unknown }) => locked(`${id}:ai-variations`, async () => {
     const job = readJob(id, jid), res = job.results.find(x => x.index === index) ?? fail('NOT_FOUND', 'That variation was not found.'), key = `${id}:${jid}`;
     if (runningJobs.has(key)) fail('BUSY', 'These variations are still being made. Wait for them to finish.');
-    if (!(res.status === 'failed' || res.checks?.blocking.length)) fail('INVALID_REQUEST', 'Only a variation that failed or cannot be used is made again; the others are kept as they are.');
     if (res.templateId) fail('INVALID_REQUEST', 'This variation was already made editable.');
+    if (!aiVariationRetriable(res)) fail('INVALID_REQUEST', 'Only a variation that failed, cannot be used or has warnings is made again; the others are kept as they are.');
     const r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI variations are not available on this server (no OpenAI key is configured).');
     const ctx = await contextOf(id, job.revision), issues = sourceIssues(id, ctx.snapshot);
     if (issues.length) fail('SOURCE_NOT_READY', `Repair the master template before any paid request: ${issues.join(' ')}`);
@@ -1245,7 +1243,7 @@ export function createReuseStudio(deps: {
    * own from the picture (already in its size), its elements found in it (`useAi`: the AI detection the person approved),
    * then reviewed, decomposed, saved and edited like any upload. The base template is not changed. Once per variation.
    */
-  const continueAiVariation = (id: string, jid: string, index: number, input: { approved?: unknown; useAi?: unknown; acceptWarnings?: unknown }) => locked(`${id}:ai-variations`, async () => {
+  const continueAiVariation = (id: string, jid: string, index: number, input: { approved?: unknown; useAi?: unknown; acceptWarnings?: unknown; confirmBusinessText?: unknown }) => locked(`${id}:ai-variations`, async () => {
     const job = readJob(id, jid), res = job.results.find(x => x.index === index) ?? fail('NOT_FOUND', 'That variation was not found.');
     if (res.status !== 'ready' || !res.file || !store.has(id, res.file)) fail('NOT_READY', 'This variation is not ready.');
     if (res.checks?.blocking.length) fail('NOT_READY', `This variation cannot be used: ${res.checks.blocking.join(' ')}`);
@@ -1253,6 +1251,9 @@ export function createReuseStudio(deps: {
     // A questionable result is used only when its warnings are accepted explicitly, one by one as listed.
     const warnings = aiVariationWarnings(res.checks);
     if (warnings.length && input.acceptWarnings !== true) fail('APPROVAL_REQUIRED', `Accept this variation's warnings first: ${warnings.join('; ')}.`, { warnings });
+    // Added words that look like a new price, offer, date or claim: never accepted with the rest, confirmed on their own.
+    const business = aiVariationBusinessWords(res.checks);
+    if (business.length && input.confirmBusinessText !== true) fail('APPROVAL_REQUIRED', `Confirm that these added words are not new prices, offers, dates or claims (or make the variation again): ${business.join(', ')}.`, { business });
     const exists = (tid: string) => { try { deps.requireProduct(tid); return true; } catch { return false; } };
     if (res.templateId && exists(res.templateId)) return { templateId: res.templateId, reused: true };
     if (!deps.fromRegenerated) fail('NOT_CONFIGURED', 'Making it editable is not available on this server.');

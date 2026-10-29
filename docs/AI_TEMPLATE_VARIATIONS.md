@@ -13,7 +13,8 @@ One saved base template becomes 3–5 genuinely different AI designs for a festi
    Changing a choice sends nothing.
 3. **Generate → confirm the estimate.** One `images.edit` request per variation, made one after another and never retried, with the actual cost recorded. Without the approved amount the server refuses (`APPROVAL_REQUIRED`).
 4. **Each variation** is the base template's latest revision as designed, rendered and sent with:
-   - its own design direction (`VARIATION_DIRECTIONS`: refreshed same layout, product hero, split layout, framed composition, bold modern);
+   - its own design direction (`VARIATION_DIRECTIONS`): refreshed styling close to the original arrangement, product spotlight, shifted balance, framed composition, alternate campaign palette. These are visibly different placements and scales of the products, characters, decorations and existing text containers;
+   - the template-family rule: the same brand identity, visual hierarchy, design grammar and composition style, as one integrated campaign artwork. Any text stays inside the artwork in the same kinds of banners, boxes, pills, ribbons, badges or strips (which may move or resize), never in a detached side panel, information board or a split of picture and text. A different canvas shape adapts the composition without turning it into a different kind of poster, and the festival changes decoration, colours, motifs and atmosphere, never the content;
    - the theme's decoration;
    - the template's exact words;
    - the rule that nothing is added except theme decoration (no text, offer, price, date, logo, brand, QR code, product or person).

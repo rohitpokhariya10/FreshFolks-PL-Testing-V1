@@ -63,6 +63,9 @@ async function generateAndUse(page: Page, request: APIRequestContext, size: RegE
   // A questionable result (a word or product the checks could not confirm) needs its warnings accepted explicitly.
   const accept = card.getByRole('checkbox', { name: /I accept these warnings/ });
   if (await accept.isVisible()) { await expect(use).toBeDisabled(); await accept.check(); }
+  // Added words that look like a price, offer, date or claim are confirmed on their own, never with the rest.
+  const business = card.getByRole('checkbox', { name: /none is a new price, offer, date or claim/ });
+  if (await business.isVisible()) { await expect(use).toBeDisabled(); await business.check(); }
   await use.click();
   await expect(panel.getByRole('heading', { name: 'Here’s what we found' })).toBeVisible({ timeout: 120000 });
   const made = ((await (await request.get(`${API}/${id}/ai-variations/${job.id}`)).json()) as AiVariationJob).results[1].templateId!;
