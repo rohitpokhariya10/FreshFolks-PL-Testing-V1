@@ -8,13 +8,15 @@
 import { randomBytes } from 'node:crypto';
 import sharp from 'sharp';
 import {
-  creativeFromSnapshot, fitToSlot, isMasterCategory, isOfferFont, offerWeights, PRODUCT_CREATIVE_LIMITS, PRODUCT_CREATIVE_SCHEMA_VERSION, PRODUCT_OBJECT_KINDS, validCreativeElementId,
+  creativeFromSnapshot, fitToSlot, regenEstimateUsdForSize, isMasterCategory, isOfferFont, offerWeights, PRODUCT_CREATIVE_LIMITS, PRODUCT_CREATIVE_SCHEMA_VERSION, PRODUCT_OBJECT_KINDS, validCreativeElementId,
   type CreativeImage, type CreativeShape, type CreativeText, type MasterSnapshot, type PixelRect, type ProductCreative, type ProductCreativeObject, type ProductObjectKind, type ProductSnapshot, type SourceBox,
 } from '@frameflow/shared';
 import { RunError } from '../../layerizeExperiment.js';
 import type { ProtectedStore } from '../store.js';
 import { sha256 } from '../pixels.js';
 import { cutOutUpload } from './uploadCutout.js';
+import { refineCutout, refinePrompt, refineRequest, refineResult } from './cutoutRefine.js';
+import type { RatioRegenerator } from './ratioRegeneration.js';
 import { createProductCreativeRun, existingProductCreativeRun } from './creativeRun.js';
 import { artworkBase } from './artworkText.js';
 
@@ -56,6 +58,8 @@ export interface ProductCreativeDeps {
   snapshot: (id: string, revision: number) => ProductSnapshot;
   latestRevision: (id: string) => number | undefined;
   locked: <T>(key: string, work: () => Promise<T>) => Promise<T>;
+  /** The image model (the shared regenerator) for an approved AI repair of one object's cut-out (Refine Cutout). */
+  regenerator?: () => RatioRegenerator | undefined;
 }
 
 export function createProductCreatives(deps: ProductCreativeDeps) {
@@ -134,6 +138,51 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
     const original = edited ? { box: edited.box, file: edited.asset.file } : template?.cutout ? { box: template.cutout.placement, file: template.cutout.file } : fail('NOT_REPLACEABLE', 'This element has no picture in the template to go back to.');
     const objects = old.objects.map(x => x.id === objectId ? { ...x, box: { ...original.box }, asset: { kind: 'template' as const, file: original.file } } : x);
     return write(id, next(old, { objects }, { at: nowIso(), action: 'restored', detail: o.label }));
+  });
+  // --- Refine Cutout: one object layer repaired, nothing else touched (cutoutRefine.ts) -------------------------------
+  /** The object to refine and its current picture (a product, character or decoration cut-out; never text or a logo). */
+  const refinable = (id: string, cid: string, objectId: string) => {
+    const c = read(id, cid), o = c.objects.find(x => x.id === objectId) ?? fail('NOT_FOUND', 'That element is not in this creative.');
+    if (!store.has(id, o.asset.file)) fail('NOT_FOUND', 'This element has no picture to refine.');
+    return { c, o, png: store.read(id, o.asset.file) };
+  };
+  const refined = async (id: string, cid: string, png: Buffer) => { const file = `pcr-${cid.slice(3)}-${sha256(png).slice(0, 12)}.png`; if (!store.has(id, file)) store.write(id, file, png); return file; };
+  /** Free, on this computer: the cleaned picture to compare with the current one. The creative is not changed. */
+  const refineLocal = (id: string, cid: string, objectId: string) => locked(`${id}:${cid}`, async () => {
+    const { o, png } = refinable(id, cid, objectId), r = await refineCutout(png);
+    return { before: o.asset.file, file: await refined(id, cid, r.png), width: r.width, height: r.height, removedPixels: r.removedPixels, filledPixels: r.filledPixels, defringedPixels: r.defringedPixels, requests: 0 };
+  });
+  /** What one AI repair of this object sends and may cost (shown before it is approved). */
+  const refineEstimate = async (id: string, cid: string, objectId: string) => {
+    const { png } = refinable(id, cid, objectId), r = deps.regenerator?.(), { size } = await refineRequest(png);
+    return { available: !!r, model: r?.model ?? '', offline: r?.offline ?? true, size, estimateUsd: r && !r.offline ? regenEstimateUsdForSize(size) : 0 };
+  };
+  /**
+   * One approved AI repair (one request, never retried, no other candidate): the result to compare with the current
+   * picture. The creative is not changed — a failure leaves it exactly as it was.
+   */
+  const refineWithAi = (id: string, cid: string, objectId: string, input: { approveUsd?: unknown }) => locked(`${id}:${cid}`, async () => {
+    const { o, png } = refinable(id, cid, objectId), r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI repair is not available on this server (no OpenAI key is configured). Use the free clean-up.');
+    const place = await refineRequest(png), estimateUsd = r.offline ? 0 : regenEstimateUsdForSize(place.size);
+    if (estimateUsd && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= estimateUsd)) fail('APPROVAL_REQUIRED', `Repairing ${o.label} with AI sends one request to ${r.model} (${place.size.width} × ${place.size.height}), at most about $${estimateUsd.toFixed(2)}. Approve the cost first.`, { estimateUsd });
+    const op = randomBytes(4).toString('hex'), save = (f: string, v: object) => store.write(id, `pcr-${cid.slice(3)}-${op}-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`, Buffer.from(JSON.stringify(v, null, 2)));
+    let out: Awaited<ReturnType<RatioRegenerator['regenerate']>>;
+    try { out = await r.regenerate({ image: place.image, prompt: refinePrompt(o.label), size: place.size }, save, op); }
+    catch (error) { fail('PROVIDER_FAILED', `The AI repair did not complete: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}. Nothing was retried; ${o.label} is unchanged.`, { estimateUsd }); }
+    const res = await refineResult(out.image, png, place), file = await refined(id, cid, res.png);
+    const usage = { model: r.model, offline: r.offline, size: place.size, estimateUsd, ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}), ...(out.requestId ? { requestId: out.requestId } : {}), file };
+    save('ai-repair.json', usage);
+    return { before: o.asset.file, ...usage, width: res.width, height: res.height, requests: 1 };
+  });
+  /** The refined picture, looked at and approved, in place of the object's: a new revision (the previous ones kept); nothing else changes. */
+  const applyRefinement = (id: string, cid: string, objectId: string, input: { expectedRevision?: unknown; file?: unknown; approved?: unknown }) => locked(`${id}:${cid}`, async () => {
+    const old = read(id, cid); expect(old, input.expectedRevision);
+    const o = old.objects.find(x => x.id === objectId) ?? fail('NOT_FOUND', 'That element is not in this creative.');
+    if (typeof input.file !== 'string' || !input.file.startsWith(`pcr-${cid.slice(3)}-`) || !input.file.endsWith('.png') || !store.has(id, input.file)) fail('INVALID_REQUEST', 'Refine this element first.');
+    if (input.approved !== true) fail('APPROVAL_REQUIRED', 'Look at the refined picture and confirm it before it replaces the current one.');
+    const png = store.read(id, input.file), m = await sharp(png).metadata();
+    const objects = old.objects.map(x => (x.id === objectId ? { ...x, asset: { kind: 'upload' as const, file: input.file as string, sha256: sha256(png), width: m.width ?? 1, height: m.height ?? 1, background: 'transparent' as const } } : x));
+    return write(id, next(old, { objects }, { at: nowIso(), action: 'replaced', detail: `${o.label}: cut-out refined` }));
   });
   const duplicate = (id: string, cid: string, input: { name?: unknown }) => locked(`${id}:creatives`, async () => {
     const old = read(id, cid), at = nowIso(), copyId = hexId('pc', 3);
@@ -233,7 +282,7 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
       ...(background ? { background: { ...background, sha256: sha256(store.read(id, background.file)) } } : {}), ...(c.absoluteZOrder ? { absoluteZOrder: true as const } : {}) };
   }
 
-  return { list, read, create, add, replaceWith, save, replace, restore, duplicate, uploadAsset, open, revisionsOf };
+  return { list, read, create, add, replaceWith, save, replace, restore, refineLocal, refineEstimate, refineWithAi, applyRefinement, duplicate, uploadAsset, open, revisionsOf };
 }
 export type ProductCreatives = ReturnType<typeof createProductCreatives>;
 

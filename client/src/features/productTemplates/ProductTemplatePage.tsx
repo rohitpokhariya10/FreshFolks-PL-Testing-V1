@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Copy, Eye, EyeOff, FileText, ImagePlus, Layers3, Plus, RefreshCw, RotateCcw, Save, Sparkles, Trash2, Wand2 } from 'lucide-react';
 import { ProductDetails } from './ProductDetails';
 import { AiDesignVariations } from './AiDesignVariations';
+import { RefineCutout } from './RefineCutout';
 import {
   MASTER_CATEGORY_LABELS, PRODUCT_ASPECT_LABELS, PRODUCT_CHECK_KIND, PRODUCT_KIND_LABELS, PRODUCT_VARIATION_LABELS, rewriteGroup, type CreativeInstance, type MasterSnapshot, type ProductAspectRatio, type ProductCreative, type ProductSnapshot, type ProductVariationKind,
 } from '@frameflow/shared';
@@ -69,7 +70,7 @@ export function ProductTemplatePage({ id, initialTab, onBack, onEditTemplate, on
 /** One creative: its preview (drag to move), its slots, text and logos; Save makes a new revision. */
 function CreativeEditor({ templateId, creativeId, onChanged, onOpen, onError, onCopied, onDecompose }: { onDecompose?: (cid: string) => Promise<void>; templateId: string; creativeId: string; onChanged: () => void; onOpen: (cid: string) => Promise<void>; onError: (m: string) => void; onCopied: (cid: string) => Promise<void> }) {
   const [creative, setCreative] = useState<ProductCreative>(), [snapshot, setSnapshot] = useState<ProductSnapshot>(), [dirty, setDirty] = useState(false), [busy, setBusy] = useState(''), [note, setNote] = useState('');
-  const [selected, setSelected] = useState<Selected>(null), [fontsRevision, setFontsRevision] = useState(0), [copy, setCopy] = useState<Record<string, string>>({});
+  const [selected, setSelected] = useState<Selected>(null), [fontsRevision, setFontsRevision] = useState(0), [copy, setCopy] = useState<Record<string, string>>({}), [refining, setRefining] = useState<string>();
   const box = useRef<HTMLDivElement>(null), [width, setWidth] = useState(560);
   useEffect(() => { void productApi.getCreative(templateId, creativeId).then(async c => { setCreative(c); setSnapshot(await productApi.snapshot(templateId, c.templateRevision)); }).catch((e: Error) => onError(e.message)); }, [templateId, creativeId, onError]);
   // As wide as the pane, and short enough to see whole.
@@ -139,8 +140,11 @@ function CreativeEditor({ templateId, creativeId, onChanged, onOpen, onError, on
           <span className="ot-row prt-slot-actions">
             <label className="ws-btn ws-btn-quiet prt-file"><ImagePlus size={14} aria-hidden="true" />{busy === o.id ? 'Placing…' : 'Replace'}<input type="file" accept="image/png,image/jpeg,image/webp" aria-label={`Replace ${o.label}`} disabled={!!busy} onChange={e => void replace(o.id, e.target.files?.[0])} /></label>
             {o.asset.kind === 'upload' && <button type="button" className="ws-btn ws-btn-quiet" disabled={!!busy} onClick={() => void restore(o.id)}><RotateCcw size={14} aria-hidden="true" />Original</button>}
+            {o.kind !== 'brand-logo' && <button type="button" className="ws-btn ws-btn-quiet" disabled={!!busy || dirty} title={dirty ? 'Save your changes first' : undefined} onClick={() => setRefining(r => (r === o.id ? undefined : o.id))}><Wand2 size={14} aria-hidden="true" />Refine cutout</button>}
             <button type="button" className="ws-icon-button" aria-label={o.hidden ? `Show ${o.label}` : `Hide ${o.label}`} onClick={() => update({ ...creative, objects: creative.objects.map(x => (x.id === o.id ? { ...x, hidden: !x.hidden } : x)) })}>{o.hidden ? <EyeOff size={15} /> : <Eye size={15} />}</button>
-          </span></li>)}</ul>
+          </span>
+          {refining === o.id && <RefineCutout templateId={templateId} creativeId={creativeId} object={o} onError={onError} onClose={() => setRefining(undefined)}
+            onApplied={c => { setCreative(c); setDirty(false); setRefining(undefined); onChanged(); setNote(`${o.label}: refined cut-out in use (a new revision; the previous one is kept).`); }} />}</li>)}</ul>
         <p className="ot-muted">For the cleanest result use a PNG with a transparent background, or a product photo on a plain white or single-colour background.</p>
       </section>
       {stands.length > 0 && <section aria-label="Display stands"><h3>Display stands</h3>

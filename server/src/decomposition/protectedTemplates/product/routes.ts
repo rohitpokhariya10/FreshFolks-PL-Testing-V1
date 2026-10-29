@@ -97,6 +97,12 @@ export function registerProductTemplateRoutes(router: Router, ctx: { products: P
       res.json(await c.replace(idOf(req), cid(req), oid(req), { expectedRevision: Number(fields.expectedRevision), bytes, filename }));
     } catch (error) { next(error); }
   });
+  // Refine Cutout (one object layer): the free local clean-up and an approved AI repair each give a picture to compare;
+  // only an approved apply replaces that object's picture (a new revision). Text and logos are overlays, never refined here.
+  router.get(`${base}/:id/creatives/:cid/objects/:oid/refine`, async (req, res, next) => { try { noStore(res); res.json(await c.refineEstimate(idOf(req), cid(req), oid(req))); } catch (error) { next(error); } });
+  router.post(`${base}/:id/creatives/:cid/objects/:oid/refine/local`, json, async (req, res, next) => { try { res.json(await c.refineLocal(idOf(req), cid(req), oid(req))); } catch (error) { next(error); } });
+  router.post(`${base}/:id/creatives/:cid/objects/:oid/refine/ai`, json, async (req, res, next) => { try { res.json(await c.refineWithAi(idOf(req), cid(req), oid(req), { approveUsd: req.body?.approveUsd })); } catch (error) { next(error); } });
+  router.post(`${base}/:id/creatives/:cid/objects/:oid/refine/apply`, json, async (req, res, next) => { try { res.json(await c.applyRefinement(idOf(req), cid(req), oid(req), { expectedRevision: req.body?.expectedRevision, file: req.body?.file, approved: req.body?.approved })); } catch (error) { next(error); } });
   router.post(`${base}/:id/creatives/:cid/objects/:oid/restore`, json, async (req, res, next) => { try { res.json(await c.restore(idOf(req), cid(req), oid(req), { expectedRevision: req.body?.expectedRevision })); } catch (error) { next(error); } });
   router.post(`${base}/:id/creatives/:cid/duplicate`, json, async (req, res, next) => { try { res.status(201).json(await c.duplicate(idOf(req), cid(req), { name: req.body?.name })); } catch (error) { next(error); } });
   router.post(`${base}/:id/creatives/:cid/assets`, async (req, res, next) => {

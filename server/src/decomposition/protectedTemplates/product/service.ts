@@ -288,6 +288,14 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     }
     return undefined;
   }
+  /** A base template's approved creative (its source picture) and words (its latest revision), or nothing if it is gone. */
+  function sourceTemplate(baseId: string): { png: Buffer; words: { text: string }[] } | undefined {
+    try {
+      const b = requireProduct(baseId), rev = b.product.revisions.at(-1);
+      if (!rev || !store.has(baseId, b.source.inputFile)) return undefined;
+      return { png: store.read(baseId, b.source.inputFile), words: snapshot(baseId, rev.revision).words };
+    } catch { return undefined; }
+  }
   async function runDetect(id: string, useAi: boolean, useSaved = false, recover = false, newRequest = false) {
     const startedAt = nowIso();
     const before = requireProduct(id);
@@ -327,20 +335,35 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       const recognizer: WordRecognizer = fromVariation ? { engine: { name: 'composition', version: '1', model: 'the variation\'s own text (no reading)', modes: ['composition'] }, recognize: async () => [] } : options.recognizer();
       const result = await detectProduct({ template: t, source, png: input, recognizer, analyzer, previous: t.textAnalysis, ...(fromVariation ? { exact: true } : {}),
         store: (f, bytes) => store.write(id, f, bytes), save: (f, value) => store.write(id, `analysis-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 80)}.json`, Buffer.from(JSON.stringify(value, null, 2))), at: nowIso() });
-      // An approved AI-regenerated creative: each logo found in it gets its layer from the upload's own pixels (the model
-      // redraws small logos; the coordinates stay the regenerated creative's). Before the review, so it shows them.
-      const g = t.product.regeneration;
-      if (g?.status === 'approved' && g.original && store.has(id, g.original.file) && !fromVariation) {
+      // An approved AI-made creative (regenerated in a size, a reused creative's regeneration, an AI variation). Its words and
+      // logos are found in this final picture — their coordinates are its own — and checked against its approved source,
+      // before the review: text and logos stay editable overlays, never decomposed as pictures.
+      const g = t.product.regeneration, base = g?.status === 'approved' && !fromVariation && g.from?.templateId ? sourceTemplate(g.from.templateId) : undefined;
+      if (g?.status === 'approved' && !fromVariation) {
+        // Words: one the source does not have (an invented or changed price, offer, date or claim) is flagged for the
+        // review, never taken as the template's. The source: the base template's own words, else the words the
+        // regeneration check read as added to the upload.
+        const norm = (w: string) => w.normalize('NFKD').replace(/[^\p{L}\p{N}₹%]/gu, '').toLowerCase();
+        const known = base ? new Set(base.words.flatMap(w => w.text.split(/\s+/)).map(norm).filter(Boolean)) : undefined, added = new Set((g.result?.checks.extraWords ?? []).map(norm));
+        const flagged = result.analysis.words.filter(w => w.review.status !== 'rejected' && (known ? !known.has(norm(w.text)) : added.has(norm(w.text))) && norm(w.text));
+        for (const w of flagged) w.review = { status: 'needs-review', at: nowIso() };
+        if (flagged.length || known) store.write(id, 'analysis-source-words.json', Buffer.from(JSON.stringify({ note: 'Words found in the approved AI creative that its source does not have: flagged for the review (an invented or changed price, offer, date or claim must not become the template\'s).', source: base ? `template ${g.from!.templateId}` : 'the regeneration check of the upload', flagged: flagged.map(w => w.text) }, null, 2)));
+        // Logos: each gets its layer from the authentic pixels of its approved source — the upload, else the base
+        // template's creative — on a clear match (the model redraws small logos). One not found is flagged for the review:
+        // keep it after looking, or upload the authentic logo; never one the model invented.
+        const source = g.original && store.has(id, g.original.file) ? store.read(id, g.original.file) : base?.png;
         const logos = result.analysis.logoSlots.filter(l => !l.replacement && !l.box.rotation && l.review.status !== 'rejected' && store.has(id, l.original.file));
-        const restored = await restoreLogosFromOriginal({ original: store.read(id, g.original.file), regenerated: { width: t.source.width, height: t.source.height }, logos: logos.map(l => ({ id: l.id, png: store.read(id, l.original.file) })) });
-        for (const r of restored) {
-          const l = logos.find(x => x.id === r.id)!;
-          if (!r.png) continue;
-          const hash = sha256(r.png), file = `logo-${l.id}-${hash.slice(0, 12)}.png`;
-          if (!store.has(id, file)) store.write(id, file, r.png);
-          l.original = { ...l.original, file, sha256: hash, bytes: r.png.length };
+        if (source && logos.length) {
+          const restored = await restoreLogosFromOriginal({ original: source, regenerated: { width: t.source.width, height: t.source.height }, logos: logos.map(l => ({ id: l.id, png: store.read(id, l.original.file) })) });
+          for (const r of restored) {
+            const l = logos.find(x => x.id === r.id)!;
+            if (!r.png) { l.review = { status: 'needs-review', at: nowIso() }; continue; }
+            const hash = sha256(r.png), file = `logo-${l.id}-${hash.slice(0, 12)}.png`;
+            if (!store.has(id, file)) store.write(id, file, r.png);
+            l.original = { ...l.original, file, sha256: hash, bytes: r.png.length };
+          }
+          store.write(id, 'analysis-regeneration-logos.json', Buffer.from(JSON.stringify({ note: 'Logos found in the approved AI creative, found again in its source and cut from its own pixels (restored), or kept as drawn and flagged for the review (not-found).', source: g.original ? 'the upload' : `template ${g.from!.templateId}`, logos: restored.map(r => ({ id: r.id, label: logos.find(x => x.id === r.id)!.label, status: r.status, score: r.score })) }, null, 2)));
         }
-        store.write(id, 'analysis-regeneration-logos.json', Buffer.from(JSON.stringify({ note: 'Logos found in the approved regenerated creative, found again in the upload and cut from its own pixels (restored), or kept as drawn (not-found).', logos: restored.map(r => ({ id: r.id, label: logos.find(x => x.id === r.id)!.label, status: r.status, score: r.score })) }, null, 2)));
       }
       // Run again on a reviewed template: the administrator's corrections win over what was found again at their place.
       const prior = !t.textAnalysis && cached?.owner.product?.detection?.status === 'done' ? cached.owner : t;
@@ -933,7 +956,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     return JSON.parse(store.read(id, ref.file).toString('utf8')) as ProductSnapshot;
   }
 
-  const creatives = createProductCreatives({ store, runsDir: options.runsDir, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision });
+  const creatives = createProductCreatives({ store, runsDir: options.runsDir, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, regenerator: options.regenerator });
   /** Enter the existing Konva editor through the existing creative/run adapter. This does not approve quality. */
   const openEditor = (id: string) => locked(id, async () => {
     let t = requireProduct(id);
