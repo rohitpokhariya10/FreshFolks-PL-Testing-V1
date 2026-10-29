@@ -20,7 +20,7 @@ describe('Product with Text templates: variations', { timeout: 240_000 }, () => 
       const options = (await s.call<{ slots: { slotId: string; kind: string }[]; choices: { ref: string }[]; planner: { ai: boolean; model: string }; aspectRatios: string[] }>(`/${id}/variation-options`)).body;
       expect(options.planner).toMatchObject({ ai: false, model: 'offline-planner' });
       expect(options.slots.map(x => x.kind).sort()).toEqual(['character', 'product', 'product', 'product']);
-      expect(options.aspectRatios).toEqual(['original', '1:1', '4:5', '9:16', '16:9']);
+      expect(options.aspectRatios).toEqual(['original', '1:1', '4:5', '9:16', '16:9', '885:286']);
       // A product for the library: a packshot cut out locally.
       const f = new FormData(); f.append('image', new Blob([new Uint8Array(await packshot())], { type: 'image/png' }), 'Speaker.png');
       const added = await s.call<{ choice: { ref: string; label: string }; background: string }>(`/${id}/variation-products`, { method: 'POST', body: f });

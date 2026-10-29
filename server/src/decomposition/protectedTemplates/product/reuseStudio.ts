@@ -17,6 +17,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import {
+  aiVariationBusinessWords, aiVariationRetriable, aiVariationWarnings, AI_VARIATION_COUNTS, AI_VARIATION_THEME_LABELS, AI_VARIATION_THEMES, offerAspectRatioOf, PRODUCT_ASPECT_RATIOS, regenEstimateUsdForSize, type AiVariationJob, type AiVariationTheme, type ProductAspectRatio, type SourceSize,
   isOfferAspectRatio, isOfferFont, offerWeights, OFFER_ASPECT_RATIOS, RATIO_REGEN_SIZES, regenRequestSize, ratioRegenEstimateUsd, REUSE_ASPECT_LABELS, REUSE_ASPECT_RATIOS, REUSE_OFFERED_RATIOS, rewriteGroup, CREATIVE_SCHEMA_VERSION,
   type CreativeInstance, type OfferAspectRatio, type ReuseComposePlan, type ReuseValidation, type OfferWeight, type ProductCreative, type ProductCreativeObject, type ProductSlot, type ProductSnapshot, type ProductVariationCheck, type ReuseAiPlan, type ReuseAspectRatio,
   type ReuseDraft, type ReuseItem, type ReuseOutput, type ReuseOverride, type ReusePlacementBox, type ReusePlacementMode, type ReuseTextEdit,
@@ -41,7 +42,8 @@ import { reuseCategory, shapeMismatch, sizeUnit } from './reusePlacement.js';
 import { artRows, frameBackground, groupBounds, mapBox, mapCreative, mapX, mapY, planFrame, reanchor, type Box, type Decoration, type ReuseFrame } from './reuseLayout.js';
 import { applyPlan, checkComposePlan, contrastIssues, extensionPercent, integerOrder, COMPOSE_PLAN_COST_USD, composeBackground, composeRequest, EXTEND_COST_USD, extendWithAi, planRules, readStructure, type Plan, type ReuseComposer, type Structure } from './reuseCompose.js';
 import type { WordRecognizer } from '../../../textRecognition/recognizer.js';
-import { atRatioSize, protectRegenerated, regenerationPrompt, type RatioRegenerator } from './ratioRegeneration.js';
+import { atRatioSize, atSize, protectRegenerated, regenerationPrompt, SHAPE, variationPrompt, VARIATION_DIRECTIONS, type RatioRegenerator } from './ratioRegeneration.js';
+import { reconstructionSize } from '../../cleanBackground.js';
 import { checkPlacement, geometryPlacement, KNOWN_KINDS, PLACEMENT_COST_USD, type PlacementInput, type ReusePlacementPlanner, type Stage } from './reusePlacement.js';
 
 const nowIso = () => new Date().toISOString();
@@ -198,7 +200,7 @@ export function createReuseStudio(deps: {
   /** The creative regenerated in a common ratio by the image model (ratioRegeneration.ts; only with approval of its cost). */
   regenerator?: () => RatioRegenerator | undefined;
   /** An approved regenerated creative made editable through the creation pipeline (service.createFromRegenerated): its template's id. */
-  fromRegenerated?: (input: { bytes: Buffer; name: string; ratio: OfferAspectRatio; useAi: boolean; from: { templateId: string; draftId: string } }) => Promise<string>;
+  fromRegenerated?: (input: { bytes: Buffer; name: string; ratio?: OfferAspectRatio; useAi: boolean; from: { templateId: string; draftId: string } }) => Promise<string>;
   /** The local word reader: an AI background continuation is read back for lettering before it is used. */
   recognizer?: () => WordRecognizer;
 }) {
@@ -1103,6 +1105,165 @@ export function createReuseStudio(deps: {
     write(id, { ...latest, regenImages: { ...latest.regenImages, [ratio]: { ...g, templateId } } });
     return { templateId, reused: false };
   });
+  // --- AI design variations of the saved template (Generate AI Variations; ratioRegeneration.ts) ---------------------------
+  /**
+   * The sizes of a variation in `ratio`: asked of the image model (a size it makes) and kept (exactly the ratio; for
+   * 'original' the template's own proportions, at most 2048 on its long side). A canvas wider than the model makes (the
+   * banner) is asked at 3:1 and its plain top and bottom trimmed after (atSize).
+   */
+  const variationSizes = (canvas: SourceSize, ratio: ProductAspectRatio): { request: SourceSize; final: SourceSize } => {
+    if (isOfferAspectRatio(ratio)) return { request: regenRequestSize(ratio), final: RATIO_REGEN_SIZES[ratio] };
+    const k = Math.min(1, 2048 / Math.max(canvas.width, canvas.height)), final = { width: Math.round(canvas.width * k), height: Math.round(canvas.height * k) };
+    return { request: reconstructionSize(final) ?? (final.width > final.height ? { width: 2496, height: 832 } : { width: 832, height: 2496 }), final };
+  };
+  const jobFile = (jid: string) => `pav-${jid}.json`, runningJobs = new Set<string>();
+  const writeJob = (id: string, j: AiVariationJob) => { store.write(id, jobFile(j.id), Buffer.from(JSON.stringify({ ...j, updatedAt: nowIso() }, null, 2))); return j; };
+  const readJob = (id: string, jid: string): AiVariationJob => {
+    deps.requireProduct(id);
+    if (!/^[a-f0-9]{8}$/.test(jid) || !store.has(id, jobFile(jid))) fail('NOT_FOUND', 'Those AI variations were not found.');
+    const j = JSON.parse(store.read(id, jobFile(jid)).toString('utf8')) as AiVariationJob;
+    // (Added words are reviewed by the person, never refused by a count: a block a since-removed rule saved is a warning again.)
+    for (const r of j.results) if (r.checks) r.checks.blocking = r.checks.blocking.filter(b => !b.startsWith('The AI added text'));
+    // Left running by a server that stopped: what did not finish has failed (nothing is retried; made ones are kept).
+    if (j.status === 'running' && !runningJobs.has(`${id}:${jid}`)) {
+      j.results = j.results.map(r => (r.status === 'pending' || r.status === 'running' ? { ...r, status: 'failed', error: 'Interrupted: the server stopped before this variation was made. Nothing was retried.' } : r));
+      j.status = j.results.some(r => r.status === 'ready') ? 'done' : 'failed';
+      writeJob(id, j);
+    }
+    return j;
+  };
+  /** What can be made here: the model, each size's estimate per variation (this template's own size for 'original'), and earlier jobs. */
+  const aiVariations = async (id: string) => {
+    deps.requireProduct(id);
+    const r = deps.regenerator?.(), revision = deps.latestRevision(id);
+    const canvas = revision ? (await contextOf(id, revision)).snapshot.canvas : undefined;
+    const estimates = Object.fromEntries(PRODUCT_ASPECT_RATIOS.map(a => [a, !r || r.offline || !canvas ? 0 : regenEstimateUsdForSize(variationSizes(canvas, a).request)])) as Record<ProductAspectRatio, number>;
+    const jobs = store.files(id, 'pav-').filter(f => /^pav-[a-f0-9]{8}\.json$/.test(f)).map(f => readJob(id, f.slice(4, 12))).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return { available: !!r, model: r?.model ?? '', offline: r?.offline ?? true, estimates, jobs };
+  };
+  /**
+   * AI design variations, started only with their approved estimate: the template's latest revision as designed (every
+   * layer, drawn) sent `count` times to the image model, each request in its own design direction and the theme, for
+   * the size (one request each, in turn, never retried). Each result, before the person sees it: at exactly its size,
+   * its products and logos put back with their own pixels, its QR codes checked, its words compared (missing, added).
+   */
+  const startAiVariations = (id: string, input: { ratio?: unknown; theme?: unknown; customTheme?: unknown; count?: unknown; approveUsd?: unknown }) => locked(`${id}:ai-variations`, async () => {
+    const r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI variations are not available on this server (no OpenAI key is configured).');
+    const ratio = input.ratio === 'original' || isOfferAspectRatio(input.ratio) ? input.ratio : fail('INVALID_REQUEST', `Choose a size: ${PRODUCT_ASPECT_RATIOS.map(a => (a === 'original' ? 'Original' : REUSE_ASPECT_LABELS[a])).join(', ')}.`);
+    const theme = (AI_VARIATION_THEMES as readonly unknown[]).includes(input.theme) ? input.theme as AiVariationTheme : fail('INVALID_REQUEST', 'Choose a festival or theme.');
+    const customTheme = theme !== 'custom' ? undefined : typeof input.customTheme === 'string' && input.customTheme.trim() ? input.customTheme.replace(/\s+/g, ' ').trim().slice(0, 160) : fail('INVALID_REQUEST', 'Describe the custom theme.');
+    const count = (AI_VARIATION_COUNTS as readonly unknown[]).includes(input.count) ? input.count as number : fail('INVALID_REQUEST', 'Choose 3, 4 or 5 variations.');
+    const revision = deps.latestRevision(id) ?? fail('NOT_READY', 'Save the template first.');
+    const ctx = await contextOf(id, revision), issues = sourceIssues(id, ctx.snapshot);
+    if (issues.length) fail('SOURCE_NOT_READY', `Repair the master template before any paid request: ${issues.join(' ')}`);
+    const { request, final } = variationSizes(ctx.snapshot.canvas, ratio), each = r.offline ? 0 : regenEstimateUsdForSize(request), estimateUsd = Math.round(each * count * 100) / 100;
+    if (estimateUsd && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= estimateUsd)) fail('APPROVAL_REQUIRED', `${count} AI variations send ${count} requests to ${r.model}, at most about $${estimateUsd.toFixed(2)}. Approve the cost first.`, { estimateUsd });
+    if ([...runningJobs].some(k => k.startsWith(`${id}:`))) fail('BUSY', 'AI variations of this template are already being made. Wait for them to finish.');
+    const at = nowIso(), job: AiVariationJob = { id: hex(4), templateId: id, revision, ratio, theme, ...(customTheme ? { customTheme } : {}), count, model: r.model, offline: r.offline, size: final, estimateUsd, costUsd: 0, status: 'running', createdAt: at, updatedAt: at,
+      results: Array.from({ length: count }, (_, index) => ({ index, direction: VARIATION_DIRECTIONS[index % VARIATION_DIRECTIONS.length], status: 'pending' as const })) };
+    writeJob(id, job); runningJobs.add(`${id}:${job.id}`);
+    void runAiVariations(id, job, ctx, r, each).catch(error => console.error('ai variations', id, job.id, error)).finally(() => runningJobs.delete(`${id}:${job.id}`));
+    return job;
+  });
+  /** What every request of a job needs: the base creative drawn, the exact pictures to put back, its words, the shape and size asked. */
+  async function variationInputs(id: string, job: AiVariationJob, ctx: Context) {
+    const c = ctx.template, final = job.size, { request } = variationSizes(ctx.snapshot.canvas, job.ratio);
+    const full = await renderProductCreative(f => store.read(id, f), ctx.snapshot, c);
+    const original = await sharp(full).resize(2048, 2048, { fit: 'inside', withoutEnlargement: true }).png().toBuffer(), k = (await sharp(original).metadata()).width! / c.canvas.width;
+    const at = (b: Box) => ({ x: b.x * k, y: b.y * k, width: b.width * k, height: b.height * k });
+    // The exact pictures to put back: every product and logo shown, each on a clear match (pattern and colours). Not
+    // required, unlike a person's product photo in Create Offer Creative: a template's products overlap one another (one
+    // partly behind another fails the colour check in any redesign), so one not found is listed for the person to check.
+    const assets: Parameters<typeof protectRegenerated>[0]['assets'] = [];
+    for (const o of c.objects.filter(x => x.kind === 'product' && !x.hidden && !x.box.rotation && store.has(id, x.asset.file))) assets.push({ label: o.label, png: store.read(id, o.asset.file), box: at(o.box), required: false });
+    for (const i of c.images.filter(x => !x.hidden && !x.box.rotation && store.has(id, x.asset.file))) {
+      const size = i.asset.kind === 'creative' ? i.asset : await sizeOf(id, i.asset.file), a = size.width / Math.max(1, size.height), w = Math.min(i.box.width, i.box.height * a), h = w / a;
+      if (w * k >= 24) assets.push({ label: i.label, png: store.read(id, i.asset.file), box: at({ x: i.box.x + (i.box.width - w) / 2, y: i.box.y + (i.box.height - h) / 2, width: w, height: h }), required: false, minScore: 0.65 });
+    }
+    const texts = c.groups.map(g => copyOf(c, g.id)).filter(t => t.trim()), products = c.objects.filter(x => x.kind === 'product' && !x.hidden).map(x => x.label);
+    const shape = isOfferAspectRatio(job.ratio) ? SHAPE[job.ratio] : `${final.width > final.height * 1.05 ? 'landscape' : final.height > final.width * 1.05 ? 'portrait' : 'square'} (the original's own proportions)`;
+    const trimmed = Math.abs(request.width / request.height - final.width / final.height) / (final.width / final.height) >= 0.02;
+    return { original, assets, texts, products, knownWords: [...texts, ...c.images.map(i => i.label), ...products], shape, request, trimmed };
+  }
+  /**
+   * One variation made (or made again, approved on its own): one request, its result at its size, protected and checked.
+   * Any word the template does not have is a warning the person reviews and accepts (the reading can misread); one that
+   * looks like a price, offer, date or claim is confirmed on its own. A failure is recorded, never retried.
+   */
+  async function makeVariation(id: string, job: AiVariationJob, index: number, inputs: Awaited<ReturnType<typeof variationInputs>>, r: RatioRegenerator, each: number) {
+    const res = job.results.find(x => x.index === index)!, { original, assets, texts, products, knownWords, shape, request, trimmed } = inputs;
+    res.status = 'running'; delete res.error; res.attempts = (res.attempts ?? 0) + 1; writeJob(id, job);
+    const op = randomUUID(), save = (f: string, v: object) => store.write(id, `pav-${job.id}-${index}-${op.slice(0, 8)}-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`, Buffer.from(JSON.stringify(v, null, 2)));
+    try {
+      const out = await r.regenerate({ image: original, prompt: variationPrompt({ shape, theme: job.theme, customTheme: job.customTheme, index, count: job.count, texts, products, trimmed }), size: request }, save, op);
+      const { png, checks } = await protectRegenerated({ original, result: await atSize(out.image, job.size), assets, knownWords, ...(deps.recognizer ? { recognizer: deps.recognizer() } : {}) });
+      const file = `pav-${job.id}-${index}-${sha256(png).slice(0, 12)}.png`;
+      if (!store.has(id, file)) store.write(id, file, png);
+      delete res.requestId; delete res.costUsd;
+      Object.assign(res, { status: 'ready', file, checks, ...(out.requestId ? { requestId: out.requestId } : {}), ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}) });
+      job.costUsd = Math.round((job.costUsd + (out.costUsd ?? each)) * 1000) / 1000;
+    } catch (error) {
+      // (A failed request may still have been charged: counted at its estimate. An earlier result of this slot is not kept as its picture.)
+      delete res.file; delete res.checks; delete res.requestId; delete res.costUsd;
+      Object.assign(res, { status: 'failed', error: `${(error instanceof Error ? error.message : String(error)).slice(0, 300)} Nothing was retried.` });
+      job.costUsd = Math.round((job.costUsd + each) * 1000) / 1000;
+    }
+    writeJob(id, job);
+  }
+  async function runAiVariations(id: string, job: AiVariationJob, ctx: Context, r: RatioRegenerator, each: number) {
+    const inputs = await variationInputs(id, job, ctx);
+    for (const res of job.results) await makeVariation(id, job, res.index, inputs, r, each);
+    job.status = job.results.some(x => x.status === 'ready') ? 'done' : 'failed';
+    writeJob(id, job);
+  }
+  /**
+   * One variation that failed, cannot be used or has warnings (added or missing words, a product or logo not put back),
+   * made again on its own with its approved estimate: one request, never retried; the other variations, their pictures
+   * and the costs recorded are kept as they are.
+   */
+  const retryAiVariation = (id: string, jid: string, index: number, input: { approveUsd?: unknown }) => locked(`${id}:ai-variations`, async () => {
+    const job = readJob(id, jid), res = job.results.find(x => x.index === index) ?? fail('NOT_FOUND', 'That variation was not found.'), key = `${id}:${jid}`;
+    if (runningJobs.has(key)) fail('BUSY', 'These variations are still being made. Wait for them to finish.');
+    if (res.templateId) fail('INVALID_REQUEST', 'This variation was already made editable.');
+    if (!aiVariationRetriable(res)) fail('INVALID_REQUEST', 'Only a variation that failed, cannot be used or has warnings is made again; the others are kept as they are.');
+    const r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI variations are not available on this server (no OpenAI key is configured).');
+    const ctx = await contextOf(id, job.revision), issues = sourceIssues(id, ctx.snapshot);
+    if (issues.length) fail('SOURCE_NOT_READY', `Repair the master template before any paid request: ${issues.join(' ')}`);
+    const each = r.offline ? 0 : regenEstimateUsdForSize(variationSizes(ctx.snapshot.canvas, job.ratio).request);
+    if (each && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= each)) fail('APPROVAL_REQUIRED', `Making variation ${index + 1} again sends one request to ${r.model}, at most about $${each.toFixed(2)}. Approve the cost first.`, { estimateUsd: each });
+    runningJobs.add(key); job.status = 'running'; res.status = 'pending'; writeJob(id, job);
+    void (async () => {
+      await makeVariation(id, job, index, await variationInputs(id, job, ctx), r, each);
+      job.status = job.results.some(x => x.status === 'ready') ? 'done' : 'failed'; writeJob(id, job);
+    })().catch(error => console.error('ai variation retry', id, jid, index, error)).finally(() => runningJobs.delete(key));
+    return job;
+  });
+  /**
+   * One variation, looked at and approved by the person, made editable through the creation pipeline: a template of its
+   * own from the picture (already in its size), its elements found in it (`useAi`: the AI detection the person approved),
+   * then reviewed, decomposed, saved and edited like any upload. The base template is not changed. Once per variation.
+   */
+  const continueAiVariation = (id: string, jid: string, index: number, input: { approved?: unknown; useAi?: unknown; acceptWarnings?: unknown; confirmBusinessText?: unknown }) => locked(`${id}:ai-variations`, async () => {
+    const job = readJob(id, jid), res = job.results.find(x => x.index === index) ?? fail('NOT_FOUND', 'That variation was not found.');
+    if (res.status !== 'ready' || !res.file || !store.has(id, res.file)) fail('NOT_READY', 'This variation is not ready.');
+    if (res.checks?.blocking.length) fail('NOT_READY', `This variation cannot be used: ${res.checks.blocking.join(' ')}`);
+    if (input.approved !== true) fail('APPROVAL_REQUIRED', 'Look at the variation — its text, prices, dates, products, logos and QR codes — and confirm it is right before continuing.');
+    // A questionable result is used only when its warnings are accepted explicitly, one by one as listed.
+    const warnings = aiVariationWarnings(res.checks);
+    if (warnings.length && input.acceptWarnings !== true) fail('APPROVAL_REQUIRED', `Accept this variation's warnings first: ${warnings.join('; ')}.`, { warnings });
+    // Added words that look like a new price, offer, date or claim: never accepted with the rest, confirmed on their own.
+    const business = aiVariationBusinessWords(res.checks);
+    if (business.length && input.confirmBusinessText !== true) fail('APPROVAL_REQUIRED', `Confirm that these added words are not new prices, offers, dates or claims (or make the variation again): ${business.join(', ')}.`, { business });
+    const exists = (tid: string) => { try { deps.requireProduct(tid); return true; } catch { return false; } };
+    if (res.templateId && exists(res.templateId)) return { templateId: res.templateId, reused: true };
+    if (!deps.fromRegenerated) fail('NOT_CONFIGURED', 'Making it editable is not available on this server.');
+    const ratio = isOfferAspectRatio(job.ratio) ? job.ratio : offerAspectRatioOf(job.size);
+    const name = `${deps.snapshot(id, job.revision).name} · AI variation ${index + 1} · ${AI_VARIATION_THEME_LABELS[job.theme]}`.slice(0, 120);
+    const templateId = await deps.fromRegenerated({ bytes: store.read(id, res.file), name, ...(ratio ? { ratio } : {}), useAi: input.useAi === true, from: { templateId: id, draftId: `pav-${jid}-${index}` } });
+    const latest = readJob(id, jid), r2 = latest.results.find(x => x.index === index)!;
+    r2.templateId = templateId; writeJob(id, latest);
+    return { templateId, reused: false };
+  });
   // --- First-time master creation in a common ratio -------------------------------------------------------------------------
   /**
    * The master's own size, while it is created: a draft of the just-saved original revision with the template's own
@@ -1132,7 +1293,7 @@ export function createReuseStudio(deps: {
     const badge = new Set([...(out.creative.background?.stageCleaned ? ctx.grounds.empty ?? ctx.grounds.base : ctx.grounds.base).lettering].filter(([, cut]) => ctx.decorations.some(dec => inside(cut.box, dec.box))).map(([gid]) => gid));
     return { draft: d, creative: withLiveText(out.creative, badge), frame: out.frame, validation: d.outputs[ratio]?.validation ?? out.validation, composition: out.composition ?? { source: 'rules' as const, layout: '' }, preview: d.outputs[ratio]?.draftRevision === d.revision ? d.outputs[ratio]?.preview : undefined };
   };
-  return { list, create, get, update, upload, preview, generate, placeWithAi, composeWithAi, regenerateImage, continueRegenerated, save, open, decompose, masterDraft, masterCreative, compose: (id: string, did: string, ratio: ReuseAspectRatio) => compose(id, read(id, did), ratio) };
+  return { list, create, get, update, upload, preview, generate, placeWithAi, composeWithAi, regenerateImage, continueRegenerated, aiVariations, startAiVariations, aiVariation: readJob, retryAiVariation, continueAiVariation, save, open, decompose, masterDraft, masterCreative, compose: (id: string, did: string, ratio: ReuseAspectRatio) => compose(id, read(id, did), ratio) };
 }
 export type ReuseStudio = ReturnType<typeof createReuseStudio>;
 

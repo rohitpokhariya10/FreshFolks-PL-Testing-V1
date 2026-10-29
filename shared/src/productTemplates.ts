@@ -473,7 +473,9 @@ export const RATIO_REGEN_SIZES: Record<OfferAspectRatio, SourceSize> = { '1:1': 
  */
 export const RATIO_REQUEST_SIZES: Partial<Record<OfferAspectRatio, SourceSize>> = { '885:286': { width: 2496, height: 832 } };
 export const regenRequestSize = (ratio: OfferAspectRatio): SourceSize => RATIO_REQUEST_SIZES[ratio] ?? RATIO_REGEN_SIZES[ratio];
-export const ratioRegenEstimateUsd = (ratio: OfferAspectRatio) => { const { width, height } = regenRequestSize(ratio); return Math.round((0.211 * width * height / (1024 * 1024) + 6800 * 8e-6 + 1500 * 5e-6) * 100) / 100; };
+/** One image-model request's estimate for the size asked (see RATIO_REGEN_SIZES). */
+export const regenEstimateUsdForSize = ({ width, height }: SourceSize) => Math.round((0.211 * width * height / (1024 * 1024) + 6800 * 8e-6 + 1500 * 5e-6) * 100) / 100;
+export const ratioRegenEstimateUsd = (ratio: OfferAspectRatio) => regenEstimateUsdForSize(regenRequestSize(ratio));
 /** What was checked on a regenerated creative before the person sees it (QR codes, exact pictures put back, missing words). */
 export interface RegenerationChecks {
   qr: { data: string; status: 'kept' | 'restored' | 'failed' }[];
@@ -488,6 +490,46 @@ export interface RegenerationChecks {
 export interface RegeneratedImage {
   ratio: OfferAspectRatio; at: string; file: string; sha256: string; width: number; height: number;
   model: string; offline: boolean; operationId: string; requestId?: string; estimateUsd: number; costUsd?: number; checks: RegenerationChecks;
+}
+/**
+ * AI design variations of a saved template (Generate AI Variations): the whole creative redesigned by the image model —
+ * one request per variation, each in its own design direction — for a festival or theme, in one size, its business
+ * content (logos, products, QR codes, every word) kept and checked. A chosen one is made editable through the creation
+ * pipeline (detection, review, decomposition, the editor); the base template is never changed.
+ */
+export const AI_VARIATION_THEMES = ['original', 'diwali', 'holi', 'dussehra', 'karwa-chauth', 'custom'] as const;
+export type AiVariationTheme = typeof AI_VARIATION_THEMES[number];
+export const AI_VARIATION_THEME_LABELS: Record<AiVariationTheme, string> = { original: 'Keep original theme', diwali: 'Diwali', holi: 'Holi', dussehra: 'Dussehra', 'karwa-chauth': 'Karwa Chauth', custom: 'Custom theme' };
+export const AI_VARIATION_COUNTS = [3, 4, 5] as const;
+export interface AiVariationResult {
+  index: number; direction: string; status: 'pending' | 'running' | 'ready' | 'failed';
+  file?: string; checks?: RegenerationChecks; requestId?: string; costUsd?: number; error?: string;
+  /** Made editable: the template it became (detected, reviewed and decomposed there). */
+  templateId?: string;
+  /** Requests made for this variation (more than one: made again on its own, approved). */
+  attempts?: number;
+}
+/**
+ * Words added to a variation that look like new business content — a price, an amount, a percentage, a date, an offer or
+ * a promotional claim. Never accepted with the general warnings: each is confirmed on its own (the reading on this
+ * computer can misread, so it is reviewed, never decided automatically).
+ */
+const BUSINESS_WORD = /[\d₹$€£%]|^(?:rs|inr|cash|cashback|back|offer|offers|discount|discounts|off|sale|sales|deal|deals|free|save|saving|savings|win|wins|prize|prizes|voucher|vouchers|coupon|coupons|bonanza|exclusive|limited|extra|instant|emi|price|prices|only|upto|flat|valid|validity|till|until|from|now|today|hurry|bonus|reward|rewards|gift|gifts|guaranteed|lowest|best|mega|super|jackpot|festive|scan|apply|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december|mon|tue|wed|thu|fri|sat|sun)$/i;
+export const aiVariationBusinessWords = (c?: RegenerationChecks): string[] => (c?.extraWords ?? []).filter(w => BUSINESS_WORD.test(w));
+/** Whether a variation may be made again on its own (approved): it failed, cannot be used or has warnings, and was not made editable. */
+export const aiVariationRetriable = (r: AiVariationResult) => !r.templateId && (r.status === 'failed' || !!r.checks?.blocking.length || aiVariationWarnings(r.checks).length > 0);
+/** What a person must accept explicitly before a variation is used: words added or missing, products or logos not put back. */
+export function aiVariationWarnings(c?: RegenerationChecks): string[] {
+  if (!c) return [];
+  return [...(c.extraWords?.length ? [`words not in your template: ${c.extraWords.join(', ')}`] : []), ...(c.missingWords.length ? [`words of your template not read in it: ${c.missingWords.join(', ')}`] : []),
+    ...(c.assets.some(a => a.status === 'not-found') ? [`not put back with their own pixels: ${c.assets.filter(a => a.status === 'not-found').map(a => a.label).join(', ')}`] : [])];
+}
+export interface AiVariationJob {
+  id: string; templateId: string; revision: number; ratio: ProductAspectRatio; theme: AiVariationTheme; customTheme?: string; count: number;
+  model: string; offline: boolean;
+  /** The size each picture is made at (exactly the ratio; the template's own canvas for 'original'). */
+  size: SourceSize;
+  estimateUsd: number; costUsd: number; status: 'running' | 'done' | 'failed'; createdAt: string; updatedAt: string; results: AiVariationResult[];
 }
 /** The aspect ratios a variation can be made in ('original': the template's own canvas). */
 export const PRODUCT_ASPECT_RATIOS = ['original', ...OFFER_ASPECT_RATIOS] as const;
