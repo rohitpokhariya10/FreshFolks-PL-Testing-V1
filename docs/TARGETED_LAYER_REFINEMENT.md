@@ -28,6 +28,18 @@ A logo with no clear match is marked **needs review** so an authentic file can b
 
 This works on one product, character or decoration layer at a time. Text and logos are overlays and are never refined as pictures.
 
+**Defect mask: only verified pixels are trusted (`cutoutDefects`).** A decomposed object partly hidden behind another element has an estimate where it was hidden. A real case: a multi-door refrigerator whose lower-right corner stood behind a dishwasher had a flat grey block there. It also kept the dishwasher's side wall as a lighter seam, because the dishwasher's own cut-out had missed it.
+
+For the template's own cut-out, the check uses the picture it was cut from (`snapshot.source`), the object's `cutout.placement`, and the cut-outs of the elements in front of it (higher `z`, overlapping). The defect mask is:
+
+- what those front layers hide, plus a margin of 4% of the layer's smaller side;
+- solid pixels that differ from the picture by more than 40 in a channel, in a patch rather than a lone pixel, plus a 2 px margin.
+
+A layer that differs almost everywhere was redrawn as a whole, so then only what is hidden counts. Everything else is **verified** and kept byte for byte. There is no such evidence for a replaced or refined picture, or for a master adapted to another canvas, so nothing is marked there.
+
+- **Free rebuild:** defects are continued from the nearest verified pixels along each row and column, weighted by 1/distance². The door's shading and divider line carry through. The outline is kept. One-pixel spurs of the estimated outline are cleared, and the inside of a defect is made solid.
+- **AI path:** the defects are painted magenta in the request and the prompt asks for them to be redrawn. Only verified pixels are put back over the answer. The earlier restore put back every solid pixel, which pasted the grey block over the repair. A defect the model left magenta or clear is rebuilt locally and counted (`unrepairedPixels`).
+
 | Step | What happens | Cost |
 | --- | --- | --- |
 | **Clean up (free)** | `refineCutout`, on this computer. It removes specks and stray fragments (pieces smaller than max(32 px, 0.5 % of the object)) and faint haze more than 2 px away from the object. It fills pinholes (at most max(4 px, 0.05 %) and not reaching the edge), keeping real openings such as a handle's gap or a glass panel. It defringes soft edge pixels with the object's own colour. Nothing is eroded: every solid pixel stays. | none |
@@ -51,6 +63,7 @@ Routes are `GET /:id/creatives/:cid/objects/:oid/refine` (estimate) and `POST �
 
 ## Limits
 
-- Refine Cutout is in the product creative editor, not in the main Konva editor.
+- Refine Cutout is in the product creative editor (Offer Templates → Use template → the creative, including the "· master editor" one), not in the main Konva editor. An applied refinement is a new creative revision: the next Edit master → Open in Editor opens it, and saving from either editor keeps it. A duplicate gets its own copy of the refined picture.
+- The free rebuild is a continuation, not a redraw. Where the hidden part holds a feature the visible part does not continue, it carries the nearest feature across. On the real refrigerator, this leaves a small dark patch about 12 × 13 px beside the dispenser. The AI path redraws such areas.
 - The AI repair has not been checked live: its quality on real cut-outs is unverified.
 - Some templates have no regeneration record, so the word check does not apply to them. These are a text-free or Original-size variation, and a template made directly from an upload.

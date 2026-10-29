@@ -565,7 +565,7 @@
 /* Refine Cutout: one object layer compared and repaired. */
 .prt-refine { flex-basis: 100%; display: grid; gap: 8px; margin-top: 8px; padding: 12px; border: 1px solid var(--color-line); border-radius: 12px; background: #fafaf8; }
 .prt-refine h4 { margin: 0; display: flex; align-items: center; gap: 6px; font-size: 14px; }
-.prt-refine-compare { display: flex; gap: 10px; flex-wrap: wrap; }
-.prt-refine-compare figure { margin: 0; display: grid; gap: 4px; justify-items: center; font-size: 12px; color: var(--color-muted); }
-.prt-refine-compare img { max-width: 220px; max-height: 220px; object-fit: contain; border-radius: 8px; background: repeating-conic-gradient(#e8e8e8 0% 25%, #fff 0% 50%) 50% / 16px 16px; }
+.prt-refine-compare { display: flex; gap: 10px; }
+.prt-refine-compare figure { flex: 1 1 0; min-width: 0; margin: 0; display: grid; gap: 4px; justify-items: center; font-size: 12px; color: var(--color-muted); text-align: center; }
+.prt-refine-compare img { height: 220px; width: 100%; object-fit: contain; border-radius: 8px; background: repeating-conic-gradient(#e8e8e8 0% 25%, #fff 0% 50%) 50% / 16px 16px; }
 

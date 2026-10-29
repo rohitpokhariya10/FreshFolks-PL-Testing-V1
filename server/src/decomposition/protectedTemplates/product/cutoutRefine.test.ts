@@ -5,7 +5,7 @@
  */
 import sharp from 'sharp';
 import { describe, expect, it } from 'vitest';
-import { refineCutout, refineRequest, refineResult } from './cutoutRefine.js';
+import { cutoutDefects, refineCutout, refineRequest, refineResult } from './cutoutRefine.js';
 
 type Box = { x: number; y: number; width: number; height: number };
 const inBox = (b: Box, x: number, y: number) => x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
@@ -56,5 +56,63 @@ describe('Refine Cutout', { timeout: 60000 }, () => {
     expect(at(b, 10, 150)[3]).toBe(0); expect([...at(b, 100, 150)]).toEqual([...at(o, 100, 150)]);
     // The missing lower part is there now (from the repair), opaque.
     expect(at(b, 100, 250)[3]).toBeGreaterThan(200);
+  });
+});
+
+/**
+ * The defect seen in a real creative: a refrigerator whose lower-right corner stood behind a dishwasher, its cut-out
+ * holding a flat grey block there (and the dishwasher's side wall, which the dishwasher's own cut-out missed, as a lighter
+ * seam). Picture 240 × 200; the refrigerator at (40, 20), 120 × 170: a door shaded from top to bottom, a dark divider at
+ * y 150; the dishwasher in front from (130, 110), its side wall at x 126–129 in the picture but not in its cut-out.
+ */
+describe('Refine Cutout: what a front layer hid is rebuilt, never trusted', { timeout: 60000 }, () => {
+  const PW = 240, PH = 200, FX = 40, FY = 20, FW = 120, FH = 170, DX = 130, DY = 110, DW = 70, DH = 80;
+  const door = (X: number, Y: number) => { const v = Y >= 150 && Y < 153 ? 40 : Math.round(200 - (Y - FY) * 0.6) - (X === 100 ? 120 : 0); return [v, v, v + 2]; };
+  const dish = (Y: number) => (Y >= 180 && Y < 185 ? [120, 120, 125] : [215, 215, 220]);
+  const raw = (w: number, h: number, ch: number, f: (x: number, y: number) => number[]) => { const b = Buffer.alloc(w * h * ch); for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) b.set(f(x, y), (y * w + x) * ch); return b; };
+  const png = (b: Buffer, w: number, h: number, ch: 3 | 4) => sharp(b, { raw: { width: w, height: h, channels: ch } }).png().toBuffer();
+  const inFridge = (X: number, Y: number) => X >= FX && X < FX + FW && Y >= FY && Y < FY + FH;
+  /** The picture: the refrigerator, the dishwasher (and its side wall) before it, a green wall behind. */
+  const picture = () => png(raw(PW, PH, 3, (X, Y) => X >= DX && Y >= DY && X < DX + DW && Y < DY + DH ? dish(Y) : X >= 126 && X < DX && Y >= DY && Y < DY + DH ? [190, 190, 192] : inFridge(X, Y) ? door(X, Y) : [40, 140, 70]), PW, PH, 3);
+  /** The refrigerator's cut-out as it was saved: the picture where it showed, a flat grey block where the dishwasher stood. */
+  const saved = (truth = false) => png(raw(FW, FH, 4, (x, y) => { const X = FX + x, Y = FY + y, hidden = X >= DX && Y >= DY; return [...(truth ? door(X, Y) : hidden ? [200, 200, 205] : X >= 126 && Y >= DY ? [190, 190, 192] : door(X, Y)), 255]; }), FW, FH, 4);
+  const dishwasher = () => png(raw(DW, DH, 4, (_x, y) => [...dish(DY + y), 255]), DW, DH, 4);
+  const context = async () => ({ picture: await picture(), placement: { x: FX, y: FY, width: FW, height: FH }, front: [{ png: await dishwasher(), placement: { x: DX, y: DY, width: DW, height: DH } }] });
+  const rgba = async (p: Buffer) => sharp(p).ensureAlpha().raw().toBuffer(), at = (p: Buffer, x: number, y: number) => [...p.subarray((y * FW + x) * 4, (y * FW + x) * 4 + 4)];
+
+  it('marks what the dishwasher hid (with the seam beside it) and nothing the picture verifies; the free rebuild continues the door', async () => {
+    const cut = await saved(), d = await cutoutDefects(cut, await context());
+    // Hidden: 30 columns × 80 rows; the mask adds its margin (the side-wall seam at x 86–89 inside it).
+    expect(d.hiddenPixels).toBe(30 * 80); expect(d.compared).toBe(true);
+    expect(d.mask[120 * FW + 100]).toBe(1); expect(d.mask[120 * FW + 87]).toBe(1);
+    expect(d.mask[120 * FW + 60]).toBe(0); expect(d.mask[60 * FW + 100]).toBe(0);
+    const r = await refineCutout(cut, d.mask), a = await rgba(cut), b = await rgba(r.png);
+    expect([r.width, r.height]).toEqual([FW, FH]); expect(r.rebuiltPixels).toBe(d.count);
+    // The grey block is the door now: its shading at that height, the divider carried through; the seam gone.
+    const shade = (y: number) => Math.round(200 - y * 0.6);
+    expect(Math.abs(at(b, 100, 140)[0] - shade(140))).toBeLessThanOrEqual(6);
+    expect(Math.abs(at(b, 110, 160)[0] - shade(160))).toBeLessThanOrEqual(6);
+    expect(at(b, 110, 131)[0]).toBeLessThan(80);
+    expect(Math.abs(at(b, 87, 120)[0] - shade(120))).toBeLessThanOrEqual(6);
+    // Verified pixels exactly as they were; the outline (every alpha) the same.
+    for (let y = 0; y < FH; y += 2) for (let x = 0; x < FW; x += 2) { if (!d.mask[y * FW + x]) expect(at(b, x, y)).toEqual(at(a, x, y)); expect(at(b, x, y)[3]).toBe(at(a, x, y)[3]); }
+  });
+
+  it('an AI repair keeps what it redrew where the defect was — the old restore pasted the grey block back — and its leftovers are rebuilt here', async () => {
+    const cut = await saved(), d = await cutoutDefects(cut, await context()), place = await refineRequest(cut, d.mask);
+    // The request shows the defect in magenta.
+    const sent = await sharp(place.image).raw().toBuffer(), sx = place.rect.left + Math.round(100.5 * place.rect.width / FW), sy = place.rect.top + Math.round(140.5 * place.rect.height / FH);
+    expect([...sent.subarray((sy * place.size.width + sx) * 4, (sy * place.size.width + sx) * 4 + 3)]).toEqual([255, 0, 255]);
+    // A model that redraws the door: its picture of the corner is kept; verified pixels stay the original's own.
+    const onGreen = async (p: Buffer) => sharp({ create: { width: place.size.width, height: place.size.height, channels: 3, background: { r: 0, g: 255, b: 0 } } }).composite([{ input: await sharp(p).resize(place.rect.width, place.rect.height, { fit: 'fill' }).png().toBuffer(), left: place.rect.left, top: place.rect.top }]).png().toBuffer();
+    const answer = await onGreen(await saved(true)), fixed = await rgba((await refineResult(answer, cut, place, d.mask)).png);
+    expect(Math.abs(at(fixed, 100, 140)[0] - Math.round(200 - 140 * 0.6))).toBeLessThanOrEqual(10);
+    expect(at(fixed, 30, 40)).toEqual(at(await rgba(cut), 30, 40));
+    // (Without the defect mask — the earlier restore — every solid original pixel went back: the grey block returned.)
+    expect(at(await rgba((await refineResult(answer, cut, place)).png), 100, 140).slice(0, 3)).toEqual([200, 200, 205]);
+    // A model that left the magenta: those pixels are rebuilt here instead, and counted.
+    const lazy = await refineResult(place.image, cut, place, d.mask), l = await rgba(lazy.png);
+    expect(lazy.unrepairedPixels).toBeGreaterThan(30 * 80 * 0.9);
+    expect(Math.abs(at(l, 100, 140)[0] - Math.round(200 - 140 * 0.6))).toBeLessThanOrEqual(6); expect(at(l, 100, 140)[1]).toBeGreaterThan(60);
   });
 });

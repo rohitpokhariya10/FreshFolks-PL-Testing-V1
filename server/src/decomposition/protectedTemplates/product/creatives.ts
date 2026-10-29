@@ -15,7 +15,7 @@ import { RunError } from '../../layerizeExperiment.js';
 import type { ProtectedStore } from '../store.js';
 import { sha256 } from '../pixels.js';
 import { cutOutUpload } from './uploadCutout.js';
-import { refineCutout, refinePrompt, refineRequest, refineResult } from './cutoutRefine.js';
+import { cutoutDefects, refineCutout, refinePrompt, refineRequest, refineResult } from './cutoutRefine.js';
 import type { RatioRegenerator } from './ratioRegeneration.js';
 import { createProductCreativeRun, existingProductCreativeRun } from './creativeRun.js';
 import { artworkBase } from './artworkText.js';
@@ -147,10 +147,25 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
     return { c, o, png: store.read(id, o.asset.file) };
   };
   const refined = async (id: string, cid: string, png: Buffer) => { const file = `pcr-${cid.slice(3)}-${sha256(png).slice(0, 12)}.png`; if (!store.has(id, file)) store.write(id, file, png); return file; };
+  /**
+   * Where the object's picture is not verified (cutoutDefects): only for the template's own cut-out, checked against the
+   * picture it was cut from and the layers in front of it there (the template's placements). A replaced or refined
+   * picture, or a master adapted to another canvas, has no such evidence: nothing is marked.
+   */
+  const defectsOf = async (id: string, c: ProductCreative, o: ProductCreativeObject, png: Buffer) => {
+    if (o.asset.kind !== 'template') return undefined;
+    const s = deps.snapshot(id, c.templateRevision), own = s.objects.find(x => x.id === o.id);
+    if (!own?.cutout || own.cutout.file !== o.asset.file || s.adaptation || !store.has(id, s.source.file)) return undefined;
+    const p = own.cutout.placement, meets = (q: PixelRect) => q.x < p.x + p.width && p.x < q.x + q.width && q.y < p.y + p.height && p.y < q.y + q.height;
+    const front = s.objects.filter(x => x.id !== o.id && x.cutout && x.z > own.z && meets(x.cutout.placement) && store.has(id, x.cutout.file)).map(x => ({ png: store.read(id, x.cutout!.file), placement: x.cutout!.placement }));
+    const d = await cutoutDefects(png, { picture: store.read(id, s.source.file), placement: p, front });
+    return d.count ? d : undefined;
+  };
+  const defectReport = (d: Awaited<ReturnType<typeof defectsOf>>) => ({ defectPixels: d?.count ?? 0, hiddenPixels: d?.hiddenPixels ?? 0, differingPixels: d?.differingPixels ?? 0 });
   /** Free, on this computer: the cleaned picture to compare with the current one. The creative is not changed. */
   const refineLocal = (id: string, cid: string, objectId: string) => locked(`${id}:${cid}`, async () => {
-    const { o, png } = refinable(id, cid, objectId), r = await refineCutout(png);
-    return { before: o.asset.file, file: await refined(id, cid, r.png), width: r.width, height: r.height, removedPixels: r.removedPixels, filledPixels: r.filledPixels, defringedPixels: r.defringedPixels, requests: 0 };
+    const { c, o, png } = refinable(id, cid, objectId), d = await defectsOf(id, c, o, png), r = await refineCutout(png, d?.mask);
+    return { before: o.asset.file, file: await refined(id, cid, r.png), width: r.width, height: r.height, removedPixels: r.removedPixels, filledPixels: r.filledPixels, defringedPixels: r.defringedPixels, rebuiltPixels: r.rebuiltPixels, ...defectReport(d), requests: 0 };
   });
   /** What one AI repair of this object sends and may cost (shown before it is approved). */
   const refineEstimate = async (id: string, cid: string, objectId: string) => {
@@ -162,15 +177,15 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
    * picture. The creative is not changed — a failure leaves it exactly as it was.
    */
   const refineWithAi = (id: string, cid: string, objectId: string, input: { approveUsd?: unknown }) => locked(`${id}:${cid}`, async () => {
-    const { o, png } = refinable(id, cid, objectId), r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI repair is not available on this server (no OpenAI key is configured). Use the free clean-up.');
-    const place = await refineRequest(png), estimateUsd = r.offline ? 0 : regenEstimateUsdForSize(place.size);
+    const { c, o, png } = refinable(id, cid, objectId), r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI repair is not available on this server (no OpenAI key is configured). Use the free clean-up.');
+    const d = await defectsOf(id, c, o, png), place = await refineRequest(png, d?.mask), estimateUsd = r.offline ? 0 : regenEstimateUsdForSize(place.size);
     if (estimateUsd && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= estimateUsd)) fail('APPROVAL_REQUIRED', `Repairing ${o.label} with AI sends one request to ${r.model} (${place.size.width} × ${place.size.height}), at most about $${estimateUsd.toFixed(2)}. Approve the cost first.`, { estimateUsd });
     const op = randomBytes(4).toString('hex'), save = (f: string, v: object) => store.write(id, `pcr-${cid.slice(3)}-${op}-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`, Buffer.from(JSON.stringify(v, null, 2)));
     let out: Awaited<ReturnType<RatioRegenerator['regenerate']>>;
-    try { out = await r.regenerate({ image: place.image, prompt: refinePrompt(o.label), size: place.size }, save, op); }
+    try { out = await r.regenerate({ image: place.image, prompt: refinePrompt(o.label, !!d), size: place.size }, save, op); }
     catch (error) { fail('PROVIDER_FAILED', `The AI repair did not complete: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}. Nothing was retried; ${o.label} is unchanged.`, { estimateUsd }); }
-    const res = await refineResult(out.image, png, place), file = await refined(id, cid, res.png);
-    const usage = { model: r.model, offline: r.offline, size: place.size, estimateUsd, ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}), ...(out.requestId ? { requestId: out.requestId } : {}), file };
+    const res = await refineResult(out.image, png, place, d?.mask), file = await refined(id, cid, res.png);
+    const usage = { model: r.model, offline: r.offline, size: place.size, estimateUsd, ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}), ...(out.requestId ? { requestId: out.requestId } : {}), file, ...defectReport(d), unrepairedPixels: res.unrepairedPixels };
     save('ai-repair.json', usage);
     return { before: o.asset.file, ...usage, width: res.width, height: res.height, requests: 1 };
   });
@@ -186,7 +201,7 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
   });
   const duplicate = (id: string, cid: string, input: { name?: unknown }) => locked(`${id}:creatives`, async () => {
     const old = read(id, cid), at = nowIso(), copyId = hexId('pc', 3);
-    const copyFile = (f: string) => { const to = f.replace(`pca-${cid.slice(3)}-`, `pca-${copyId.slice(3)}-`); if (to !== f && !store.has(id, to)) store.write(id, to, store.read(id, f)); return to; };
+    const copyFile = (f: string) => { const to = f.replace(new RegExp(`^(pca|pcr)-${cid.slice(3)}-`), `$1-${copyId.slice(3)}-`); if (to !== f && !store.has(id, to)) store.write(id, to, store.read(id, f)); return to; };
     const copy: ProductCreative = { ...old, id: copyId, name: typeof input.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 120) : `${old.name} (copy)`.slice(0, 120), createdAt: at, updatedAt: at, revision: 1,
       objects: old.objects.map(o => o.asset.kind === 'upload' ? { ...o, asset: { ...o.asset, file: copyFile(o.asset.file) } } : o),
       images: old.images.map(i => i.asset.kind === 'creative' ? { ...i, asset: { ...i.asset, file: copyFile(i.asset.file) } } : i),
@@ -232,6 +247,8 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
     const templateFiles = new Set([...snapshot.logoSlots.flatMap(l => [l.original.file, l.replacement?.file]), ...snapshot.objects.map(o => o.cutout?.file),
       ...(snapshot.editorCreative?.images.map(i => i.asset.file) ?? []), ...(snapshot.editorCreative?.objects.map(o => o.asset.file) ?? [])].filter((f): f is string => !!f));
     const own = (f: unknown) => typeof f === 'string' && f.startsWith(`pca-${old.id.slice(3)}-`) && store.has(id, f);
+    // (An object's refined cut-out — Refine Cutout — is this creative's own picture too.)
+    const ownObject = (f: unknown) => own(f) || (typeof f === 'string' && f.startsWith(`pcr-${old.id.slice(3)}-`) && f.endsWith('.png') && store.has(id, f));
     const texts: CreativeText[] = c.texts.map((t, k) => {
       const what = `Text ${k + 1}`, s = t?.style;
       if (!t || typeof t.text !== 'string' || t.text.length > 200 || /[\n\r]/.test(t.text) || !groupIds.has(t.groupId)) fail('INVALID_CREATIVE', `${what}: one line of text in a group, up to 200 characters.`);
@@ -259,7 +276,7 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
       if (!o || typeof o.label !== 'string' || !(PRODUCT_OBJECT_KINDS as readonly string[]).includes(o.kind) || !num(o.z, 0, 100000)) fail('INVALID_CREATIVE', `${what} is malformed.`);
       const previous = old.objects.find(x => x.id === o.id);
       const asset = a && templateFiles.has(a.file) ? { kind: 'template' as const, file: a.file }
-        : a?.kind === 'upload' && own(a.file) ? (previous?.asset.kind === 'upload' && previous.asset.file === a.file ? previous.asset : { ...a, sha256: sha256(store.read(id, a.file)) })
+        : a?.kind === 'upload' && ownObject(a.file) ? (previous?.asset.kind === 'upload' && previous.asset.file === a.file ? previous.asset : { ...a, sha256: sha256(store.read(id, a.file)) })
         : fail('INVALID_CREATIVE', `${what} (${o.label}): its picture is not one of this template's or this creative's files.`);
       const b = box(o.box, what);
       return { id: unique(o.id, what, v => typeof v === 'string' && OBJECT_ID.test(v)), objectId: o.objectId && snapshot.objects.some(x => x.id === o.objectId) ? o.objectId : null, kind: o.kind as ProductObjectKind, label: o.label.slice(0, 120),

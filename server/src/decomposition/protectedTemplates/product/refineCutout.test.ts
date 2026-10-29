@@ -52,6 +52,12 @@ describe('Refine Cutout (HTTP, test double)', { timeout: 180000 }, () => {
       expect(c1.texts).toEqual(c0.texts); expect(c1.images).toEqual(c0.images); expect(c1.canvas).toEqual(c0.canvas);
       // The previous picture is still in the creative's history.
       expect((await s.call<ProductCreative>(`/${id}/creatives/${cid}?revision=${c0.revision}`)).body.objects.find(o => o.id === fridge.id)!.asset.file).toBe(fridge.asset.file);
+      // Saved again (as either editor does): the refined picture is the creative's own and stays; a copy gets its own.
+      const c2 = (await s.send<ProductCreative>('PUT', `/${id}/creatives/${cid}`, { expectedRevision: c1.revision, creative: c1 })).body;
+      expect(c2.revision).toBe(c1.revision + 1); expect(c2.objects.find(o => o.id === fridge.id)!.asset.file).toBe(ai.file);
+      const copy = (await s.send<ProductCreative>('POST', `/${id}/creatives/${cid}/duplicate`, {})).body, copied = copy.objects.find(o => o.id === fridge.id)!.asset.file;
+      expect(copied).toMatch(new RegExp(`^pcr-${copy.id.slice(3)}-`));
+      expect((await s.send<ProductCreative>('PUT', `/${id}/creatives/${copy.id}`, { expectedRevision: copy.revision, creative: copy })).body.objects.find(o => o.id === fridge.id)!.asset.file).toBe(copied);
       // Text and logos are overlays, never refined as pictures: a logo is not an object here.
       expect((await s.send<{ error: { code: string } }>('POST', `/${id}/creatives/${cid}/objects/${c0.images[0].id}/refine/local`, {})).body.error.code).toBe('NOT_FOUND');
       expect(calls).toBe(2);
