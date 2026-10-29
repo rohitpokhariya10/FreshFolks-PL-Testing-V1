@@ -23,7 +23,10 @@
  */
 import sharp from 'sharp';
 
-export interface CutoutRefinement { png: Buffer; width: number; height: number; removedPixels: number; filledPixels: number; defringedPixels: number; rebuiltPixels: number }
+export interface CutoutRefinement { png: Buffer; width: number; height: number; removedPixels: number; filledPixels: number; defringedPixels: number; rebuiltPixels: number; clearedPixels: number }
+/** What to repair: the pixels to rebuild as the object (`mask`) and, past its outline, to make transparent (`clear`). */
+export type CutoutRepair = Uint8Array | { mask: Uint8Array; clear?: Uint8Array };
+const repairParts = (d: CutoutRepair | undefined) => (!d ? undefined : d instanceof Uint8Array ? { mask: d, clear: undefined } : d);
 const SOLID = 128;
 type Rect = { x: number; y: number; width: number; height: number };
 
@@ -32,13 +35,31 @@ type Rect = { x: number; y: number; width: number; height: number };
  * and the background plate the decomposition made (the picture without its objects), when known.
  */
 export interface CutoutContext { picture: Buffer; placement: Rect; front: { png: Buffer; placement: Rect }[]; plate?: Buffer }
-export interface CutoutDefects { mask: Uint8Array; count: number; hiddenPixels: number; differingPixels: number; foreignPixels: number; compared: boolean }
+/**
+ * A region of the background plate's content in the layer and what is done with it: `rebuild` — inside the object's
+ * outline (verified object pixels on two sides across a corner, or on two opposite sides: a wheel over a refrigerator's
+ * corner), rebuilt as the object; `clear` — past it (verified object on one side at most: the backdrop under an air
+ * conditioner), made transparent; `keep` — a thin band along the outline (a purifier's light rim against a light wall),
+ * left as it is: it cannot be told from the object's own edge.
+ */
+export interface CutoutRegion { kind: 'background' | 'hidden'; action: 'rebuild' | 'clear' | 'keep'; pixels: number; box: Rect; thickness: number }
+export interface CutoutDefects {
+  /** Pixels to rebuild as the object (hidden, the plate's content inside it, differing patches, with their margins). */
+  mask: Uint8Array; count: number;
+  /** Pixels to make transparent (the plate's content past the object's outline). */
+  clear: Uint8Array; clearCount: number;
+  hiddenPixels: number; differingPixels: number; foreignPixels: number; keptPixels: number; keptHiddenPixels: number; compared: boolean;
+  hidden: Uint8Array; foreign: Uint8Array; regions: CutoutRegion[];
+}
 /**
  * Where a cut-out is not verified (see the top of this file): its pixels hidden behind a front layer (at least half
  * opaque there), and solid pixels differing from the picture by more than 40 in a channel — in a patch, not a lone pixel
  * or a one-pixel line along an edge — with a margin for their fringe. A layer differing almost everywhere was redrawn
  * as a whole (its colours are not the picture's): then only what is hidden counts. With the plate: the plate's content
- * the layer claims (`plateContent`).
+ * the layer claims (`plateContent`), each region rebuilt, cleared or kept (`CutoutRegion`) — hidden pixels too: what the
+ * decomposition put behind a layer in front can itself be the background (the backdrop under an air conditioner, behind
+ * a speaker). What is hidden and unlike the background is rebuilt within the outline the decomposition gave it, never
+ * cleared: a television half behind a soundbar keeps its lower half.
  */
 export async function cutoutDefects(png: Buffer, ctx: CutoutContext): Promise<CutoutDefects> {
   const { data: px, info } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true }), w = info.width, h = info.height, n = w * h;
@@ -69,19 +90,93 @@ export async function cutoutDefects(png: Buffer, ctx: CutoutContext): Promise<Cu
   }
   const compared = differing <= opaque * 0.3;
   const { foreign, rare } = ctx.plate ? await plateContent(png, px, w, h, p, ctx.plate, hidden) : { foreign: new Uint8Array(n), rare: new Uint8Array(n) };
+  const { inside, outside, keepHidden, regions } = placeRegions(px, w, h, foreign, hidden, compared ? patch : new Uint8Array(n));
+  const rebuildHidden = new Uint8Array(n); for (let i = 0; i < n; i++) rebuildHidden[i] = hidden[i] && !outside[i] && !keepHidden[i] ? 1 : 0;
   // The margins: what is hidden, 4 % of the layer's smaller side (a front layer's own cut-out can miss a few pixels of it
   // — a dishwasher's side wall left on the refrigerator as a lighter seam); the plate's content, as far into colours not
-  // the object's own (a wheel's outer ring of dots matches the plate only in part) and 2 % into the rest (its soft edge tints the door); a differing
-  // patch, 2 px.
-  const margin = Math.max(2, Math.round(Math.min(w, h) * 0.04));
-  const near = grow(hidden, w, h, margin), farForeign = grow(foreign, w, h, margin), nearForeign = grow(foreign, w, h, Math.max(3, Math.round(Math.min(w, h) * 0.02))), nearPatch = compared ? grow(patch, w, h, 2) : new Uint8Array(n);
-  const mask = new Uint8Array(n);
-  let count = 0, hiddenPixels = 0, foreignPixels = 0;
+  // the object's own (a wheel's outer ring of dots matches the plate only in part) and 2 % into the rest (its soft edge
+  // tints the door); a differing patch, 2 px.
+  const margin = Math.max(2, Math.round(Math.min(w, h) * 0.04)), soft = Math.max(3, Math.round(Math.min(w, h) * 0.02));
+  const near = grow(rebuildHidden, w, h, margin), farForeign = grow(inside, w, h, margin), nearForeign = grow(inside, w, h, soft), nearPatch = compared ? grow(patch, w, h, 2) : new Uint8Array(n);
+  const farOut = grow(outside, w, h, soft);
+  const mask = new Uint8Array(n), clear = new Uint8Array(n);
+  let count = 0, clearCount = 0, hiddenPixels = 0, foreignPixels = 0, keptPixels = 0, keptHiddenPixels = 0;
   for (let i = 0; i < n; i++) {
-    if (hidden[i]) hiddenPixels++; else if (foreign[i]) foreignPixels++;
-    if (px[i * 4 + 3] && (near[i] || nearPatch[i] || nearForeign[i] || (farForeign[i] && rare[i]))) { mask[i] = 1; count++; }
+    if (hidden[i]) { hiddenPixels++; if (keepHidden[i]) keptHiddenPixels++; } else if (foreign[i]) { foreignPixels++; if (!inside[i] && !outside[i]) keptPixels++; }
+    if (!px[i * 4 + 3]) continue;
+    // Past the outline: the region, and the fringe of its own colours around it (never what is hidden or verified).
+    if (outside[i] || (farOut[i] && rare[i] && !inside[i] && !hidden[i])) { clear[i] = 1; clearCount++; continue; }
+    if (keepHidden[i]) continue;
+    if (near[i] || nearPatch[i] || nearForeign[i] || (farForeign[i] && rare[i])) { mask[i] = 1; count++; }
   }
-  return { mask, count, hiddenPixels, differingPixels: compared ? differing : 0, foreignPixels, compared };
+  return { mask, count, clear, clearCount, hiddenPixels, differingPixels: compared ? differing : 0, foreignPixels, keptPixels, keptHiddenPixels, compared, hidden, foreign, regions };
+}
+
+/**
+ * Each region (8-connected) of the plate's content, then of what is hidden and unlike the background, placed against the
+ * object's verified pixels (solid, neither hidden, the plate's nor differing): the bands just past its bounding box on
+ * each side (2 px out, max(4 px, 2 %) deep, along the box) — a side is the object's when at least half of its band is
+ * verified object; inside its outline with two sides across a corner or two opposite sides.
+ *   the plate's content   thinner than max(3 px, 1 % of the layer's smaller side): a band longer than three times that,
+ *                         `keep`; a speck, inside `rebuild`, else `keep`. Thicker: inside, `rebuild`; else `clear`.
+ *   hidden                thinner, or inside, `rebuild`; else, mostly in colours not the object's own, `clear` (the
+ *                         decomposition's backdrop under an air conditioner, behind a speaker); in its own colours,
+ *                         `keep` — left as decomposed and reported (a television behind a soundbar as wide as it).
+ * (Measured on 160 saved product cut-outs: the Navratri wheel 20 px thick, object left and below; a chevron over a
+ * refrigerator's corner 9 px, left and above; a purifier's rim 1–2 px; the backdrop under an air conditioner 5 and 11 px,
+ * object above at most; the block behind its speaker, no side.)
+ */
+function placeRegions(px: Buffer, w: number, h: number, foreign: Uint8Array, hidden: Uint8Array, patch: Uint8Array) {
+  const n = w * h, inside = new Uint8Array(n), outside = new Uint8Array(n), keepHidden = new Uint8Array(n), regions: CutoutRegion[] = [];
+  const thin = Math.max(3, Math.round(Math.min(w, h) * 0.01)), depth = Math.max(4, Math.round(Math.min(w, h) * 0.02));
+  const verified = (i: number) => px[i * 4 + 3] >= 250 && !hidden[i] && !foreign[i] && !patch[i];
+  // The object's own colours: over its verified pixels.
+  const rareColour = colourRarity(px, n, verified), ownColour = (i: number) => !rareColour(i);
+  const seen = new Uint8Array(n), stack: number[] = [], within = new Float32Array(n), band = new Uint8Array(n);
+  const specks: { members: number[]; inside: boolean; region: CutoutRegion }[] = [];
+  for (const kind of ['background', 'hidden'] as const) for (let s = 0; s < n; s++) {
+    const member = kind === 'background' ? (i: number) => foreign[i] === 1 : (i: number) => hidden[i] === 1 && !foreign[i] && px[i * 4 + 3] >= SOLID;
+    if (!member(s) || seen[s]) continue;
+    const members: number[] = []; let x0 = w, y0 = h, x1 = -1, y1 = -1; seen[s] = 1; stack.push(s);
+    while (stack.length) {
+      const i = stack.pop()!, x = i % w, y = (i - x) / w; members.push(i);
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= w || Y >= h) continue; const j = Y * w + X; if (member(j) && !seen[j]) { seen[j] = 1; stack.push(j); } }
+    }
+    // Its thickness: the largest distance from a member to the nearest pixel outside it (two passes, within its box).
+    const at = (x: number, y: number) => (x < x0 || y < y0 || x > x1 || y > y1 ? 0 : within[y * w + x]);
+    for (const i of members) within[i] = 1e9;
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) { const i = y * w + x; if (within[i]) within[i] = Math.min(within[i], at(x - 1, y) + 1, at(x, y - 1) + 1); }
+    for (let y = y1; y >= y0; y--) for (let x = x1; x >= x0; x--) { const i = y * w + x; if (within[i]) within[i] = Math.min(within[i], at(x + 1, y) + 1, at(x, y + 1) + 1); }
+    let thickness = 0; for (const i of members) thickness = Math.max(thickness, within[i]);
+    for (const i of members) within[i] = 0;
+    const box = { x: x0, y: y0, width: x1 - x0 + 1, height: y1 - y0 + 1 };
+    // Thin: a band along the outline is kept; a small compact speck enclosed by the object and away from any such band
+    // (the backdrop's green in a notch at the top of a door gap — not a piece of a purifier's rim at its corner) is
+    // rebuilt; nothing thin is ever cleared.
+    const small = thickness < thin, long = Math.max(box.width, box.height) > 3 * thin;
+    if (small && (long || kind === 'hidden')) {
+      if (kind === 'background') for (const i of members) band[i] = 1;
+      regions.push({ kind, action: kind === 'hidden' ? 'rebuild' : 'keep', pixels: members.length, box, thickness }); continue;
+    }
+    const side = (xs: [number, number], ys: [number, number]) => {
+      let v = 0, c = 0;
+      for (let y = ys[0]; y <= ys[1]; y++) for (let x = xs[0]; x <= xs[1]; x++) { c++; if (x >= 0 && y >= 0 && x < w && y < h && verified(y * w + x)) v++; }
+      return c > 0 && v >= c / 2;
+    };
+    const L = side([x0 - 1 - depth, x0 - 2], [y0, y1]), R = side([x1 + 2, x1 + 1 + depth], [y0, y1]), T = side([x0, x1], [y0 - 1 - depth, y0 - 2]), B = side([x0, x1], [y1 + 2, y1 + 1 + depth]);
+    const within_ = ((L || R) && (T || B)) || (L && R) || (T && B);
+    let foreignColours = 0; if (!within_ && kind === 'hidden') for (const i of members) if (!ownColour(i)) foreignColours++;
+    if (small) { const region: CutoutRegion = { kind, action: 'keep', pixels: members.length, box, thickness }; specks.push({ members, inside: within_, region }); regions.push(region); continue; }
+    const action = within_ ? 'rebuild' : kind === 'background' || foreignColours > members.length / 2 ? 'clear' : 'keep';
+    if (kind === 'background') { if (action !== 'keep') for (const i of members) (action === 'rebuild' ? inside : outside)[i] = 1; }
+    else if (action !== 'rebuild') for (const i of members) (action === 'clear' ? outside : keepHidden)[i] = 1;
+    regions.push({ kind, action, pixels: members.length, box, thickness });
+  }
+  // The specks, once every band is known: rebuilt when enclosed and not within 2 × max(3 px, 1 %) of a band.
+  const nearBand = grow(band, w, h, 2 * thin);
+  for (const sp of specks) if (sp.inside && !sp.members.some(i => nearBand[i])) { sp.region.action = 'rebuild'; for (const i of sp.members) inside[i] = 1; }
+  return { inside, outside, keepHidden, regions };
 }
 
 /**
@@ -100,7 +195,7 @@ async function plateContent(png: Buffer, px: Buffer, w: number, h: number, p: Re
   const sharpPlate = await sharp(plate).removeAlpha().raw().toBuffer();
   let solid = 0, matched = 0;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const i = y * w + x; if (px[i * 4 + 3] < 250 || hidden[i]) continue;
+    const i = y * w + x; if (px[i * 4 + 3] < 250) continue;
     solid++;
     const X = Math.floor(p.x + (x + 0.5) * p.width / w), Y = Math.floor(p.y + (y + 0.5) * p.height / h);
     let best = 255;
@@ -114,10 +209,8 @@ async function plateContent(png: Buffer, px: Buffer, w: number, h: number, p: Re
     if (best <= 32) { shared[i] = 1; matched++; }
   }
   if (!matched || matched > solid * 0.3) return { foreign: out, rare: rareMask };
-  // The object's own colours: 8 levels a channel, over its solid pixels not shared with the plate.
-  const bin = (i: number) => (px[i * 4] >> 5) * 64 + (px[i * 4 + 1] >> 5) * 8 + (px[i * 4 + 2] >> 5), own = new Uint32Array(512);
-  let owned = 0; for (let i = 0; i < n; i++) if (px[i * 4 + 3] >= 250 && !shared[i] && !hidden[i]) { own[bin(i)]++; owned++; }
-  const rare = (i: number) => own[bin(i)] < owned * 0.005;
+  // The object's own colours: over its solid pixels not shared with the plate.
+  const rare = colourRarity(px, n, i => px[i * 4 + 3] >= 250 && !shared[i] && !hidden[i]);
   for (let i = 0; i < n; i++) if (px[i * 4 + 3] >= SOLID && rare(i)) rareMask[i] = 1;
   const label = new Int32Array(n).fill(-1), stack: number[] = [];
   for (let s = 0; s < n; s++) {
@@ -134,6 +227,16 @@ async function plateContent(png: Buffer, px: Buffer, w: number, h: number, p: Re
     if (edge && foreignColours >= members.length / 2) for (const i of members) if (rareMask[i]) out[i] = 1;
   }
   return { foreign: out, rare: rareMask };
+}
+/**
+ * Whether a pixel's colour is not the object's own: fewer than 0.5 % of the counted pixels share its colour (8 levels a
+ * channel): the wheel's purple and yellow on a grey refrigerator, a beige backdrop under a white air conditioner. (A
+ * smooth gradient spreads thin over many such colours: `placeRegions` also asks for an edge against the object.)
+ */
+function colourRarity(px: Buffer, n: number, counted: (i: number) => boolean) {
+  const bin = (i: number) => (px[i * 4] >> 5) * 64 + (px[i * 4 + 1] >> 5) * 8 + (px[i * 4 + 2] >> 5), own = new Uint32Array(512);
+  let total = 0; for (let i = 0; i < n; i++) if (counted(i)) { own[bin(i)]++; total++; }
+  return (i: number) => own[bin(i)] < total * 0.005;
 }
 /** A mask grown by `r` pixels (a square: rows, then columns). */
 function grow(mask: Uint8Array, w: number, h: number, r: number) {
@@ -152,15 +255,18 @@ function grow(mask: Uint8Array, w: number, h: number, r: number) {
 
 /**
  * Defects rebuilt from the object's verified pixels (solid, not a defect), in place: each from the nearest verified
- * pixels along its row and column (two of them, inwards, never across a clear gap), weighted by 1 / distance², so a
- * long thin hidden strip continues across its short side; what no straight line reaches, from its rebuilt neighbours.
+ * pixels along its row and column (two of them, inwards, never across a clear gap), weighted by 1 / distance² — so a
+ * long thin hidden strip continues across its short side — and by whether each axis's two sides agree; what no straight
+ * line reaches, from its rebuilt neighbours.
  * Its alpha — the outline — is kept; inside it (2 px from any clear pixel) a defect is solid, not a faint see-through seam.
  */
 function rebuild(px: Buffer, w: number, h: number, defect: Uint8Array) {
   const n = w * h, ok = (i: number) => !defect[i] && px[i * 4 + 3] >= 250, todo = (i: number) => defect[i] === 1 && px[i * 4 + 3] > 0;
-  const sum = new Float32Array(n * 3), weight = new Float32Array(n);
-  // Four sweeps (left, right, up, down): the colour of the nearest two verified pixels before each one, and how far.
-  const sweep = (lines: number, length: number, at: (line: number, k: number) => number) => {
+  // Each pixel to rebuild: from each of four sweeps (left, right, up, down) the colour of the nearest two verified pixels
+  // before it and how far (stored by direction for those pixels only).
+  const slot = new Int32Array(n).fill(-1); let m = 0; for (let i = 0; i < n; i++) if (todo(i)) slot[i] = m++;
+  const col = new Float32Array(m * 12), dist = new Int32Array(m * 4);
+  const sweep = (dir: number, lines: number, length: number, at: (line: number, k: number) => number) => {
     for (let l = 0; l < lines; l++) {
       let r = 0, g = 0, b = 0, d = -1, prev = -1;
       for (let k = 0; k < length; k++) {
@@ -171,14 +277,28 @@ function rebuild(px: Buffer, w: number, h: number, defect: Uint8Array) {
           r = (px[i * 4] + px[j * 4]) / 2; g = (px[i * 4 + 1] + px[j * 4 + 1]) / 2; b = (px[i * 4 + 2] + px[j * 4 + 2]) / 2; d = 0;
         } else if (d >= 0) {
           d++;
-          if (todo(i)) { const k2 = 1 / (d * d); sum[i * 3] += r * k2; sum[i * 3 + 1] += g * k2; sum[i * 3 + 2] += b * k2; weight[i] += k2; }
+          const t = slot[i]; if (t >= 0) { col[t * 12 + dir * 3] = r; col[t * 12 + dir * 3 + 1] = g; col[t * 12 + dir * 3 + 2] = b; dist[t * 4 + dir] = d; }
         }
         prev = i;
       }
     }
   };
-  sweep(h, w, (y, x) => y * w + x); sweep(h, w, (y, x) => y * w + (w - 1 - x));
-  sweep(w, h, (x, y) => y * w + x); sweep(w, h, (x, y) => (h - 1 - y) * w + x);
+  sweep(0, h, w, (y, x) => y * w + x); sweep(1, h, w, (y, x) => y * w + (w - 1 - x));
+  sweep(2, w, h, (x, y) => y * w + x); sweep(3, w, h, (x, y) => (h - 1 - y) * w + x);
+  // Weighted by 1 / distance²; an axis whose two sides agree (within 30 in every channel) counts 100 times more, one whose
+  // sides differ 100 times less: a soundbar's strip under a television's picture continues the wall on its left and right,
+  // not the picture above it into the wall below.
+  const sum = new Float32Array(n * 3), weight = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const t = slot[i]; if (t < 0) continue;
+    const wt = [0, 1, 2, 3].map(k => (dist[t * 4 + k] ? 1 / (dist[t * 4 + k] * dist[t * 4 + k]) : 0));
+    for (const [a, b] of [[0, 1], [2, 3]]) {
+      if (!wt[a] || !wt[b]) continue;
+      let diff = 0; for (let c = 0; c < 3; c++) diff = Math.max(diff, Math.abs(col[t * 12 + a * 3 + c] - col[t * 12 + b * 3 + c]));
+      const k = diff <= 30 ? 100 : 0.01; wt[a] *= k; wt[b] *= k;
+    }
+    for (let k = 0; k < 4; k++) { if (!wt[k]) continue; for (let c = 0; c < 3; c++) sum[i * 3 + c] += col[t * 12 + k * 3 + c] * wt[k]; weight[i] += wt[k]; }
+  }
   let rebuilt = 0;
   const done = new Uint8Array(n), left: number[] = [];
   for (let i = 0; i < n; i++) {
@@ -211,10 +331,17 @@ function rebuild(px: Buffer, w: number, h: number, defect: Uint8Array) {
   return rebuilt;
 }
 
-/** The local repair (free): see the top of this file. `defect` (from `cutoutDefects`) is rebuilt first. */
-export async function refineCutout(png: Buffer, defect?: Uint8Array): Promise<CutoutRefinement> {
+/**
+ * The local repair (free): see the top of this file. `defect` (from `cutoutDefects`): what is past the outline cleared,
+ * then what is not verified rebuilt. `conservative` (the automatic check after a decomposition): soft edges are left as
+ * the decomposition made them — no haze removed, nothing defringed — so a product's soft shadow or rim stays its own.
+ */
+export async function refineCutout(png: Buffer, defect?: CutoutRepair, options: { conservative?: boolean } = {}): Promise<CutoutRefinement> {
   const { data, info } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true }), w = info.width, h = info.height, n = w * h, px = Buffer.from(data);
-  const rebuiltPixels = defect ? rebuild(px, w, h, defect) : 0;
+  const repair = repairParts(defect);
+  let clearedPixels = 0;
+  if (repair?.clear) for (let i = 0; i < n; i++) if (repair.clear[i] && px[i * 4 + 3]) { px[i * 4 + 3] = 0; clearedPixels++; }
+  const rebuiltPixels = repair ? rebuild(px, w, h, repair.mask) : 0;
   const solid = new Uint8Array(n); for (let i = 0; i < n; i++) solid[i] = px[i * 4 + 3] >= SOLID ? 1 : 0;
   // Connected pieces (8-neighbours) of the solid pixels, or of the clear ones.
   const pieces = (mask: (i: number) => boolean) => {
@@ -240,7 +367,7 @@ export async function refineCutout(png: Buffer, defect?: Uint8Array): Promise<Cu
   for (let i = 0; i < n; i++) if (solid[i] && !keep[obj.label[i]]) { px[i * 4 + 3] = 0; solid[i] = 0; removedPixels++; }
   // Faint haze: a translucent pixel not within two pixels of the kept object.
   const near = (i: number) => { const x = i % w, y = (i - x) / w; for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const X = x + dx, Y = y + dy; if (X >= 0 && Y >= 0 && X < w && Y < h && solid[Y * w + X]) return true; } return false; };
-  for (let i = 0; i < n; i++) if (!solid[i] && px[i * 4 + 3] > 0 && !near(i)) { px[i * 4 + 3] = 0; removedPixels++; }
+  if (!options.conservative) for (let i = 0; i < n; i++) if (!solid[i] && px[i * 4 + 3] > 0 && !near(i)) { px[i * 4 + 3] = 0; removedPixels++; }
   // Pinholes: clear pieces inside the object (not reaching the edge) of a few pixels — never a real opening.
   const holes = pieces(i => solid[i] === 0);
   const mean = (i: number, ok: (j: number) => boolean) => { const x = i % w, y = (i - x) / w; let r = 0, g = 0, b = 0, c = 0;
@@ -254,14 +381,14 @@ export async function refineCutout(png: Buffer, defect?: Uint8Array): Promise<Cu
   // Halo: a soft edge pixel's colour is the old background mixed in — the object's own colour from its solid inside.
   const inside = (j: number) => { if (px[j * 4 + 3] < 250) return false; const x = j % w, y = (j - x) / w; for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= w || Y >= h || px[(Y * w + X) * 4 + 3] < 250) return false; } return true; };
   const before = Buffer.from(px);
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < n && !options.conservative; i++) {
     const a = before[i * 4 + 3]; if (a === 0 || a >= 250) continue;
     const c = mean(i, inside); if (!c) continue;
     px[i * 4] = c[0]; px[i * 4 + 1] = c[1]; px[i * 4 + 2] = c[2]; defringedPixels++;
   }
   // A clear pixel keeps no colour (a removed wheel's purple in it could bleed back where another program scales it).
   for (let i = 0; i < n; i++) if (!px[i * 4 + 3]) { px[i * 4] = 0; px[i * 4 + 1] = 0; px[i * 4 + 2] = 0; }
-  return { png: await sharp(px, { raw: { width: w, height: h, channels: 4 } }).png({ compressionLevel: 9 }).toBuffer(), width: w, height: h, removedPixels, filledPixels, defringedPixels, rebuiltPixels };
+  return { png: await sharp(px, { raw: { width: w, height: h, channels: 4 } }).png({ compressionLevel: 9 }).toBuffer(), width: w, height: h, removedPixels, filledPixels, defringedPixels, rebuiltPixels, clearedPixels };
 }
 
 /** The image model's request for one object (see the top of this file): the instruction, its plain ground, its defects marked. */
@@ -284,12 +411,17 @@ export function refineCanvas(asset: { width: number; height: number }) {
   return { size, rect: { left: Math.round((size.width - width) / 2), top: Math.round((size.height - height) / 2), width, height } };
 }
 /** The request's picture: the cut-out on the plain green ground, where refineCanvas puts it, its defects painted magenta. */
-export async function refineRequest(asset: Buffer, defect?: Uint8Array) {
+export async function refineRequest(asset: Buffer, defect?: CutoutRepair) {
   const m = await sharp(asset).metadata(), { size, rect } = refineCanvas({ width: m.width ?? 1, height: m.height ?? 1 });
   let source = asset;
-  if (defect) {
+  const repair = repairParts(defect);
+  if (repair) {
+    // (What is past the outline is sent as the plain ground: not the object's.)
     const { data, info } = await sharp(asset).ensureAlpha().raw().toBuffer({ resolveWithObject: true }), px = Buffer.from(data);
-    for (let i = 0; i < info.width * info.height; i++) if (defect[i] && px[i * 4 + 3]) { px[i * 4] = MARK[0]; px[i * 4 + 1] = MARK[1]; px[i * 4 + 2] = MARK[2]; px[i * 4 + 3] = 255; }
+    for (let i = 0; i < info.width * info.height; i++) {
+      if (repair.clear?.[i]) px[i * 4 + 3] = 0;
+      else if (repair.mask[i] && px[i * 4 + 3]) { px[i * 4] = MARK[0]; px[i * 4 + 1] = MARK[1]; px[i * 4 + 2] = MARK[2]; px[i * 4 + 3] = 255; }
+    }
     source = await sharp(px, { raw: { width: info.width, height: info.height, channels: 4 } }).png().toBuffer();
   }
   const placed = await sharp(source).resize(rect.width, rect.height, { fit: 'fill' }).png().toBuffer();
@@ -301,10 +433,12 @@ export async function refineRequest(asset: Buffer, defect?: Uint8Array) {
  * keyed out (soft edge, the green spill taken off), the original's verified pixels put back over it — never its defects:
  * those are the model's, or, where it left them magenta or clear, rebuilt locally (the outline kept) — then the local pass.
  */
-export async function refineResult(result: Buffer, original: Buffer, place: Awaited<ReturnType<typeof refineRequest>>, defect?: Uint8Array): Promise<CutoutRefinement & { unrepairedPixels: number }> {
-  const m = await sharp(original).metadata(), w = m.width ?? 1, h = m.height ?? 1;
+export async function refineResult(result: Buffer, original: Buffer, place: Awaited<ReturnType<typeof refineRequest>>, repairWith?: CutoutRepair): Promise<CutoutRefinement & { unrepairedPixels: number }> {
+  const m = await sharp(original).metadata(), w = m.width ?? 1, h = m.height ?? 1, repair = repairParts(repairWith), defect = repair?.mask;
   const crop = await sharp(await sharp(result).resize(place.size.width, place.size.height, { fit: 'fill' }).extract(place.rect).png().toBuffer()).resize(w, h, { fit: 'fill' }).ensureAlpha().raw().toBuffer();
-  const own = await sharp(original).ensureAlpha().raw().toBuffer(), out = Buffer.from(crop);
+  const own = Buffer.from(await sharp(original).ensureAlpha().raw().toBuffer()), out = Buffer.from(crop);
+  // (Past the outline: clear in the original too, so nothing of it is put back.)
+  if (repair?.clear) for (let i = 0; i < w * h; i++) if (repair.clear[i]) own[i * 4 + 3] = 0;
   const local = defect ? Buffer.from(own) : undefined; if (local) rebuild(local, w, h, defect!);
   let unrepairedPixels = 0;
   for (let i = 0; i < w * h; i++) {
@@ -317,6 +451,7 @@ export async function refineResult(result: Buffer, original: Buffer, place: Awai
       if (marked(r, g, b) || out[i * 4 + 3] < a / 2) { out[i * 4] = local![i * 4]; out[i * 4 + 1] = local![i * 4 + 1]; out[i * 4 + 2] = local![i * 4 + 2]; out[i * 4 + 3] = a; unrepairedPixels++; }
       else out[i * 4 + 3] = Math.max(out[i * 4 + 3], a);
     } else if (a >= 250) { out[i * 4] = own[i * 4]; out[i * 4 + 1] = own[i * 4 + 1]; out[i * 4 + 2] = own[i * 4 + 2]; out[i * 4 + 3] = a; }
+    else if (repair?.clear?.[i]) out[i * 4 + 3] = 0;
     // (The original's verified pixels are its own: never the model's redrawing of them.)
   }
   return { ...await refineCutout(await sharp(out, { raw: { width: w, height: h, channels: 4 } }).png().toBuffer()), unrepairedPixels };

@@ -143,6 +143,8 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
   productComposer?: () => ReuseComposer | undefined;
   /** The creative regenerated in a common ratio by the image model (both workflows); default: the live one when an OpenAI key is set. */
   productRegenerator?: () => RatioRegenerator | undefined;
+  /** The check of each product's layer after its decomposition (product/cutoutVerification.ts); default FRAMEFLOW_CUTOUT_VERIFICATION=1. */
+  productCutoutVerification?: () => boolean;
   /** Product with Text templates: the image model for new AI artwork of recomposed variations (used only with approval). */
   productArtwork?: () => ArtworkGenerator | undefined;
   smart?: SmartProviders & { analysesDir?: string; variantsDir?: string; env?: NodeJS.ProcessEnv } } = {}): Router {
@@ -228,7 +230,8 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
     artwork: options.productArtwork ?? (() => (process.env.OPENAI_API_KEY ? liveArtworkGenerator() : undefined)),
     placement: options.productPlacement ?? (() => (process.env.OPENAI_API_KEY ? liveReusePlacementPlanner() : undefined)),
     composer: options.productComposer ?? (() => (process.env.OPENAI_API_KEY ? liveReuseComposer() : undefined)),
-    regenerator: options.productRegenerator ?? (() => (process.env.OPENAI_API_KEY ? liveRatioRegenerator() : undefined)) }) });
+    regenerator: options.productRegenerator ?? (() => (process.env.OPENAI_API_KEY ? liveRatioRegenerator() : undefined)),
+    cutoutVerification: options.productCutoutVerification ?? (() => process.env.FRAMEFLOW_CUTOUT_VERIFICATION === '1') }) });
 
   router.get('/runs/:id/diagnostics', async (req, res, next) => {
     try {

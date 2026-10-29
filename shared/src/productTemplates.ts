@@ -100,6 +100,25 @@ export interface ProductCutout {
   method: 'sam3' | 'local' | 'upload' | 'layer' | 'seedream';
   /** Share of its box it covers, and whether it needs a look (a mask that fills its whole box or almost nothing of it). */
   coverage: number; quality: 'good' | 'check'; note?: string;
+  /**
+   * The automatic check after the decomposition (server option `cutoutVerification`; absent on cut-outs made without
+   * it): what was found and repaired in this layer, and `original`, the layer as the decomposition made it.
+   */
+  verification?: ProductCutoutVerification & { original?: { file: string; sha256: string } };
+}
+/** A product layer's check after its decomposition (cutoutVerification.ts): pixels, and why it is `uncertain`. */
+export interface ProductCutoutVerification {
+  version: 1; solidPixels: number;
+  /** Hidden behind layers in front (named in `hiddenBehind`); the background plate's content in it; of that, thin edge bands left as they are; solid pixels unlike the picture. */
+  hiddenPixels: number; backgroundPixels: number; keptEdgePixels: number; differingPixels: number; hiddenBehind: string[];
+  /** Hidden pixels past its verified outline yet in its own colours: left as the decomposition made them (reported). */
+  keptHiddenPixels: number;
+  /** What was done: rebuilt from its verified pixels, made transparent past its outline, pinholes filled, specks removed. */
+  rebuiltPixels: number; clearedPixels: number; filledPixels: number; removedPixels: number;
+  /** Mean local contrast of the verified pixels around what was rebuilt (0–255), and whether the repair was applied. */
+  detail: number; applied: boolean;
+  /** An estimate too large or too detailed to present as exact: see `reasons`. */
+  uncertain: boolean; reasons: string[];
 }
 export interface ProductObject {
   id: string; kind: ProductObjectKind; label: string;

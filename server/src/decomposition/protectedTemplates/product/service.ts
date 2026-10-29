@@ -90,6 +90,11 @@ export interface ProductTemplateOptions {
   composer?: () => ReuseComposer | undefined;
   /** The creative regenerated in a common ratio by the image model (ratioRegeneration.ts; only with approval of its cost), for both workflows. */
   regenerator?: () => RatioRegenerator | undefined;
+  /**
+   * Check each product's layer after its decomposition and repair it on this computer (cutoutVerification.ts); off when
+   * absent or false (the router reads FRAMEFLOW_CUTOUT_VERIFICATION=1). Nothing is sent or charged either way.
+   */
+  cutoutVerification?: () => boolean;
 }
 /** One element of the review as the client sends it (the whole state each time). */
 export interface ReviewInput {
@@ -827,7 +832,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       // Every saved logo is restored independently, including legacy logos previously kept in the background.
       for (const logo of analysis?.logoSlots ?? []) delete logo.inBackground;
       const result = await prepareProduct({ source, analysis, objects: t.product.objects, segmenter: engine === 'sam3' ? options.segmenter?.() : undefined, paidApproved: paid,
-        ...(engine === 'ai' ? { layerizer: options.layerizer?.(), requireAiMatches: !!v } : {}), ...(known ? { known } : {}),
+        ...(engine === 'ai' ? { layerizer: options.layerizer?.(), requireAiMatches: !!v } : {}), ...(known ? { known } : {}), ...(options.cutoutVerification?.() ? { verifyCutouts: true } : {}),
         save: (f, value) => store.write(id, `prepare-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 80)}.json`, Buffer.from(JSON.stringify(value, null, 2))),
         saveImage: (f, png) => store.write(id, `prepare-${f.replace(/\.png$/i, '')}-${sha256(png).slice(0, 12)}.png`, png) });
       const file = (prefix: string, png: Buffer) => { const name = `${prefix}-${sha256(png).slice(0, 12)}.png`; if (!store.has(id, name)) store.write(id, name, png); return { file: name, sha256: sha256(png) }; };
@@ -851,7 +856,8 @@ export function createProductTemplates(options: ProductTemplateOptions) {
         for (const o of p.objects) {
           const c = cutouts.get(o.id);
           if (!c) { delete o.cutout; delete o.slot; continue; }
-          o.cutout = { file: c.file, sha256: c.sha256, placement: c.placement, method: c.method, coverage: c.coverage, quality: c.quality, ...(c.note ? { note: c.note } : {}) };
+          o.cutout = { file: c.file, sha256: c.sha256, placement: c.placement, method: c.method, coverage: c.coverage, quality: c.quality, ...(c.note ? { note: c.note } : {}),
+            ...(c.verification ? { verification: { ...c.verification, ...(c.original ? { original: file(`pcut-${c.id}`, c.original) } : {}) } } : {}) };
           if (o.kind === 'character' || o.kind === 'product') o.slot = { box: { ...c.placement }, contactY: c.contactY, targetHeight: c.contactY - c.placement.y + 1, z: o.z };
         }
         p.prepared = { version: PRODUCT_PREPARE_VERSION, at: nowIso(), objectsRevision, analysisRevision, clean, base,

@@ -162,13 +162,14 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
     // its own; a character's or a decoration's outline is not that regular, so the plate check is for products only.)
     const plate = own.kind === 'product' && store.has(id, s.base.file) ? { plate: store.read(id, s.base.file) } : {};
     const d = await cutoutDefects(png, { picture: store.read(id, s.source.file), placement: p, front, ...plate });
-    return d.count ? d : undefined;
+    return d.count || d.clearCount ? d : undefined;
   };
-  const defectReport = (d: Awaited<ReturnType<typeof defectsOf>>) => ({ defectPixels: d?.count ?? 0, hiddenPixels: d?.hiddenPixels ?? 0, differingPixels: d?.differingPixels ?? 0, foreignPixels: d?.foreignPixels ?? 0 });
+  const repairOf = (d: Awaited<ReturnType<typeof defectsOf>>) => (d ? { mask: d.mask, clear: d.clear } : undefined);
+  const defectReport = (d: Awaited<ReturnType<typeof defectsOf>>) => ({ defectPixels: d?.count ?? 0, hiddenPixels: d?.hiddenPixels ?? 0, differingPixels: d?.differingPixels ?? 0, foreignPixels: d?.foreignPixels ?? 0, keptPixels: d?.keptPixels ?? 0 });
   /** Free, on this computer: the cleaned picture to compare with the current one. The creative is not changed. */
   const refineLocal = (id: string, cid: string, objectId: string) => locked(`${id}:${cid}`, async () => {
-    const { c, o, png } = refinable(id, cid, objectId), d = await defectsOf(id, c, o, png), r = await refineCutout(png, d?.mask);
-    return { before: o.asset.file, file: await refined(id, cid, r.png), width: r.width, height: r.height, removedPixels: r.removedPixels, filledPixels: r.filledPixels, defringedPixels: r.defringedPixels, rebuiltPixels: r.rebuiltPixels, ...defectReport(d), requests: 0 };
+    const { c, o, png } = refinable(id, cid, objectId), d = await defectsOf(id, c, o, png), r = await refineCutout(png, repairOf(d));
+    return { before: o.asset.file, file: await refined(id, cid, r.png), width: r.width, height: r.height, removedPixels: r.removedPixels, filledPixels: r.filledPixels, defringedPixels: r.defringedPixels, rebuiltPixels: r.rebuiltPixels, clearedPixels: r.clearedPixels, ...defectReport(d), requests: 0 };
   });
   /** What one AI repair of this object sends and may cost (shown before it is approved). */
   const refineEstimate = async (id: string, cid: string, objectId: string) => {
@@ -181,14 +182,14 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
    */
   const refineWithAi = (id: string, cid: string, objectId: string, input: { approveUsd?: unknown }) => locked(`${id}:${cid}`, async () => {
     const { c, o, png } = refinable(id, cid, objectId), r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI repair is not available on this server (no OpenAI key is configured). Use the free clean-up.');
-    const d = await defectsOf(id, c, o, png), place = await refineRequest(png, d?.mask), estimateUsd = r.offline ? 0 : regenEstimateUsdForSize(place.size);
+    const d = await defectsOf(id, c, o, png), place = await refineRequest(png, repairOf(d)), estimateUsd = r.offline ? 0 : regenEstimateUsdForSize(place.size);
     if (estimateUsd && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= estimateUsd)) fail('APPROVAL_REQUIRED', `Repairing ${o.label} with AI sends one request to ${r.model} (${place.size.width} × ${place.size.height}), at most about $${estimateUsd.toFixed(2)}. Approve the cost first.`, { estimateUsd });
     const op = randomBytes(4).toString('hex'), save = (f: string, v: object) => store.write(id, `pcr-${cid.slice(3)}-${op}-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`, Buffer.from(JSON.stringify(v, null, 2)));
     let out: Awaited<ReturnType<RatioRegenerator['regenerate']>>;
     try { out = await r.regenerate({ image: place.image, prompt: refinePrompt(o.label, !!d), size: place.size }, save, op); }
     catch (error) { fail('PROVIDER_FAILED', `The AI repair did not complete: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}. Nothing was retried; ${o.label} is unchanged.`, { estimateUsd }); }
-    const res = await refineResult(out.image, png, place, d?.mask), file = await refined(id, cid, res.png);
-    const usage = { model: r.model, offline: r.offline, size: place.size, estimateUsd, ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}), ...(out.requestId ? { requestId: out.requestId } : {}), file, ...defectReport(d), unrepairedPixels: res.unrepairedPixels };
+    const res = await refineResult(out.image, png, place, repairOf(d)), file = await refined(id, cid, res.png);
+    const usage = { model: r.model, offline: r.offline, size: place.size, estimateUsd, ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}), ...(out.requestId ? { requestId: out.requestId } : {}), file, ...defectReport(d), clearedPixels: res.clearedPixels, unrepairedPixels: res.unrepairedPixels };
     save('ai-repair.json', usage);
     return { before: o.asset.file, ...usage, width: res.width, height: res.height, requests: 1 };
   });

@@ -24,7 +24,7 @@ import { svgPng, textInkExact, textSvg } from '../../../templateStudio/masterCre
  * kept, only hidden ones are filled, and the share that is an estimate is reported, never claimed exact.
  */
 import sharp from 'sharp';
-import type { LogoSlot, PixelRect, ProductAiSeparation, ProductObject, ProductQuality, ProductQualityIssue, TextAnalysis } from '@frameflow/shared';
+import type { LogoSlot, PixelRect, ProductAiSeparation, ProductCutoutVerification, ProductObject, ProductQuality, ProductQualityIssue, TextAnalysis } from '@frameflow/shared';
 import { flattenRgb, sha256, type Rgba } from '../pixels.js';
 import { removalMask } from '../master/removal.js';
 import { extendLineToInk } from '../master/scan.js';
@@ -39,6 +39,7 @@ import { completeStands, findRisers, type Riser } from './risers.js';
 import { binDown, dilate, maskDown, sampleRgb, upsampleLabels, workIndex, workSize, type WorkSize } from './multiscale.js';
 import { sentSize, type AiDecomposition, type ProductLayerizer } from './aiDecompose.js';
 import { refineMasks } from './segment.js';
+import { verifyProductCutouts } from './cutoutVerification.js';
 import type { Segmenter } from '../../creativeTemplates/segmenter.js';
 
 type Box = PixelRect;
@@ -1262,13 +1263,20 @@ export interface PrepareInput {
   /** A requested paid variation must not pass quality checks on local fallback cutouts. */
   requireAiMatches?: boolean;
   /**
+   * Check each product's layer after the decomposition and repair it on this computer (cutoutVerification.ts): server
+   * option `cutoutVerification`, off by default — off, nothing of it runs.
+   */
+  verifyCutouts?: boolean;
+  /**
    * A template made from a generated variation (variationTemplate.ts): its background, its picture without text and logos
    * (exact), and each element's layer at its place. An element whose box is still its layer's keeps that layer — its
    * pixels and its mask — and what is behind it is the variation's own background; anything else is decomposed as usual.
    */
   known?: { verifiedComposition?: boolean; background: Rgba; clean: Rgba; layers: { label: string; kind: ProductObject['kind']; box: Box; png: Buffer }[]; plates?: { box: Box; png: Buffer }[] };
 }
-export interface PreparedCutout { id: string; png: Buffer; placement: Box; method: 'sam3' | 'local' | 'layer' | 'seedream'; coverage: number; quality: 'good' | 'check'; note?: string; contactY: number }
+export interface PreparedCutout { id: string; png: Buffer; placement: Box; method: 'sam3' | 'local' | 'layer' | 'seedream'; coverage: number; quality: 'good' | 'check'; note?: string; contactY: number;
+  /** With `verifyCutouts`: what the check found and did, and the layer as the decomposition made it (when changed). */
+  verification?: ProductCutoutVerification; original?: Buffer }
 /** A display stand on its own layer: `key` names it (its place), `hint` the administrator's box it came from. */
 export interface PreparedStand { key: string; label: string; png: Buffer; placement: Box; under: string[]; visiblePixels: number; completedPixels: number; uncertain: boolean; source: 'auto' | 'user'; hint?: string }
 export interface PrepareResult {
@@ -1648,6 +1656,24 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
     const note = edgeless(m) > 0.35 ? 'Its edge does not follow the object everywhere: it may include background or miss a part.' : coverage < 0.08 ? 'Covers very little of its box: parts may be missing.' : localCut && overlapsOthers ? 'Overlaps another object: check the edge between them.' : localCut ? 'Local colour-based cutout: inspect for background fragments and missing product details.' : undefined;
     if (note) issues.push({ id: `cutout-${o.id}`, area: o.box, message: `${o.label}: ${note}`, blocking: false, elementId: o.id });
     cutouts.push({ id: o.id, png: made.png, placement: made.placement, method: ai ? (ai.masks.has(o.id) ? 'seedream' : 'local') : method === 'seedream' ? 'local' : method, coverage: round(coverage), quality: note ? 'check' : 'good', ...(note ? { note } : {}), contactY: made.contactY });
+  }
+  // 4b The check after the decomposition (option `verifyCutouts`): each product's layer against the picture, the layers in
+  // front of it and the background plate; repaired here, the original kept, what is uncertain reported.
+  if (input.verifyCutouts && cutouts.length) {
+    const picture = await sharp(Buffer.from(rgb.buffer, rgb.byteOffset, rgb.byteLength), { raw: { width: w, height: h, channels: 3 } }).png().toBuffer();
+    const byId = new Map(live.map(o => [o.id, o]));
+    const checked = await verifyProductCutouts({ picture, plate: basePng,
+      cutouts: cutouts.map(c => { const o = byId.get(c.id)!; return { id: c.id, kind: o.kind, label: o.label, z: o.z, png: c.png, placement: c.placement, method: c.method }; }) });
+    const repaired: string[] = [];
+    for (const c of cutouts) {
+      const v = checked.get(c.id), o = byId.get(c.id)!; if (!v) continue;
+      c.verification = v.report;
+      if (v.changed) { c.original = c.png; c.png = v.png; repaired.push(o.label); }
+      if (v.report.uncertain) issues.push({ id: `uncertain-${o.id}`, area: o.box, elementId: o.id, blocking: false,
+        message: `“${o.label}”: ${v.report.reasons.join('; ')}. Its layer is the best estimate from the picture, not an exact product photo: Refine cutout → Complete with AI (its cost shown first) or a product photo makes it exact.` });
+    }
+    if (repaired.length) issues.push({ id: 'cutouts-verified', area: { x: 0, y: 0, width: w, height: h }, blocking: false,
+      message: `Checked after the decomposition: ${repaired.length === 1 ? 'the layer' : `${repaired.length} layers`} of ${repaired.slice(0, 4).join(', ')}${repaired.length > 4 ? ` and ${repaired.length - 4} more` : ''} repaired on this computer — what other layers or the background left in them removed, what was hidden rebuilt from their own pixels. Their verified pixels are unchanged; the originals are kept.` });
   }
   // Each stand's layer, named after what stands on it (or the administrator's box).
   const stands: PreparedStand[] = [];
