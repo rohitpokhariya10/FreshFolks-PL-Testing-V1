@@ -1053,9 +1053,14 @@ export function createProductTemplates(options: ProductTemplateOptions) {
    * pipeline — a template of its own from the regenerated picture (already in its size), its elements found, reviewed,
    * decomposed and edited like any upload.
    */
-  async function createFromRegenerated(input: { bytes: Buffer; name: string; ratio: OfferAspectRatio; useAi: boolean; from: { templateId: string; draftId: string } }) {
-    const nid = await create(input.bytes, { name: input.name, filename: `regenerated-${input.ratio.replace(':', 'x')}.png`, aspectRatio: input.ratio });
-    await service.updateMaster(nid, undefined, x => { x.product!.regeneration = { status: 'approved', ratio: input.ratio, useAi: input.useAi, startedAt: nowIso(), from: input.from }; history(x.product!, { action: 'created', detail: `Regenerated in ${REUSE_ASPECT_LABELS[input.ratio]} by AI from template ${input.from.templateId} (Create Offer Creative), approved after review.` }); });
+  // (`ratio` absent: an AI design variation in its template's own size, not one of the common ratios.)
+  async function createFromRegenerated(input: { bytes: Buffer; name: string; ratio?: OfferAspectRatio; useAi: boolean; from: { templateId: string; draftId: string } }) {
+    const ratio = input.ratio, how = input.from.draftId.startsWith('pav-') ? 'Generate AI Variations' : 'Create Offer Creative';
+    const nid = await create(input.bytes, { name: input.name, filename: `regenerated-${(ratio ?? 'original').replace(':', 'x')}.png`, ...(ratio ? { aspectRatio: ratio } : {}) });
+    await service.updateMaster(nid, undefined, x => {
+      if (ratio) x.product!.regeneration = { status: 'approved', ratio, useAi: input.useAi, startedAt: nowIso(), from: input.from };
+      history(x.product!, { action: 'created', detail: `Made by AI${ratio ? ` in ${REUSE_ASPECT_LABELS[ratio]}` : ''} from template ${input.from.templateId} (${how}), approved after review.` });
+    });
     startDetect(nid, { useAi: input.useAi });
     return nid;
   }

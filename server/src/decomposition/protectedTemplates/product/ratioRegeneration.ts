@@ -22,7 +22,7 @@
 import sharp from 'sharp';
 import jsqrModule, { type Options as QrOptions, type QRCode } from 'jsqr';
 import { toFile } from 'openai';
-import { RATIO_REGEN_SIZES, RATIO_REQUEST_SIZES, type OfferAspectRatio, type RegenerationChecks, type SourceSize } from '@frameflow/shared';
+import { RATIO_REGEN_SIZES, RATIO_REQUEST_SIZES, type AiVariationTheme, type OfferAspectRatio, type RegenerationChecks, type SourceSize } from '@frameflow/shared';
 import { createOpenAIClient } from '../../../services/openAIClient.js';
 import type { WordRecognizer } from '../../../textRecognition/recognizer.js';
 import { imageModel } from '../../aiModels.js';
@@ -32,7 +32,7 @@ type Box = { x: number; y: number; width: number; height: number };
 const jsQR = ((jsqrModule as unknown as { default?: unknown }).default ?? jsqrModule) as (data: Uint8ClampedArray, width: number, height: number, options?: QrOptions) => QRCode | null;
 type Save = (file: string, value: object) => void;
 
-const SHAPE: Record<OfferAspectRatio, string> = { '1:1': 'square 1:1', '4:5': 'portrait 4:5', '9:16': 'tall vertical 9:16', '16:9': 'wide landscape 16:9', '885:286': 'ultra-wide 3:1 banner' };
+export const SHAPE: Record<OfferAspectRatio, string> = { '1:1': 'square 1:1', '4:5': 'portrait 4:5', '9:16': 'tall vertical 9:16', '16:9': 'wide landscape 16:9', '885:286': 'ultra-wide 3:1 banner' };
 /**
  * The instruction: a faithful adaptation of this creative to the shape — the same design, only what the new shape needs
  * changed — and nothing that is not in it (the exact words when they are known). It names no kind of element the
@@ -53,6 +53,43 @@ export function regenerationPrompt(ratio: OfferAspectRatio, texts: string[] = []
     quoted.length ? `Keep every piece of text with exactly the same words, spelling, numbers and symbols — exactly these texts: ${quoted.join('; ')}.` : 'Keep every piece of text with exactly the same words, spelling, numbers and symbols.',
     'Do not add, remove, translate or rewrite any text. Do not add any new products, logos, people or QR codes.',
   ].join(' ');
+}
+
+/** The design directions of AI variations, one per variation (in turn): genuinely different layouts of the same family. */
+export const VARIATION_DIRECTIONS = [
+  'Same layout family, refreshed: keep the original arrangement of the elements and give it a new background treatment, decoration and colour styling.',
+  'Product hero: the products larger and central on a striking stage, the headline above them, the offer and terms in a clean structured panel.',
+  'Split layout: the characters and products together on one side, the headline and offer in a bold rounded panel on the other.',
+  'Framed composition: a rich decorative frame or arch around the content on a patterned backdrop, the headline crowning it.',
+  'Bold modern: a large headline band, colour-blocked rounded panels and a dynamic arrangement of the products.',
+] as const;
+const THEMES: Record<Exclude<AiVariationTheme, 'custom'>, string> = {
+  original: 'Keep the original festival or theme and its mood.',
+  diwali: 'Restyle it for Diwali: warm golds with deep purple or maroon, glowing diyas, rangoli, marigold garlands, lanterns and soft sparkling lights.',
+  holi: 'Restyle it for Holi: vibrant clouds and splashes of coloured powder (gulal) in pink, yellow, green and blue, bright and playful.',
+  dussehra: 'Restyle it for Dussehra: festive saffron, red and gold, marigolds, bows and arrows and a celebratory victory mood.',
+  'karwa-chauth': 'Restyle it for Karwa Chauth: a night sky with a glowing full moon, sieve (channi) and karwa motifs, deep red and gold, a soft warm glow.',
+};
+/**
+ * The instruction for one AI design variation: a new design of this creative in its direction (VARIATION_DIRECTIONS, in
+ * turn) and theme, for the shape — the same brand and business content, every word exactly (when known), nothing added
+ * but the theme's decoration. `shape`: the canvas in words; `trimmed`: made wider than the model can and trimmed after.
+ */
+export function variationPrompt(input: { shape: string; theme: AiVariationTheme; customTheme?: string; index: number; count: number; texts?: string[]; products?: string[]; trimmed?: boolean }) {
+  const quoted = (input.texts ?? []).map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 40).map(t => `"${t.replace(/"/g, '\'')}"`);
+  const named = [...new Set((input.products ?? []).map(t => t.replace(/\s+/g, ' ').trim()).filter(Boolean))].slice(0, 12);
+  const theme = input.theme === 'custom' ? `Restyle it for this theme: ${(input.customTheme ?? '').replace(/\s+/g, ' ').trim().slice(0, 160)}.` : THEMES[input.theme];
+  return [
+    `Create design variation ${input.index + 1} of ${input.count} of this exact advertising creative, as a ${input.shape} canvas filled edge to edge.`,
+    VARIATION_DIRECTIONS[input.index % VARIATION_DIRECTIONS.length],
+    theme,
+    'It must stay recognisably the same campaign from the same brand: a professional, polished promotional design with a clear hierarchy from headline to products to offer to terms, readable typography and strong colours. Do not stretch, squash, letterbox or add borders.',
+    'You may change the background, decoration, colours, layout, hierarchy, and the placement and relative scale of the elements. Keep every element of the original: the same logos, unchanged and whole; the same products and devices with their printed details; the same illustrated characters; the same QR codes.',
+    named.length ? `The products (${named.join(', ')}) stay exactly these products.` : '',
+    quoted.length ? `Keep every piece of text with exactly the same words, spelling, numbers and symbols — exactly these texts: ${quoted.join('; ')}.` : 'Keep every piece of text with exactly the same words, spelling, numbers and symbols.',
+    'Do not add, remove, translate or rewrite any text, offer, price, date or term. Do not add any new logo, brand name, QR code, product or person. Decoration for the theme is the only new content allowed, and it never contains text.',
+    input.trimmed ? 'Keep a thin band along the top and bottom edges (about 2 % of the height each) as continued background only: no text, logo, product or character may touch it.' : '',
+  ].filter(Boolean).join(' ');
 }
 
 export interface RatioRegenerator {
@@ -80,8 +117,10 @@ export function liveRatioRegenerator(): RatioRegenerator {
   } };
 }
 /** The result at exactly the ratio's size (the model is asked for it; anything else is fitted, never stretched past 2 %). */
-export async function atRatioSize(png: Buffer, ratio: OfferAspectRatio): Promise<Buffer> {
-  const size = RATIO_REGEN_SIZES[ratio], meta = await sharp(png).metadata();
+export const atRatioSize = (png: Buffer, ratio: OfferAspectRatio) => atSize(png, RATIO_REGEN_SIZES[ratio]);
+/** The result at exactly `size`: within 2 % of its aspect, sized; else covered (only the excess of one side trimmed, centred). */
+export async function atSize(png: Buffer, size: SourceSize): Promise<Buffer> {
+  const meta = await sharp(png).metadata();
   const fill = Math.abs((meta.width ?? 1) / (meta.height ?? 1) - size.width / size.height) / (size.width / size.height) < 0.02;
   return sharp(png).resize(size.width, size.height, { fit: fill ? 'fill' : 'cover' }).removeAlpha().png().toBuffer();
 }

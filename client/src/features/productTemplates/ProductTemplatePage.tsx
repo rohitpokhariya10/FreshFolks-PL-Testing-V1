@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Copy, Eye, EyeOff, FileText, ImagePlus, Layers3, Plus, RefreshCw, RotateCcw, Save, Sparkles, Trash2, Wand2 } from 'lucide-react';
 import { ProductDetails } from './ProductDetails';
+import { AiDesignVariations } from './AiDesignVariations';
 import {
   MASTER_CATEGORY_LABELS, PRODUCT_ASPECT_LABELS, PRODUCT_CHECK_KIND, PRODUCT_KIND_LABELS, PRODUCT_VARIATION_LABELS, rewriteGroup, type CreativeInstance, type MasterSnapshot, type ProductAspectRatio, type ProductCreative, type ProductSnapshot, type ProductVariationKind,
 } from '@frameflow/shared';
@@ -247,6 +248,7 @@ function Variations({ templateId, revision, onOpen, onSaved, onDecomposeTemplate
   const slotsOf = (kind: 'product' | 'character') => options.slots.filter(s => s.kind === kind);
   const choicesOf = (kind: 'product' | 'character') => options.choices.filter(c => c.kind === kind);
   return <div className="prt-variations">
+    <AiDesignVariations templateId={templateId} canvas={options.canvas} onOpenTemplate={onDecomposeTemplate} onError={onError} />
     <section className="ts-card"><div className="ts-card-body prt-var-form">
       <h3>What should the variations look like?</h3>
       <label className="ot-field"><span>Generation mode</span><select aria-label="Generation mode" value={mode} onChange={e => { setMode(e.target.value as typeof mode); setConfirm(false); setKinds(['premium', 'minimal', 'festive']); }}><option value="reuse">Preserve structure · new AI products</option><option value="typography">Typography only · keep existing products</option><option value="redesign">Redesign artwork or layout</option></select></label>

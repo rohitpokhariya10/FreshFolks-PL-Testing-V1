@@ -1,0 +1,56 @@
+# AI template variations (Generate AI Variations → AI design variations)
+
+One saved base template becomes 3–5 genuinely different AI designs for a festival or theme, in any of the six sizes. A chosen design continues through the existing creation pipeline: analysis, review, decomposition, editable layers, save, editor and export.
+
+## Flow
+
+1. **Offer Templates → a template → Generate AI Variations.** This is the existing entry point; it opens the template's *Generate with AI* tab. The new **AI design variations** card sits at the top, and the earlier layered modes (typography, AI products, AI backdrop) remain below, unchanged.
+2. **Choose:**
+   - **Size:** the six shared sizes (Original, Square 1:1, Portrait 4:5, Story 9:16, Landscape 16:9, PL One Banner 885 × 286), from the shared ratio engine.
+   - **Festival or theme:** keep original, Diwali, Holi, Dussehra, Karwa Chauth, or custom.
+   - **How many:** 3, 4 or 5.
+
+   Changing a choice sends nothing.
+3. **Generate → confirm the estimate.** One `images.edit` request per variation, made one after another and never retried, with the actual cost recorded. Without the approved amount the server refuses (`APPROVAL_REQUIRED`).
+4. **Each variation** is the base template's latest revision as designed, rendered and sent with:
+   - its own design direction (`VARIATION_DIRECTIONS`: refreshed same layout, product hero, split layout, framed composition, bold modern);
+   - the theme's decoration;
+   - the template's exact words;
+   - the rule that nothing is added except theme decoration (no text, offer, price, date, logo, brand, QR code, product or person).
+
+   Before it is shown, each result goes through the shared protection (`protectRegenerated`): it is brought to exactly its size, products and logos are put back with their own pixels on a clear match, QR payloads are checked, and missing or added words are listed. PL One Banner uses the safe 3:1 request with the height-only trim.
+5. **Preview cards** show each design with its checks; **Inspect** opens it full screen.
+6. **Choose this variation → "I have looked at it" → Use this variation.** The existing `createFromRegenerated` makes a template from that picture (linked to the base: `regeneration.from = { templateId, draftId: "pav-<job>-<index>" }`). Its elements are found in the variation itself (AI detection only if ticked, estimated at up to $0.35), then reviewed, decomposed (with the existing approval), saved and opened in the editor.
+
+The base template and its revisions are never changed. Jobs are stored with the base template as `pav-<id>.json`, with images `pav-<id>-<index>-<hash>.png`.
+
+## Code
+
+| Area | Change |
+| --- | --- |
+| `shared/src/productTemplates.ts` | `AI_VARIATION_THEMES`, labels, counts, `AiVariationJob`, `regenEstimateUsdForSize` |
+| `product/ratioRegeneration.ts` | `variationPrompt`, `VARIATION_DIRECTIONS`, `atSize` (`atRatioSize` uses it) |
+| `product/reuseStudio.ts` | `aiVariations`, `startAiVariations`, `aiVariation`, `continueAiVariation` (the template's own creative rendered as in `regenerateImage`) |
+| `product/routes.ts` | `GET/POST /:id/ai-variations`, `GET /:id/ai-variations/:jid`, `POST /:id/ai-variations/:jid/:index/continue` |
+| `product/service.ts` | `createFromRegenerated` takes an optional ratio (an Original-size variation) |
+| `client/…/AiDesignVariations.tsx` | The card: choices, cost confirmation, previews, choose, make editable |
+
+## Verification
+
+- `aiVariations.test.ts` (HTTP, test doubles):
+  - the prompt: five distinct directions, themes, exact words, nothing invented;
+  - approval required, nothing sent before it;
+  - Journey A (original theme, Original size: 3 distinct designs at the template's exact proportions), B (Holi, 1:1, 4 designs), C (PL One Banner requested at 2496 × 832 and kept at exactly 1770 × 572; Story 9:16);
+  - the base template unchanged;
+  - Journey D hand-off: refused until looked at, then a template of its own from that exact picture, detected in it.
+- `ai-variations.spec.ts` (browser, offline doubles):
+  - banner + Diwali: the cost is confirmed, three previews appear, one is made editable and detected;
+  - 16:9 + Holi: made editable → reviewed → decomposed → saved → a layer moved in the editor → kept after reload → exported at 2048 × 1152.
+- **Real AI visual quality has not been verified**: no paid request was made for this feature.
+
+## Limitations
+
+- The Figma file was not accessed (it needs a signed-in connector) and no screenshots came with the request. The directions follow the written brief.
+- The offline browser analyser answers with the test poster's own layout, so the banner journey is browser-verified through review, and decomposition-to-editor is browser-verified in 16:9. Real detection reads the real image.
+- A template product the model moves behind another, or redraws beyond a clear match, is listed under "Check it" rather than restored. The person approves after looking.
+- Theme decoration is new content by design. Wording is never changed, so a festival-specific line (for example "A grand welcome for Bappa") stays as it is under another theme.
