@@ -22,7 +22,7 @@
 import sharp from 'sharp';
 import jsqrModule, { type Options as QrOptions, type QRCode } from 'jsqr';
 import { toFile } from 'openai';
-import { RATIO_REGEN_SIZES, type OfferAspectRatio, type RegenerationChecks, type SourceSize } from '@frameflow/shared';
+import { RATIO_REGEN_SIZES, RATIO_REQUEST_SIZES, type OfferAspectRatio, type RegenerationChecks, type SourceSize } from '@frameflow/shared';
 import { createOpenAIClient } from '../../../services/openAIClient.js';
 import type { WordRecognizer } from '../../../textRecognition/recognizer.js';
 import { imageModel } from '../../aiModels.js';
@@ -32,7 +32,7 @@ type Box = { x: number; y: number; width: number; height: number };
 const jsQR = ((jsqrModule as unknown as { default?: unknown }).default ?? jsqrModule) as (data: Uint8ClampedArray, width: number, height: number, options?: QrOptions) => QRCode | null;
 type Save = (file: string, value: object) => void;
 
-const SHAPE: Record<OfferAspectRatio, string> = { '1:1': 'square 1:1', '4:5': 'portrait 4:5', '9:16': 'tall vertical 9:16', '16:9': 'wide landscape 16:9' };
+const SHAPE: Record<OfferAspectRatio, string> = { '1:1': 'square 1:1', '4:5': 'portrait 4:5', '9:16': 'tall vertical 9:16', '16:9': 'wide landscape 16:9', '885:286': 'ultra-wide 3:1 banner' };
 /**
  * The instruction: a faithful adaptation of this creative to the shape — the same design, only what the new shape needs
  * changed — and nothing that is not in it (the exact words when they are known). It names no kind of element the
@@ -46,6 +46,8 @@ export function regenerationPrompt(ratio: OfferAspectRatio, texts: string[] = []
     `Convert this exact advertising creative to a ${SHAPE[ratio]} canvas, keeping the same design.`,
     'This is an aspect-ratio adaptation, not a redesign: keep the original composition, visual identity, colours, illustration style, typography, characters, products and every element as they are. Extend the existing background naturally to the new edges and move or resize the existing elements only as much as the new shape requires, so the whole canvas is filled. Do not stretch, squash, crop, letterbox or add borders.',
     'Use only what is in this image. Do not add any text, offer, price, date, logo, brand name, QR code, product, person, character, decoration or prop that is not in it, and do not remove any element.',
+    // (Made wider than the model can, the banner is trimmed to its ratio afterwards: only its plain edges may go.)
+    ...(RATIO_REQUEST_SIZES[ratio] ? ['Keep a thin band along the top and bottom edges (about 2 % of the height each) as continued background only: no text, logo, product or character may touch it.'] : []),
     named.length ? `Keep the products (${named.join(', ')}) exactly as they are, at the same size relative to the other elements.` : 'Keep the products exactly as they are, at the same size relative to the other elements.',
     'Keep every logo unchanged, whole and legible, never cropped, including any small words printed beside it.',
     quoted.length ? `Keep every piece of text with exactly the same words, spelling, numbers and symbols — exactly these texts: ${quoted.join('; ')}.` : 'Keep every piece of text with exactly the same words, spelling, numbers and symbols.',

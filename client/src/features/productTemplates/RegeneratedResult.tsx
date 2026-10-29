@@ -6,7 +6,7 @@
  * they looked at it. What happens next is the caller's (its actions, below).
  */
 import { Check, Sparkles } from 'lucide-react';
-import { REUSE_ASPECT_LABELS, type RegeneratedImage } from '@frameflow/shared';
+import { REUSE_ASPECT_LABELS, RATIO_REQUEST_SIZES, type RegeneratedImage } from '@frameflow/shared';
 
 export function RegeneratedResult({ beforeUrl, beforeLabel, resultUrl, result, approved, onApproved, children }: {
   beforeUrl?: string; beforeLabel: string; resultUrl: string; result: RegeneratedImage;
@@ -14,7 +14,7 @@ export function RegeneratedResult({ beforeUrl, beforeLabel, resultUrl, result, a
 }) {
   const label = REUSE_ASPECT_LABELS[result.ratio], c = result.checks, blocked = c.blocking.length > 0;
   const rows: [string, boolean, string][] = [
-    ['Size', true, `${result.width} × ${result.height} px — exactly ${label.replace(/^\S+ /, '')}.`],
+    ['Size', true, `${result.width} × ${result.height} px — exactly ${result.ratio}.${RATIO_REQUEST_SIZES[result.ratio] ? ' Made at 3:1 (the widest the image model makes), its plain top and bottom edges trimmed to the exact ratio.' : ''}`],
     ['QR codes', !c.qr.some(q => q.status === 'failed'), c.qr.length ? c.qr.map(q => (q.status === 'kept' ? 'Scans to the same link as your original.' : q.status === 'restored' ? 'Redrawn by the AI — your original QR code was put back; it scans to the same link.' : 'Does not scan to your original link.')).join(' ') : 'None in your original.'],
     ...(c.assets.length ? [['Products & logos', !c.assets.some(a => a.status === 'not-found'), c.assets.map(a => `${a.label}: ${a.status === 'restored' ? 'your own picture put back' : 'not found — check it'}`).join(' · ')] as [string, boolean, string]] : []),
     ['Text', !c.missingWords.length, c.missingWords.length ? `Not read in the regenerated creative — check these: ${c.missingWords.join(', ')}. You can also correct text in the review that follows.` : 'Every word read in your original was found again (read on this computer). You check every word again in the review that follows.'],

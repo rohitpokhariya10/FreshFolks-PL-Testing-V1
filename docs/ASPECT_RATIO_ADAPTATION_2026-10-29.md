@@ -69,9 +69,18 @@ The administrator's own run on `localhost:5173`: upload → 16:9 AI regeneration
 
 Not run live (cost not approved): Flow 2's regenerated results made editable (detection + decomposition); 1:1 and 4:5 regeneration.
 
+## PL One Banner preset (885 × 286, ≈3.094:1)
+
+Offered in both workflows beside Original, 1:1, 4:5, 9:16 and 16:9 (`OFFER_ASPECT_RATIOS` → the master upload's size picker, Create Offer Creative's size picker, the Size step and AI variations). Final size **1770 × 572**, exactly 885:286 at 2×. The free Size step makes it at the template's own resolution, exactly 885:286 (885 × 286 for a small template).
+
+- **The image model cannot make it directly.** `gpt-image-2` takes sides in multiples of 16 and aspects from 1:3 to 3:1 (as already recorded in `cleanBackground.ts` and `templateStudio/compose/formats.ts`); 885:286 is wider.
+- **Smallest safe adaptation, same engine and same request:** the banner alone is asked at the widest supported shape, **3:1, 2496 × 832** (`RATIO_REQUEST_SIZES` / `regenRequestSize`). Its prompt adds one sentence: keep a ~2% band along the top and bottom edges as plain background. The existing `atRatioSize` then makes one `sharp` cover-resize to 1770 × 572. That keeps the **full width**, trims only the height difference (about 13 of 832 rows top and bottom, ≈1.5% each, inside the reserved band) and scales proportionally. QR, product and logo protection, the word checks and the Flow 1 logo restore all run on the final, trimmed image, before analysis and decomposition.
+- The five earlier choices are unchanged: same sizes, requests, labels and prompts (asserted in `plOneBanner.test.ts`).
+- Estimate per banner request: at most $0.48 (from the 2496 × 832 request size; the 16:9 estimate is $0.54). **Not run live** (no paid request approved for it).
+
 ## Tests
 
-- New unit tests: `ratioAdaptation.test.ts` (abandoned stands, a clipped reviewed logo in a dense logo grid, prompt content).
+- New unit tests: `ratioAdaptation.test.ts` (abandoned stands, a clipped reviewed logo in a dense logo grid, the faithful prompt, invented-copy flag, Flow 1 logo restore incl. backdrop and partial-match refusals) and `plOneBanner.test.ts` (the banner preset across both flows, the five earlier choices unchanged).
 - Browser: `ratio-regeneration.spec.ts` gains a test for AI regeneration chosen at Generate (result first, basic layout labelled). `ganesh-replay.spec.ts` now also asserts no stand layer is shown and the replacement is at least 20 % of the canvas height.
 - Product folder + `tests/unit`: 137 passed, 20 skipped, 2 failed. The 2 failures (`productAiDecomposition.test.ts:140`, `productReadiness.test.ts:16`) match the recorded baseline on untouched `727379d`.
 

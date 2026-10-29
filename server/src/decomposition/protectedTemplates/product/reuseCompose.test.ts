@@ -117,10 +117,10 @@ describe('Recompose in the Reuse Template studio (HTTP, temporary store, mocked 
       let d = (await s.send<ReuseDraft>('POST', `/${id}/reuse`, { ratios: ['9:16'] })).body;
       expect(d.ratios).toEqual(['9:16']);
       const view = (await s.call<{ formats: { ratio: string; method: string; canvas: { width: number; height: number } }[]; composition: { ai: boolean } }>(`/${id}/reuse/${d.id}`)).body;
-      expect(view.formats.map(f => f.ratio)).toEqual(['original', '1:1', '4:5', '9:16', '16:9']);
+      expect(view.formats.map(f => f.ratio)).toEqual(['original', '1:1', '4:5', '9:16', '16:9', '885:286']);
       for (const f of view.formats.filter(x => x.ratio !== 'original')) { expect(f.method).toBe('recompose'); expect(exact(f.ratio, f.canvas), f.ratio).toBe(true); }
       expect(view.composition.ai).toBe(true);
-      d = (await s.send<ReuseDraft>('PUT', `/${id}/reuse/${d.id}`, { expectedRevision: d.revision, ratios: ['1:1', '4:5', '9:16', '16:9'] })).body;
+      d = (await s.send<ReuseDraft>('PUT', `/${id}/reuse/${d.id}`, { expectedRevision: d.revision, ratios: ['1:1', '4:5', '9:16', '16:9', '885:286'] })).body;
       d = (await s.send<ReuseDraft>('POST', `/${id}/reuse/${d.id}/generate`, {})).body;
       for (const r of OFFER_ASPECT_RATIOS) {
         const o = d.outputs[r] as ReuseOutput;

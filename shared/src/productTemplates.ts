@@ -437,11 +437,12 @@ export const PRODUCT_VARIATION_LABELS: Record<ProductVariationKind, { title: str
 };
 /**
  * The common offer-creative aspect ratios: the one list every Product with Text flow offers (Create Offer Creative, Reuse
- * Template, AI variations) and the editor's own presets (Square, Poster 4:5, Story, Landscape).
+ * Template, AI variations) and the editor's own presets (Square, Poster 4:5, Story, Landscape), and the client's PL One
+ * banner (its Figma frame: 885 × 286, about 3.09:1).
  */
-export const OFFER_ASPECT_RATIOS = ['1:1', '4:5', '9:16', '16:9'] as const;
+export const OFFER_ASPECT_RATIOS = ['1:1', '4:5', '9:16', '16:9', '885:286'] as const;
 export type OfferAspectRatio = typeof OFFER_ASPECT_RATIOS[number];
-export const OFFER_ASPECT_LABELS: Record<OfferAspectRatio, string> = { '1:1': 'Square 1:1', '4:5': 'Portrait 4:5', '9:16': 'Story 9:16', '16:9': 'Landscape 16:9' };
+export const OFFER_ASPECT_LABELS: Record<OfferAspectRatio, string> = { '1:1': 'Square 1:1', '4:5': 'Portrait 4:5', '9:16': 'Story 9:16', '16:9': 'Landscape 16:9', '885:286': 'PL One Banner (885 × 286) — Ultra-wide' };
 /** One common ratio as width / height. */
 export const offerAspectValue = (ratio: OfferAspectRatio) => { const [w, h] = ratio.split(':').map(Number); return w / h; };
 /** The common ratio a canvas already has (within 1 %), if any: a template made in 9:16 says so. */
@@ -463,8 +464,16 @@ export function exactRatioCanvas(ratio: OfferAspectRatio, longSide: number): Sou
  * from its 1024 × 1024 high price, the picture sent at the high-fidelity token estimate, the prompt). The cost of a request
  * actually sent is taken from its response's usage, usually well below this.
  */
-export const RATIO_REGEN_SIZES: Record<OfferAspectRatio, SourceSize> = { '1:1': { width: 1536, height: 1536 }, '4:5': { width: 1280, height: 1600 }, '9:16': { width: 1152, height: 2048 }, '16:9': { width: 2048, height: 1152 } };
-export const ratioRegenEstimateUsd = (ratio: OfferAspectRatio) => { const { width, height } = RATIO_REGEN_SIZES[ratio]; return Math.round((0.211 * width * height / (1024 * 1024) + 6800 * 8e-6 + 1500 * 5e-6) * 100) / 100; };
+export const RATIO_REGEN_SIZES: Record<OfferAspectRatio, SourceSize> = { '1:1': { width: 1536, height: 1536 }, '4:5': { width: 1280, height: 1600 }, '9:16': { width: 1152, height: 2048 }, '16:9': { width: 2048, height: 1152 }, '885:286': { width: 1770, height: 572 } };
+/**
+ * The size asked of the image model, where it cannot make the ratio itself: it makes sides that are multiples of 16 in
+ * aspects from 1:3 to 3:1, so the 885:286 banner (3.09:1) is made at 3:1 (2496 × 832), its outer 1.5 % top and bottom —
+ * asked to be plain background — trimmed off to the exact ratio (atRatioSize), then sized. Every other ratio is made at
+ * its own size.
+ */
+export const RATIO_REQUEST_SIZES: Partial<Record<OfferAspectRatio, SourceSize>> = { '885:286': { width: 2496, height: 832 } };
+export const regenRequestSize = (ratio: OfferAspectRatio): SourceSize => RATIO_REQUEST_SIZES[ratio] ?? RATIO_REGEN_SIZES[ratio];
+export const ratioRegenEstimateUsd = (ratio: OfferAspectRatio) => { const { width, height } = regenRequestSize(ratio); return Math.round((0.211 * width * height / (1024 * 1024) + 6800 * 8e-6 + 1500 * 5e-6) * 100) / 100; };
 /** What was checked on a regenerated creative before the person sees it (QR codes, exact pictures put back, missing words). */
 export interface RegenerationChecks {
   qr: { data: string; status: 'kept' | 'restored' | 'failed' }[];

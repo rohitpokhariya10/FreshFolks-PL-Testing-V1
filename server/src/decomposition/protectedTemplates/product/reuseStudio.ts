@@ -17,7 +17,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import sharp from 'sharp';
 import {
-  isOfferAspectRatio, isOfferFont, offerWeights, OFFER_ASPECT_RATIOS, RATIO_REGEN_SIZES, ratioRegenEstimateUsd, REUSE_ASPECT_LABELS, REUSE_ASPECT_RATIOS, REUSE_OFFERED_RATIOS, rewriteGroup, CREATIVE_SCHEMA_VERSION,
+  isOfferAspectRatio, isOfferFont, offerWeights, OFFER_ASPECT_RATIOS, RATIO_REGEN_SIZES, regenRequestSize, ratioRegenEstimateUsd, REUSE_ASPECT_LABELS, REUSE_ASPECT_RATIOS, REUSE_OFFERED_RATIOS, rewriteGroup, CREATIVE_SCHEMA_VERSION,
   type CreativeInstance, type OfferAspectRatio, type ReuseComposePlan, type ReuseValidation, type OfferWeight, type ProductCreative, type ProductCreativeObject, type ProductSlot, type ProductSnapshot, type ProductVariationCheck, type ReuseAiPlan, type ReuseAspectRatio,
   type ReuseDraft, type ReuseItem, type ReuseOutput, type ReuseOverride, type ReusePlacementBox, type ReusePlacementMode, type ReuseTextEdit,
 } from '@frameflow/shared';
@@ -50,7 +50,7 @@ function fail(code: string, message: string, details?: Record<string, unknown>):
 const DRAFT_ID = /^pr-[a-f0-9]{8}$/, fileOf = (did: string) => `prd-${did.slice(3)}.json`;
 const ratioKey = (r: ReuseAspectRatio) => (r === 'original' ? 'original' : r.replace(':', 'x'));
 /** Each format's number in a derived template's name and id (stable: the formats offered first keep theirs). */
-const FORMAT_INDEX: Record<ReuseAspectRatio, number> = { original: 0, '3:9': 1, '4:9': 2, '16:9': 3, '1:1': 4, '4:5': 5, '9:16': 6 };
+const FORMAT_INDEX: Record<ReuseAspectRatio, number> = { original: 0, '3:9': 1, '4:9': 2, '16:9': 3, '1:1': 4, '4:5': 5, '9:16': 6, '885:286': 7 };
 /** Bumped when reuseCompose.ts changes what a recomposed background looks like (a new cached file). */
 const RECOMPOSE_VERSION = 2;
 const isRatio = (r: unknown): r is ReuseAspectRatio => (REUSE_ASPECT_RATIOS as readonly string[]).includes(r as string);
@@ -922,7 +922,7 @@ export function createReuseStudio(deps: {
   const composeWithAi = (id: string, did: string, input: { ratios?: unknown; approveUsd?: unknown; extend?: unknown }) => locked(`${id}:reuse:${did}`, async () => {
     const d = read(id, did), composer = deps.composer?.() ?? fail('NOT_CONFIGURED', 'AI composition is not configured on this server (no OpenAI key). Each size is laid out on this computer instead (free).');
     const asked = Array.isArray(input.ratios) && input.ratios.length ? d.ratios.filter(r => (input.ratios as unknown[]).includes(r)) : d.ratios, ratios = asked.filter(isOfferAspectRatio);
-    if (!ratios.length) fail('INVALID_REQUEST', 'Choose a size of this draft to compose with AI: Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9.');
+    if (!ratios.length) fail('INVALID_REQUEST', 'Choose a size of this draft to compose with AI: Square 1:1, Portrait 4:5, Story 9:16, Landscape 16:9 or PL One Banner (885 × 286).');
     const ctx = await contextOf(id, d.templateRevision), issues = sourceIssues(id, ctx.snapshot);
     if (issues.length) fail('SOURCE_NOT_READY', `Repair the master template before any paid request: ${issues.join(' ')}`);
     const editor = input.extend === false ? undefined : composer.editor, each = (composer.offline ? 0 : COMPOSE_PLAN_COST_USD) + (editor && !editor.offline ? EXTEND_COST_USD : 0);
@@ -1046,7 +1046,7 @@ export function createReuseStudio(deps: {
    */
   const regenerateImage = (id: string, did: string, input: { ratio?: unknown; approveUsd?: unknown }) => locked(`${id}:reuse:${did}`, async () => {
     const d = read(id, did), r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI regeneration is not configured on this server (no OpenAI key). The basic layout (free, not AI) is available.');
-    if (!isOfferAspectRatio(input.ratio)) fail('INVALID_REQUEST', 'Choose a size to regenerate in: Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9 (Original keeps the template as designed).');
+    if (!isOfferAspectRatio(input.ratio)) fail('INVALID_REQUEST', 'Choose a size to regenerate in: Square 1:1, Portrait 4:5, Story 9:16, Landscape 16:9 or PL One Banner (885 × 286) (Original keeps the template as designed).');
     const ratio: OfferAspectRatio = input.ratio, issues = sourceIssues(id, (await contextOf(id, d.templateRevision)).snapshot);
     if (issues.length) fail('SOURCE_NOT_READY', `Repair the master template before any paid request: ${issues.join(' ')}`);
     const estimateUsd = r.offline ? 0 : ratioRegenEstimateUsd(ratio);
@@ -1069,7 +1069,7 @@ export function createReuseStudio(deps: {
     const next: ReuseDraft = structuredClone(d), cents = (v: number) => Math.round(v * 1000) / 1000;
     next.ai.requests += 1;
     let result: Awaited<ReturnType<RatioRegenerator['regenerate']>>;
-    try { result = await r.regenerate({ image: original, prompt: regenerationPrompt(ratio, texts, c.objects.filter(x => x.kind === 'product' && !x.hidden).map(x => x.label)), size: RATIO_REGEN_SIZES[ratio] }, save, op); }
+    try { result = await r.regenerate({ image: original, prompt: regenerationPrompt(ratio, texts, c.objects.filter(x => x.kind === 'product' && !x.hidden).map(x => x.label)), size: regenRequestSize(ratio) }, save, op); }
     catch (error) {
       const message = (error instanceof Error ? error.message : String(error)).slice(0, 300);
       // (A failed request may still have been charged: counted at its estimate.)

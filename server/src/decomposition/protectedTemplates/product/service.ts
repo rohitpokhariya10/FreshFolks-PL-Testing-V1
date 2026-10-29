@@ -15,7 +15,7 @@ import sharp from 'sharp';
 import {
   decomposesObject, estimateAdvance, isMasterCategory, isOverlayKind, normalizeBox, orderProductObjects, PRODUCT_ELEMENT_KINDS, PRODUCT_LIMITS, PRODUCT_OBJECT_KINDS, PRODUCT_PREPARE_VERSION, PRODUCT_SCHEMA_VERSION, PROTECTED_SCHEMA_VERSION, withHistory,
   type DetectedWord, type LogoSlot, type MasterCategory, type PixelRect, type ProductHistoryEntry, type ProductInfo, type ProductObject, type ProductObjectKind, type ProductPrepared, type ProductSnapshot, type ProductGenerationBrief, type ProductStage, type ProtectedTemplate, type SourceBox,
-  type ReuseAspectRatio, type OfferAspectRatio, isOfferAspectRatio, REUSE_ASPECT_LABELS, OFFER_ASPECT_RATIOS, RATIO_REGEN_SIZES, ratioRegenEstimateUsd,
+  type ReuseAspectRatio, type OfferAspectRatio, isOfferAspectRatio, REUSE_ASPECT_LABELS, OFFER_ASPECT_RATIOS, RATIO_REGEN_SIZES, regenRequestSize, ratioRegenEstimateUsd,
 } from '@frameflow/shared';
 import { RunError } from '../../layerizeExperiment.js';
 import { decodeRgba, ingestImage, ProtectedImageError, sha256 } from '../pixels.js';
@@ -189,7 +189,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
    * `aspectRatio`: the master's size chosen on the upload screen ('original' or absent: its own size), kept with it.
    */
   async function create(bytes: Buffer, input: { name?: string; filename?: string; crop?: PixelRect; aspectRatio?: unknown; regenerate?: boolean; approveUsd?: unknown; useAi?: boolean }) {
-    if (input.aspectRatio !== undefined && input.aspectRatio !== 'original' && !isOfferAspectRatio(input.aspectRatio)) fail('INVALID_REQUEST', 'Choose Original, Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9.');
+    if (input.aspectRatio !== undefined && input.aspectRatio !== 'original' && !isOfferAspectRatio(input.aspectRatio)) fail('INVALID_REQUEST', 'Choose Original, Square 1:1, Portrait 4:5, Story 9:16, Landscape 16:9 or PL One Banner (885 × 286).');
     const targetRatio = isOfferAspectRatio(input.aspectRatio) ? input.aspectRatio : undefined;
     // Regenerated in the chosen size first: one image request, sent only with its approved estimate.
     if (input.regenerate) {
@@ -994,7 +994,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       const r = options.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI regeneration is not configured on this server (no OpenAI key).');
       // The upload as sent (at most 2048 px on its long side: the model works at about that size).
       const original = await sharp(store.read(id, t.source.inputFile)).resize(2048, 2048, { fit: 'inside', withoutEnlargement: true }).png().toBuffer();
-      const out = await r.regenerate({ image: original, prompt: regenerationPrompt(g.ratio), size: RATIO_REGEN_SIZES[g.ratio] }, save, op);
+      const out = await r.regenerate({ image: original, prompt: regenerationPrompt(g.ratio), size: regenRequestSize(g.ratio) }, save, op);
       const { png, checks } = await protectRegenerated({ original, result: await atRatioSize(out.image, g.ratio), recognizer: options.recognizer() });
       const hash = sha256(png), file = `regenerated-${g.ratio.replace(':', 'x')}-${hash.slice(0, 12)}.png`, size = RATIO_REGEN_SIZES[g.ratio], estimateUsd = r.offline ? 0 : ratioRegenEstimateUsd(g.ratio);
       if (!store.has(id, file)) store.write(id, file, png);
@@ -1072,7 +1072,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
   const setTargetRatio = (id: string, input: { ratio?: unknown; expectedRevision?: unknown }) => locked(id, async () => {
     const t = requireProduct(id);
     if (input.expectedRevision !== undefined && input.expectedRevision !== t.revision) fail('STALE_REVISION', `This template changed since you opened it (revision ${t.revision}). Reload it and try again.`, { revision: t.revision });
-    if (input.ratio !== 'original' && !isOfferAspectRatio(input.ratio)) fail('INVALID_REQUEST', 'Choose Original, Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9.');
+    if (input.ratio !== 'original' && !isOfferAspectRatio(input.ratio)) fail('INVALID_REQUEST', 'Choose Original, Square 1:1, Portrait 4:5, Story 9:16, Landscape 16:9 or PL One Banner (885 × 286).');
     const ratio = isOfferAspectRatio(input.ratio) ? input.ratio : undefined;
     if ((t.product.targetRatio ?? undefined) === ratio) return view(id);
     store.update(id, t.revision, x => {
@@ -1087,7 +1087,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
    * Template engine (reuseCompose.ts) — free by the rules, or by its approved AI composition — with its checks.
    */
   const masterSize = async (id: string, input: { ratio?: unknown }) => {
-    if (!isOfferAspectRatio(input.ratio)) fail('INVALID_REQUEST', 'Choose Square 1:1, Portrait 4:5, Story 9:16 or Landscape 16:9 (Original size needs no adaptation).');
+    if (!isOfferAspectRatio(input.ratio)) fail('INVALID_REQUEST', 'Choose Square 1:1, Portrait 4:5, Story 9:16, Landscape 16:9 or PL One Banner (885 × 286) (Original size needs no adaptation).');
     const revision = sourceRevisionOf(id), r = await reuse.masterDraft(id, { revision, ratio: input.ratio });
     return { ...r, sourceRevision: revision, ratio: input.ratio };
   };
