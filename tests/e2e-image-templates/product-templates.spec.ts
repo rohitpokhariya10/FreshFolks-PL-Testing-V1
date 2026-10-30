@@ -116,7 +116,7 @@ test('reuse: a product replaced in its slot, the headline rewritten, opened in t
   await page.route(url => /^https?:$/.test(url.protocol) && url.hostname !== '127.0.0.1', r => r.abort());
   const name = `Reuse ${Date.now()}`, v = await savedTemplate(request, name), id = v.template.id;
   const panel = await open(page);
-  await panel.getByRole('article', { name: `Product template ${name}` }).getByRole('button', { name: 'Use template' }).click();
+  await panel.getByRole('article', { name: `Product template ${name}` }).getByRole('button', { name: 'Use template', exact: true }).click();
   await panel.getByRole('button', { name: 'New creative' }).click();
   const change = panel.getByRole('complementary', { name: 'Change the creative' });
   await expect(change.getByRole('region', { name: 'Products and characters' })).toBeVisible();
@@ -193,7 +193,7 @@ test('reuse: a product replaced in its slot, the headline rewritten, opened in t
   await expect(again.getByRole('tab', { name: 'Generate with AI' })).toHaveAttribute('aria-selected', 'true');
   await expect(again.getByRole('heading', { name: 'What should the variations look like?' })).toBeVisible();
   await again.getByRole('button', { name: 'Templates', exact: true }).click();
-  await again.getByRole('article', { name: `Product template ${name}` }).getByRole('button', { name: 'Use template' }).click();
+  await again.getByRole('article', { name: `Product template ${name}` }).getByRole('button', { name: 'Use template', exact: true }).click();
   await again.getByRole('complementary', { name: 'Creatives' }).getByRole('button', { name: /Festive original/ }).click();
   await again.getByRole('button', { name: 'Open in editor' }).click();
   await expect(page.getByRole('dialog', { name: 'OpenAI + Seedream test' })).toBeHidden({ timeout: 60000 });

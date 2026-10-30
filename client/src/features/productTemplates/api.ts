@@ -34,7 +34,9 @@ export interface TextBlock { id: string; category: MasterCategory; text: string;
 export interface LogoView { id: string; label: string; category: string; box: PixelRect; file: string; removed: boolean; attention: boolean; confidence: number; /** A brand logo or graphic kept in the picture (not its own layer). */ inBackground?: boolean }
 export interface Attention { type: 'object' | 'text' | 'logo' | 'missing'; id: string; label: string; reason: string; box: PixelRect }
 export interface ProductView {
-  recovery?: { savedAnswer: boolean; retrievable: boolean; interrupted: boolean };
+  recovery?: { savedAnswer: boolean; retrievable: boolean; interrupted: boolean;
+    /** The element analysis request as OpenAI last reported it (`in_progress`, `completed`, `failed`, …): when it was submitted and last checked. */
+    job?: { status: string; startedAt: string; checkedAt?: string } };
   template: { id: string; name: string; revision: number; createdAt: string; updatedAt: string; source: ProtectedTemplate['source'] };
   stage: ProductStage; product: ProductInfo; texts: TextBlock[]; logos: LogoView[]; attention: Attention[];
   counts: { characters: number; products: number; text: number; words: number; logos: number; background: number };
@@ -131,6 +133,11 @@ export const productApi = {
   saveCreative: (id: string, cid: string, input: { expectedRevision: number; creative: ProductCreative }) => call<ProductCreative>(`/${id}/creatives/${cid}`, json('PUT', input)),
   replace: (id: string, cid: string, objectId: string, file: Blob, expectedRevision: number) => call<{ creative: ProductCreative; cutout: { background: 'transparent' | 'removed' | 'kept'; note?: string } }>(`/${id}/creatives/${cid}/objects/${objectId}/replace`, upload(file, { expectedRevision: String(expectedRevision) })),
   restore: (id: string, cid: string, objectId: string, expectedRevision: number) => call<ProductCreative>(`/${id}/creatives/${cid}/objects/${objectId}/restore`, json('POST', { expectedRevision })),
+  // Refine Cutout (one object layer): free local clean-up, an approved AI repair, and the approved apply (a new revision).
+  refineInfo: (id: string, cid: string, objectId: string) => call<RefineInfo>(`/${id}/creatives/${cid}/objects/${objectId}/refine`),
+  refineLocal: (id: string, cid: string, objectId: string) => call<RefineResult>(`/${id}/creatives/${cid}/objects/${objectId}/refine/local`, json('POST', {})),
+  refineWithAi: (id: string, cid: string, objectId: string, approveUsd: number) => call<RefineResult>(`/${id}/creatives/${cid}/objects/${objectId}/refine/ai`, json('POST', { approveUsd })),
+  applyRefinement: (id: string, cid: string, objectId: string, input: { expectedRevision: number; file: string; approved: boolean }) => call<ProductCreative>(`/${id}/creatives/${cid}/objects/${objectId}/refine/apply`, json('POST', input)),
   duplicate: (id: string, cid: string, name?: string) => call<ProductCreative>(`/${id}/creatives/${cid}/duplicate`, json('POST', { name })),
   uploadAsset: (id: string, cid: string, file: Blob, name?: string) => call<{ asset: { kind: 'creative'; file: string; sha256: string; width: number; height: number; originalName?: string } }>(`/${id}/creatives/${cid}/assets`, upload(file, {}, name)),
   openCreative: (id: string, cid: string) => call<{ runId: string; created: boolean }>(`/${id}/creatives/${cid}/open`, { method: 'POST' }),
@@ -192,6 +199,11 @@ export interface ReuseStudioView {
   /** The creative regenerated in a common ratio by the image model, when the server offers it. */
   regeneration?: RegenerationInfo;
 }
+/** Refine Cutout: what one AI repair sends and may cost; a refined picture to compare (local: what was cleaned; ai: the request's model and cost). */
+export interface RefineInfo { available: boolean; model: string; offline: boolean; size: { width: number; height: number }; estimateUsd: number }
+export interface RefineResult { before: string; file: string; width: number; height: number; requests: number; removedPixels?: number; filledPixels?: number; defringedPixels?: number; rebuiltPixels?: number; defectPixels?: number; hiddenPixels?: number; differingPixels?: number; foreignPixels?: number; keptPixels?: number; clearedPixels?: number; unrepairedPixels?: number; model?: string; offline?: boolean; size?: { width: number; height: number }; estimateUsd?: number; costUsd?: number; requestId?: string;
+  /** Geometry-locked AI completion: the automatic check, and whether it rejected the result (the layer is then kept). */
+  gate?: { accepted: boolean; reasons: string[]; holePixels: number; filledPixels: number }; rejected?: boolean }
 /** AI design variations of a template: whether they can be made here, each size's estimate per variation, earlier jobs. */
 export interface AiVariationsInfo { available: boolean; model: string; offline: boolean; estimates: Record<ProductAspectRatio, number>; jobs: AiVariationJob[] }
 export interface RegenerationInfo { available: boolean; model: string; offline: boolean; estimates: Record<OfferAspectRatio, number> }

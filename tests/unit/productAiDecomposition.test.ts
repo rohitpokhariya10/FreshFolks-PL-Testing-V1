@@ -12,6 +12,7 @@
  *     decomposed layer.
  */
 import { describe, expect, it } from 'vitest';
+import { APIConnectionTimeoutError } from 'openai';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import sharp from 'sharp';
@@ -191,6 +192,66 @@ describe('AI decomposition core: OpenAI planner → Seedream Layerize (live code
       expect(objectLayers).toHaveLength(4);
       expect(Math.min(...logoLayers.map(l => (l as unknown as { z: number }).z))).toBeGreaterThan(Math.max(...objectLayers.map(l => l.z)));
       expect(run.creative.provenance.textLayersSentToProviders).toBe(0);
+    } finally { await s.close(); }
+  });
+
+  it('replays the planner answer recorded for the very same request (no planner request); a live failure without one is reported', async () => {
+    const poster = await productPosterPng(), openai = fakeOpenAI();
+    // The live planner can time out (as gpt-5.6-sol did on the Navratri creative): each call either answers or times out.
+    let timeOut = true, live = 0;
+    const client = { responses: { async create(request: unknown) { live++; if (timeOut) throw new APIConnectionTimeoutError(); return openai.client.responses.create(request); } } };
+    const fal = fakeFal({ Television: PRODUCT_OBJECTS.tv, 'Washing machine': PRODUCT_OBJECTS.washer, Refrigerator: PRODUCT_OBJECTS.fridge, Mascot: PRODUCT_OBJECTS.mascot });
+    const layerizer = createProductLayerizer({ planner: liveDecompositionPlanner({ client: client as never, model: 'gpt-test-planner' }), transport: () => fal.transport, sleep: async () => undefined, pollIntervalMs: 0 });
+    const s = await setup({ analyzer: true, layerizer });
+    // Upload → detect → review → choose (the same choices every time, unless `pick` says otherwise) → decompose with AI.
+    const chooseAndDecompose = async (name: string, pick = (k: string) => k === 'product' || k === 'character') => {
+      let v = await s.detected((await s.form<View>('', poster, { name })).body.template.id);
+      const id = v.template.id;
+      v = (await s.send<View>('PUT', `/${id}/review`, { expectedRevision: v.template.revision, objects: v.product.objects.map(o => ({ ...o, accepted: true })), texts: [], logos: [], dismissMissingText: true })).body;
+      v = (await s.send<View>('PUT', `/${id}/selection`, { expectedRevision: v.template.revision, objects: v.product.objects.map(o => ({ id: o.id, decompose: pick(o.kind) })) })).body;
+      const estimate = (await s.call<{ ai: { maxUsd: number } }>(`/${id}/prepare-estimate`)).body.ai;
+      expect((await s.send('POST', `/${id}/prepare`, { expectedRevision: v.template.revision, engine: 'ai', approveUsd: estimate.maxUsd })).status).toBe(202);
+      return s.prepared(id);
+    };
+    const again = async (v: View) => {
+      const estimate = (await s.call<{ ai: { maxUsd: number } }>(`/${v.template.id}/prepare-estimate`)).body.ai;
+      expect((await s.send('POST', `/${v.template.id}/prepare`, { expectedRevision: v.template.revision, engine: 'ai', approveUsd: estimate.maxUsd })).status).toBe(202);
+      return s.prepared(v.template.id);
+    };
+    try {
+      // 1. Nothing recorded, the live planner times out: the genuine failure is reported, back on Review, Seedream not called.
+      let a = await chooseAndDecompose('First');
+      expect(a.stage).toBe('review');
+      expect(a.product.preparing).toMatchObject({ status: 'failed', engine: 'ai' });
+      expect(a.product.preparing?.error).toBe('The OpenAI planner (gpt-test-planner) request failed: Request timed out. Seedream was not called.');
+      expect([live, fal.log.submits.length]).toEqual([1, 0]);
+      // 2. Decompose again (the person's choice): the planner answers live and is recorded with the finished decomposition.
+      timeOut = false;
+      a = await again(a);
+      expect(a.stage, a.product.preparing?.error).toBe('prepared');
+      expect(a.product.preparing?.status).toBe('done');
+      expect(a.product.prepared?.separation.ai?.planner).toBe('gpt-test-planner');
+      expect([live, fal.log.submits.length]).toEqual([2, 1]);
+
+      // 3. The same upload with the same choices (another template): the identical request's recorded answer is replayed —
+      //    no planner request even though the live planner would time out — and Seedream gets the same prompt.
+      timeOut = true;
+      const b = await chooseAndDecompose('Second');
+      expect(b.stage, b.product.preparing?.error).toBe('prepared');
+      expect(b.product.preparing?.status).toBe('done');
+      expect(live).toBe(2);
+      expect(fal.log.submits).toHaveLength(2);
+      expect(fal.log.submits[1].input.prompt).toBe(fal.log.submits[0].input.prompt);
+      const separation = b.product.prepared!.separation;
+      expect(separation.ai?.planner).toBe('gpt-test-planner (recorded answer, replayed)');
+      expect(separation.costUsd).toBeCloseTo(a.product.prepared!.separation.costUsd - 0.08, 4);
+      expect(JSON.parse(readFileSync(join(s.protectedDir, b.template.id, 'prepare-ai-planner-replay.json'), 'utf8'))).toMatchObject({ replayOf: a.template.id, model: 'gpt-test-planner' });
+
+      // 4. Other choices are another request: nothing recorded for it, so the live planner is asked — and its failure shown.
+      const c = await chooseAndDecompose('Third', k => k === 'product');
+      expect(c.stage).toBe('review');
+      expect(c.product.preparing?.error).toContain('request failed: Request timed out. Seedream was not called.');
+      expect([live, fal.log.submits.length]).toEqual([3, 2]);
     } finally { await s.close(); }
   });
 });

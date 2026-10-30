@@ -40,7 +40,8 @@ export function ProductPrepare({ view, onChange, onError, onBackToReview, onChan
   };
   useEffect(() => { void productApi.estimate(id).then(setEstimate).catch(() => undefined); }, [id]);
   const stands = useMemo(() => p.stands ?? [], [p]);
-  const objects = useMemo(() => [...stands, ...view.product.objects.filter(o => o.cutout)].sort((a, b) => a.z - b.z), [view, stands]);
+  // (With the cut-out check: artwork in front of an element, on a layer just over it.)
+  const objects = useMemo(() => [...stands, ...(p.pieces ?? []), ...view.product.objects.filter(o => o.cutout)].sort((a, b) => a.z - b.z), [view, stands, p]);
   const [unstand, setUnstand] = useState<string>();
   const issues = p.quality.issues, blocking = issues.filter(i => i.blocking), warnings = issues.filter(i => !i.blocking);
   const stage = useRef<HTMLDivElement>(null), drag = useRef<{ id: string; x: number; y: number; ox: number; oy: number } | null>(null);
@@ -116,7 +117,8 @@ export function ProductPrepare({ view, onChange, onError, onBackToReview, onChan
             return <article key={o.id} className="prt-cutout" aria-label={`Layer ${o.label}`}>
               <div className="prt-cutout-img"><img src={productFileUrl(id, c.file)} alt={o.label} loading="lazy" /></div>
               <div className="prt-cutout-body"><strong>{o.label}</strong>
-                <span className="prt-reason">{what(o)} · {c.placement.width} × {c.placement.height} px · {c.method === 'seedream' ? 'Seedream layer' : c.method === 'sam3' ? 'cut-out service' : c.method === 'upload' ? 'your picture' : c.method === 'layer' ? 'the variation’s own layer' : 'cut out on this computer'}{stand ? ` · ${Math.round(100 * stand.completedPixels / Math.max(1, stand.visiblePixels + stand.completedPixels))}% continued behind the products` : ''}</span>
+                <span className="prt-reason">{what(o)} · {c.placement.width} × {c.placement.height} px · {c.method === 'seedream' ? 'Seedream layer' : c.method === 'sam3' ? 'cut-out service' : c.method === 'upload' ? 'your picture' : c.method === 'layer' ? 'the variation’s own layer' : 'cut out on this computer'}{stand ? ` · ${Math.round(100 * stand.completedPixels / Math.max(1, stand.visiblePixels + stand.completedPixels))}% continued behind the products` : ''}{c.evidence && c.evidence.behindLayerPixels + c.evidence.behindArtPixels > 0 ? ` · ${Math.max(1, Math.round(100 * (c.evidence.behindLayerPixels + c.evidence.behindArtPixels) / Math.max(1, c.evidence.solidPixels)))}% hidden in the picture; completion is an estimate` : ''}</span>
+                {c.evidence?.uncertain && <span className="prt-reason is-warn">{c.evidence.reasons.join('; ')}</span>}
                 {c.note && <span className="prt-reason is-warn">{c.note}</span>}
                 <button type="button" className="ws-btn ws-btn-quiet prt-inline" onClick={() => show(c.placement, o.id)}>Hide it in the Hide / Move test</button></div>
             </article>; })}

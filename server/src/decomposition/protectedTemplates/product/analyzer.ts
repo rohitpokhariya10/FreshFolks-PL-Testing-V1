@@ -13,7 +13,9 @@ export interface VisionWord {
   box: SourceBox; confidence: number; z: number;
 }
 export interface ProductAnalysisUsage { inputTokens: number; outputTokens: number; cachedInputTokens: number; costUsd?: number }
-export type ProductScene = SceneDescription & { words?: VisionWord[]; analysisUsage?: ProductAnalysisUsage };
+export type ProductScene = SceneDescription & { words?: VisionWord[]; analysisUsage?: ProductAnalysisUsage;
+  /** Main or advertised ids naming nothing the answer lists: left out, and said in the review (never made into an object). */
+  referenceWarnings?: string[] };
 export const PRODUCT_ANALYSIS_MAX_OUTPUT_TOKENS = 16000;
 export const PRODUCT_ANALYSIS_PRICE = { model: 'gpt-5.6-sol', inputPerMillion: 4, cachedPerMillion: 0.4, outputPerMillion: 20, checkedAt: '2026-10-22', source: 'https://developers.openai.com/api/docs/models/gpt-5.6-sol' } as const;
 /**
@@ -33,6 +35,8 @@ export interface ProductAnalysisJob {
   model: string; imageSha256: string; sent: ProductAnalysisSent; startedAt: string;
   responseId?: string; status: 'submitting' | 'unknown' | 'rejected' | 'unavailable' | NonNullable<OpenAI.Responses.Response['status']>;
   lastError?: { code: string; message: string; at: string };
+  /** When OpenAI was last asked for this response (its `status` is what it said then). */
+  checkedAt?: string;
 }
 export interface RecoverableProductAnalyzer extends SceneAnalyzer {
   recover(image: Buffer, save: (file: string, value: object) => void, job: ProductAnalysisJob): Promise<ProductScene>;
@@ -116,7 +120,7 @@ text_overlays: all advertising blocks, exact transcription, fractional boxes, va
  *   itself, or of an unknown kind is left out; the objects, words and logos stand.
  */
 export function trimProductObjects(value: unknown, max: number = PRODUCT_LIMITS.maxObjects): unknown {
-  const v = value as { objects?: unknown; relations?: unknown; marks?: unknown } | undefined;
+  const v = value as { objects?: unknown; relations?: unknown; marks?: unknown; main_candidates?: unknown; advertised_ids?: unknown } | undefined;
   if (!v || typeof v !== 'object' || !Array.isArray(v.objects)) return value;
   const rank = (o: { kind?: unknown }) => (o?.kind === 'character' ? 0 : o?.kind === 'product' ? 1 : 2);
   const kept = v.objects.length <= max ? v.objects as { id?: unknown }[] : [...(v.objects as { id?: unknown; kind?: unknown; confidence?: unknown }[])].sort((a, b) => rank(a) - rank(b) || (Number(b?.confidence) || 0) - (Number(a?.confidence) || 0)).slice(0, max);
@@ -124,11 +128,22 @@ export function trimProductObjects(value: unknown, max: number = PRODUCT_LIMITS.
   const relations = Array.isArray(v.relations) ? (v.relations as { source?: unknown; target?: unknown; relation?: unknown; confidence?: unknown }[]).filter(r => r && ids.has(r.source) && ids.has(r.target) && r.source !== r.target
     && (SCENE_RELATIONS as readonly unknown[]).includes(r.relation) && typeof r.confidence === 'number' && r.confidence >= 0 && r.confidence <= 1) : v.relations;
   const marks = Array.isArray(v.marks) ? (v.marks as { owner_id?: unknown }[]).map(m => (m && typeof m === 'object' && typeof m.owner_id === 'string' && m.owner_id && !ids.has(m.owner_id) ? { ...m, owner_id: '' } : m)) : v.marks;
-  return { ...v, objects: kept, relations, marks };
+  // Main and advertised ids name objects: one naming a logo or text of the answer (live 2026-10-30: the Navi logo
+  // `mark_logo_1`), or an object left out above, is left out; it stays what it is. (A non-string still fails validation.)
+  const only = (list: unknown) => (Array.isArray(list) ? list.filter(id => typeof id !== 'string' || ids.has(id)) : list);
+  return { ...v, objects: kept, relations, marks, main_candidates: only(v.main_candidates), advertised_ids: only(v.advertised_ids) };
+}
+/** Main or advertised ids that name nothing in the answer (no object, logo or text): what the review should check. */
+function unresolvedReferences(value: unknown): string[] {
+  const v = (value ?? {}) as Record<string, unknown>, listed = new Set<unknown>();
+  for (const key of ['objects', 'marks', 'text_overlays']) for (const item of Array.isArray(v[key]) ? v[key] as { id?: unknown }[] : []) listed.add(item?.id);
+  const named = [...(Array.isArray(v.main_candidates) ? v.main_candidates : []), ...(Array.isArray(v.advertised_ids) ? v.advertised_ids : [])];
+  return [...new Set(named.filter((id): id is string => typeof id === 'string' && !listed.has(id)))];
 }
 
 export function parseProductScene(value: unknown, size: { width: number; height: number }): ProductScene {
   const scene = parseSceneDescription(trimProductObjects(value), { objects: PRODUCT_LIMITS.maxObjects }), words = (value as { words?: unknown }).words;
+  const unresolved = unresolvedReferences(value);
   if (!Array.isArray(words) || words.length > 400) throw new Error('AI word detection is missing or exceeds 400 words.');
   const ids = new Set<string>();
   const parsed = words.map((w: VisionWord) => {
@@ -158,7 +173,7 @@ export function parseProductScene(value: unknown, size: { width: number; height:
     }
     if (missing.length) throw new ProductAnalysisError('PARTIAL_WORDS', `AI word manifest does not cover text block “${overlay.id}” (${missing.length} missing token(s)). Review or retry; detection is incomplete.`);
   }
-  return { ...scene, words: parsed };
+  return { ...scene, words: parsed, ...(unresolved.length ? { referenceWarnings: unresolved.map(id => `The analysis named “${id.slice(0, 60)}” as what this creative is about, but listed no such element. Nothing was added for it: check that no product or character is missing, and add it if one is.`) } : {}) };
 }
 
 /** One source image, no tools, no retries; this builder never makes a network request. */
@@ -187,7 +202,7 @@ export function liveProductAnalyzer(options: { model?: string; client?: Pick<Ope
     let response: OpenAI.Responses.Response;
     const started = Date.now();
     const checkpoint = (r: OpenAI.Responses.Response) => {
-      job.responseId = r.id; job.status = r.status ?? 'unknown'; delete job.lastError; save('product.job.json', job);
+      job.responseId = r.id; job.status = r.status ?? 'unknown'; job.checkedAt = new Date().toISOString(); delete job.lastError; save('product.job.json', job);
       save('product.response.json', r);
       // The request dimensions and answer are paired atomically; a later attempt cannot mislabel an older answer.
       if (r.status === 'completed') save('product.completed.json', { job, response: r });
@@ -205,6 +220,12 @@ export function liveProductAnalyzer(options: { model?: string; client?: Pick<Ope
     }
     catch (error) {
       const f = productProviderFailure(error, timeoutMs), elapsedMs = Date.now() - started;
+      // Still running at OpenAI after the wait: said with OpenAI's own status. Not a failure, never done; checking again is free.
+      if (error instanceof ProductAnalysisError && error.code === 'PENDING') {
+        save('product.error.json', { code: 'PENDING', status: job.status, responseId: job.responseId, startedAt: job.startedAt, checkedAt: job.checkedAt, elapsedMs, timeoutMs, sent, model: job.model, retried: false, at: new Date().toISOString() });
+        const minutes = Math.max(1, Math.round((Date.now() - Date.parse(job.startedAt)) / 60_000));
+        throw new ProductAnalysisError('PENDING', `OpenAI still reports this request as ${job.status} (submitted ${minutes} min ago), so there is no answer yet. Use “Retrieve existing request” to check it again: checking is free and submits no new request.`, undefined, { elapsedMs, sent: job.sent });
+      }
       const unavailable = !!job.responseId && (f.httpStatus === 404 || f.httpStatus === 410);
       if (unavailable) job.status = 'unavailable';
       else if (!job.responseId) job.status = f.httpStatus && [400, 401, 403, 404, 413, 422, 429].includes(f.httpStatus) ? 'rejected' : 'unknown';
@@ -227,10 +248,11 @@ export function liveProductAnalyzer(options: { model?: string; client?: Pick<Ope
  * A Responses answer made into the product scene: everything that happens after the network (usage, completion,
  * refusal, empty answer, JSON, the schema checks). Shared by the live analyzer and the replay of a recorded answer.
  */
-export function productSceneFromResponse(response: Pick<OpenAI.Responses.Response, 'status' | 'usage' | 'incomplete_details' | 'output' | 'output_text'>, size: { width: number; height: number }, model: string, save: (file: string, value: object) => void): ProductScene {
+export function productSceneFromResponse(response: Pick<OpenAI.Responses.Response, 'status' | 'usage' | 'incomplete_details' | 'output' | 'output_text'> & Partial<Pick<OpenAI.Responses.Response, 'error'>>, size: { width: number; height: number }, model: string, save: (file: string, value: object) => void): ProductScene {
   const usage = productAnalysisUsage(model, response.usage);
   if (usage) save('product.usage.json', { model, ...usage });
-  if (response.status !== 'completed') throw new ProductAnalysisError('INCOMPLETE', `AI detection not completed (${response.status}: ${response.incomplete_details?.reason ?? 'unknown'}). No automatic retry was made.`, usage);
+  // OpenAI's own reason (a failed response's error, an incomplete one's cause): this request has ended and cannot be collected again.
+  if (response.status !== 'completed') throw new ProductAnalysisError('INCOMPLETE', `AI detection not completed (${response.status}: ${response.error?.message ?? response.incomplete_details?.reason ?? 'unknown'}). OpenAI has ended this request, so it cannot be retrieved again; a new analysis needs your approval. No automatic retry was made.`, usage);
   if (response.output?.some(item => item.type === 'message' && item.content.some(c => c.type === 'refusal'))) throw new ProductAnalysisError('REFUSAL', 'The model declined this analysis. No detections were accepted.', usage);
   if (!response.output_text?.trim()) throw new ProductAnalysisError('EMPTY_RESPONSE', 'AI returned no word manifest. No detections were accepted.', usage);
   try { return { ...parseProductScene(JSON.parse(response.output_text), size), analysisUsage: usage }; }

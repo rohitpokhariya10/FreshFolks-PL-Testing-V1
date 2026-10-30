@@ -24,7 +24,7 @@ import { newProtectedTemplateId, type ProtectedStore } from '../store.js';
 import type { WordRecognizer } from '../../../textRecognition/recognizer.js';
 import type { SceneAnalyzer } from '../../creativeTemplates/smartProviders.js';
 import type { Segmenter } from '../../creativeTemplates/segmenter.js';
-import { aiDecompositionEstimate, sentSize, type ProductLayerizer } from './aiDecompose.js';
+import { aiDecompositionEstimate, sentSize, type ProductLayerizer, type RecordedPlannerAnswer } from './aiDecompose.js';
 import { OverlayGateError, prepareProduct } from './prepare.js';
 import { createProductCreatives } from './creatives.js';
 import { createProductVariations, type ProductVariationPlanner } from './variations.js';
@@ -90,6 +90,11 @@ export interface ProductTemplateOptions {
   composer?: () => ReuseComposer | undefined;
   /** The creative regenerated in a common ratio by the image model (ratioRegeneration.ts; only with approval of its cost), for both workflows. */
   regenerator?: () => RatioRegenerator | undefined;
+  /**
+   * Check each layer after its decomposition and repair it on this computer (layerEvidence.ts, cutoutVerification.ts); off
+   * when absent or false (the router turns it on unless FRAMEFLOW_CUTOUT_VERIFICATION=0). Nothing is sent or charged either way.
+   */
+  cutoutVerification?: () => boolean;
 }
 /** One element of the review as the client sends it (the whole state each time). */
 export interface ReviewInput {
@@ -153,7 +158,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     });
   }
   function view(id: string) {
-    const t = requireProduct(id), p = t.product, a = t.textAnalysis, blocks = textBlocks(t);
+    const t = requireProduct(id), p = t.product, a = t.textAnalysis, blocks = textBlocks(t), job = readJob(id);
     const logos = (a?.logoSlots ?? []).map(s => ({ id: s.id, label: s.label, category: s.category ?? 'partner-logo', box: boxOf(s.box), file: s.replacement?.file ?? s.original.file, removed: s.review.status === 'rejected', attention: s.review.status === 'needs-review', confidence: s.confidence, ...(s.inBackground ? { inBackground: true } : {}) }));
     const live = p.objects.filter(o => !o.hidden);
     const attention = [
@@ -166,7 +171,9 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     return {
       template: { id: t.id, name: t.name, revision: t.revision, createdAt: t.createdAt, updatedAt: t.updatedAt, source: t.source },
       recovery: { savedAnswer: store.has(id, 'analysis-product-completed.json') || store.list().some(s => s.source.sha256 === t.source.sha256 && s.product?.detection?.status === 'done' && store.has(s.id, 'analysis-product-response.json')),
-        retrievable: !!readJob(id)?.responseId, interrupted: p.detection?.status === 'running' && !detecting.has(id) },
+        // Retrievable while OpenAI may still give an answer for it; one it ended (failed, cancelled, incomplete, expired) is not.
+        retrievable: !!job?.responseId && !['failed', 'cancelled', 'incomplete', 'unavailable', 'rejected'].includes(job.status), interrupted: p.detection?.status === 'running' && !detecting.has(id),
+        ...(job ? { job: { status: job.status, startedAt: job.startedAt, ...(job.checkedAt ? { checkedAt: job.checkedAt } : {}) } } : {}) },
       stage: stageOf(t), texts: blocks, logos, attention,
       product: p.preparing?.status === 'running' && !preparingNow(t.id) ? { ...p, preparing: { ...p.preparing, status: 'failed' as const, error: 'Preparing was interrupted: prepare again.' } } : p,
       counts: { characters: count('character'), products: count('product'), text: blocks.filter(b => !b.removed).length, words: (a?.words ?? []).filter(w => w.review.status !== 'rejected').length, logos: logos.filter(l => !l.removed && !l.inBackground).length + count('brand-logo'), background: count('podium') + count('frame') + count('decoration') },
@@ -288,12 +295,42 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     }
     return undefined;
   }
+  /**
+   * The decomposition planner's completed answer to this very request, recorded by an AI decomposition of the same picture
+   * (this template or another made from the same upload) — no new planner request, nothing spent. Only the files of a
+   * template whose LAST prepare was that AI decomposition and finished are read (a later run, failed or not, rewrites the
+   * request file, so the pair would not belong together), and only when the answer, read with today's checks, is the very
+   * prompt that decomposition used. Anything less is not replayed: the live planner is asked.
+   */
+  const recordedPlanner = (target: ProtectedTemplate): RecordedPlannerAnswer => ({ request, imageSha256, derive }) => {
+    const wanted = JSON.stringify(request);
+    for (const owner of [target, ...store.list().filter(o => o.id !== target.id)]) {
+      try {
+        const p = owner.product, s = p?.prepared?.separation;
+        if (!p || owner.source.sha256 !== target.source.sha256 || owner.source.width !== target.source.width || owner.source.height !== target.source.height) continue;
+        if (p.preparing?.status !== 'done' || p.preparing.engine !== 'ai' || s?.method !== 'seedream' || !s.ai || s.ai.offline || s.inputSha256 !== imageSha256) continue;
+        if (JSON.stringify(JSON.parse(store.read(owner.id, 'prepare-ai-planner-request.json').toString('utf8'))) !== wanted) continue;
+        const response: unknown = JSON.parse(store.read(owner.id, 'prepare-ai-planner-response.json').toString('utf8'));
+        if (derive(response).prompt !== s.ai.prompt) continue;
+        return { response, from: owner.id };
+      } catch { /* A missing, unreadable or refused recording is never replayed. */ }
+    }
+    return undefined;
+  };
+  /** A base template's approved creative (its source picture) and words (its latest revision), or nothing if it is gone. */
+  function sourceTemplate(baseId: string): { png: Buffer; words: { text: string }[] } | undefined {
+    try {
+      const b = requireProduct(baseId), rev = b.product.revisions.at(-1);
+      if (!rev || !store.has(baseId, b.source.inputFile)) return undefined;
+      return { png: store.read(baseId, b.source.inputFile), words: snapshot(baseId, rev.revision).words };
+    } catch { return undefined; }
+  }
   async function runDetect(id: string, useAi: boolean, useSaved = false, recover = false, newRequest = false) {
     const startedAt = nowIso();
     const before = requireProduct(id);
     // Keep the last successful analysis intact even while a new attempt is running or fails.
     // (What this run asks of the AI is shown while it runs: a previous skipped or failed attempt's outcome is not.)
-    if (before.product.detection?.status !== 'done') await service.updateMaster(id, undefined, x => { const d = { ...x.product!.detection, status: 'running' as const, startedAt, sourceSha256: x.source.sha256 }; delete d.ai; x.product!.detection = useAi ? d : { ...d, ai: { status: 'skipped' } }; });
+    if (before.product.detection?.status !== 'done') await service.updateMaster(id, undefined, x => { const d = { ...x.product!.detection, status: 'running' as const, startedAt, sourceSha256: x.source.sha256 }; delete d.ai; x.product!.detection = useAi || recover ? d : { ...d, ai: { status: 'skipped' } }; });
     try {
       const t = requireProduct(id), png = store.read(id, t.source.inputFile);
       if (sha256(png) !== t.source.sha256) fail('SOURCE_MISMATCH', 'The stored image does not match its original hash. No saved analysis or provider request was used.');
@@ -327,20 +364,35 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       const recognizer: WordRecognizer = fromVariation ? { engine: { name: 'composition', version: '1', model: 'the variation\'s own text (no reading)', modes: ['composition'] }, recognize: async () => [] } : options.recognizer();
       const result = await detectProduct({ template: t, source, png: input, recognizer, analyzer, previous: t.textAnalysis, ...(fromVariation ? { exact: true } : {}),
         store: (f, bytes) => store.write(id, f, bytes), save: (f, value) => store.write(id, `analysis-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 80)}.json`, Buffer.from(JSON.stringify(value, null, 2))), at: nowIso() });
-      // An approved AI-regenerated creative: each logo found in it gets its layer from the upload's own pixels (the model
-      // redraws small logos; the coordinates stay the regenerated creative's). Before the review, so it shows them.
-      const g = t.product.regeneration;
-      if (g?.status === 'approved' && g.original && store.has(id, g.original.file) && !fromVariation) {
+      // An approved AI-made creative (regenerated in a size, a reused creative's regeneration, an AI variation). Its words and
+      // logos are found in this final picture — their coordinates are its own — and checked against its approved source,
+      // before the review: text and logos stay editable overlays, never decomposed as pictures.
+      const g = t.product.regeneration, base = g?.status === 'approved' && !fromVariation && g.from?.templateId ? sourceTemplate(g.from.templateId) : undefined;
+      if (g?.status === 'approved' && !fromVariation) {
+        // Words: one the source does not have (an invented or changed price, offer, date or claim) is flagged for the
+        // review, never taken as the template's. The source: the base template's own words, else the words the
+        // regeneration check read as added to the upload.
+        const norm = (w: string) => w.normalize('NFKD').replace(/[^\p{L}\p{N}₹%]/gu, '').toLowerCase();
+        const known = base ? new Set(base.words.flatMap(w => w.text.split(/\s+/)).map(norm).filter(Boolean)) : undefined, added = new Set((g.result?.checks.extraWords ?? []).map(norm));
+        const flagged = result.analysis.words.filter(w => w.review.status !== 'rejected' && (known ? !known.has(norm(w.text)) : added.has(norm(w.text))) && norm(w.text));
+        for (const w of flagged) w.review = { status: 'needs-review', at: nowIso() };
+        if (flagged.length || known) store.write(id, 'analysis-source-words.json', Buffer.from(JSON.stringify({ note: 'Words found in the approved AI creative that its source does not have: flagged for the review (an invented or changed price, offer, date or claim must not become the template\'s).', source: base ? `template ${g.from!.templateId}` : 'the regeneration check of the upload', flagged: flagged.map(w => w.text) }, null, 2)));
+        // Logos: each gets its layer from the authentic pixels of its approved source — the upload, else the base
+        // template's creative — on a clear match (the model redraws small logos). One not found is flagged for the review:
+        // keep it after looking, or upload the authentic logo; never one the model invented.
+        const source = g.original && store.has(id, g.original.file) ? store.read(id, g.original.file) : base?.png;
         const logos = result.analysis.logoSlots.filter(l => !l.replacement && !l.box.rotation && l.review.status !== 'rejected' && store.has(id, l.original.file));
-        const restored = await restoreLogosFromOriginal({ original: store.read(id, g.original.file), regenerated: { width: t.source.width, height: t.source.height }, logos: logos.map(l => ({ id: l.id, png: store.read(id, l.original.file) })) });
-        for (const r of restored) {
-          const l = logos.find(x => x.id === r.id)!;
-          if (!r.png) continue;
-          const hash = sha256(r.png), file = `logo-${l.id}-${hash.slice(0, 12)}.png`;
-          if (!store.has(id, file)) store.write(id, file, r.png);
-          l.original = { ...l.original, file, sha256: hash, bytes: r.png.length };
+        if (source && logos.length) {
+          const restored = await restoreLogosFromOriginal({ original: source, regenerated: { width: t.source.width, height: t.source.height }, logos: logos.map(l => ({ id: l.id, png: store.read(id, l.original.file) })) });
+          for (const r of restored) {
+            const l = logos.find(x => x.id === r.id)!;
+            if (!r.png) { l.review = { status: 'needs-review', at: nowIso() }; continue; }
+            const hash = sha256(r.png), file = `logo-${l.id}-${hash.slice(0, 12)}.png`;
+            if (!store.has(id, file)) store.write(id, file, r.png);
+            l.original = { ...l.original, file, sha256: hash, bytes: r.png.length };
+          }
+          store.write(id, 'analysis-regeneration-logos.json', Buffer.from(JSON.stringify({ note: 'Logos found in the approved AI creative, found again in its source and cut from its own pixels (restored), or kept as drawn and flagged for the review (not-found).', source: g.original ? 'the upload' : `template ${g.from!.templateId}`, logos: restored.map(r => ({ id: r.id, label: logos.find(x => x.id === r.id)!.label, status: r.status, score: r.score })) }, null, 2)));
         }
-        store.write(id, 'analysis-regeneration-logos.json', Buffer.from(JSON.stringify({ note: 'Logos found in the approved regenerated creative, found again in the upload and cut from its own pixels (restored), or kept as drawn (not-found).', logos: restored.map(r => ({ id: r.id, label: logos.find(x => x.id === r.id)!.label, status: r.status, score: r.score })) }, null, 2)));
       }
       // Run again on a reviewed template: the administrator's corrections win over what was found again at their place.
       const prior = !t.textAnalysis && cached?.owner.product?.detection?.status === 'done' ? cached.owner : t;
@@ -790,6 +842,8 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       .map(g => `“${g.label.length > 48 ? `${g.label.slice(0, 48)}…` : g.label}”`);
     return `${error.message}${named.length ? ` (${named.slice(0, 2).join(', ')})` : ''} Its text boxes may not sit on the letters: use “Fit text to the letters” in the review (free, on this computer), or correct the boxes, then prepare again.`;
   };
+  const withRecordedPlanner = (layerizer: ProductLayerizer | undefined, t: ProtectedTemplate): ProductLayerizer | undefined =>
+    layerizer && { ...layerizer, decompose: (request, save) => layerizer.decompose(request, save, { recordedPlanner: recordedPlanner(t) }) };
   async function runPrepare(id: string, engine: 'ai' | 'sam3' | 'local') {
     const started = Date.now(), at = nowIso(), t = requireProduct(id), objectsRevision = t.product.objectsRevision, analysisRevision = t.textAnalysis?.revision ?? 0, paid = engine !== 'local';
     await service.updateMaster(id, undefined, x => { x.product!.preparing = { status: 'running', startedAt: at, paid, engine }; });
@@ -804,7 +858,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       // Every saved logo is restored independently, including legacy logos previously kept in the background.
       for (const logo of analysis?.logoSlots ?? []) delete logo.inBackground;
       const result = await prepareProduct({ source, analysis, objects: t.product.objects, segmenter: engine === 'sam3' ? options.segmenter?.() : undefined, paidApproved: paid,
-        ...(engine === 'ai' ? { layerizer: options.layerizer?.(), requireAiMatches: !!v } : {}), ...(known ? { known } : {}),
+        ...(engine === 'ai' ? { layerizer: withRecordedPlanner(options.layerizer?.(), t), requireAiMatches: !!v } : {}), ...(known ? { known } : {}), ...(options.cutoutVerification?.() ? { verifyCutouts: true } : {}),
         save: (f, value) => store.write(id, `prepare-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 80)}.json`, Buffer.from(JSON.stringify(value, null, 2))),
         saveImage: (f, png) => store.write(id, `prepare-${f.replace(/\.png$/i, '')}-${sha256(png).slice(0, 12)}.png`, png) });
       const file = (prefix: string, png: Buffer) => { const name = `${prefix}-${sha256(png).slice(0, 12)}.png`; if (!store.has(id, name)) store.write(id, name, png); return { file: name, sha256: sha256(png) }; };
@@ -821,6 +875,14 @@ export function createProductTemplates(options: ProductTemplateOptions) {
             quality: s.uncertain ? 'check' as const : 'good' as const, ...(s.uncertain ? { note: 'Mostly hidden behind the products: most of it is an estimate.' } : {}) },
           stand: { under: s.under, visiblePixels: s.visiblePixels, completedPixels: s.completedPixels, uncertain: s.uncertain } };
       });
+      // Artwork in front of an element (the cut-out check): a decoration layer of its own just over that element.
+      const pieces: NonNullable<ProductPrepared['pieces']> = (result.pieces ?? []).map(s => {
+        const over = t.product.objects.find(o => o.id === s.over)!, f = file(`ppiece-${sha256(Buffer.from(`${id}:${s.key}`)).slice(0, 10)}`, s.png);
+        return { id: `po-${sha256(Buffer.from(`${s.key}:${s.placement.x},${s.placement.y},${s.placement.width},${s.placement.height}`)).slice(0, 10)}`, kind: 'decoration' as const, label: s.label, box: { ...s.placement },
+          confidence: 0.9, z: over.z + 0.5, covers: [s.over], origin: 'local' as const, review: { status: 'accepted' as const, by: 'auto' as const }, decompose: true,
+          cutout: { file: f.file, sha256: f.sha256, placement: { ...s.placement }, method: 'local' as const, coverage: 1, quality: 'check' as const, note: `Overlap of background artwork in front of “${over.label}”; the rest remains in the background. Moving this overlay does not move the whole decoration.` },
+          piece: { over: s.over, pixels: s.pixels } };
+      });
       await service.updateMaster(id, undefined, x => {
         const p = x.product!;
         if (p.objectsRevision !== objectsRevision || (x.textAnalysis?.revision ?? 0) !== analysisRevision) { p.preparing = { status: 'failed', startedAt: at, paid, error: 'The elements changed while preparing: prepare again.' }; return; }
@@ -828,17 +890,19 @@ export function createProductTemplates(options: ProductTemplateOptions) {
         for (const o of p.objects) {
           const c = cutouts.get(o.id);
           if (!c) { delete o.cutout; delete o.slot; continue; }
-          o.cutout = { file: c.file, sha256: c.sha256, placement: c.placement, method: c.method, coverage: c.coverage, quality: c.quality, ...(c.note ? { note: c.note } : {}) };
+          o.cutout = { file: c.file, sha256: c.sha256, placement: c.placement, method: c.method, coverage: c.coverage, quality: c.quality, ...(c.note ? { note: c.note } : {}),
+            ...(c.verification ? { verification: { ...c.verification, ...(c.original ? { original: file(`pcut-${c.id}`, c.original) } : {}) } } : {}),
+            ...(c.evidence ? { evidence: { ...c.evidence, ...(c.evidenceLayer ? { layer: file(`pseedream-${c.id}`, c.evidenceLayer) } : {}) } } : {}) };
           if (o.kind === 'character' || o.kind === 'product') o.slot = { box: { ...c.placement }, contactY: c.contactY, targetHeight: c.contactY - c.placement.y + 1, z: o.z };
         }
         p.prepared = { version: PRODUCT_PREPARE_VERSION, at: nowIso(), objectsRevision, analysisRevision, clean, base,
           previews: { recombined: file('precombined', result.recombined).file, recombinedClean: file('precombined-clean', result.recombinedClean).file, overlayMask: file('pmask', result.overlayMask).file, overlays: file('poverlays', result.overlays).file, estimated: file('pestimated', result.estimated).file },
-          separation: result.separation, quality: result.quality, ...(stands.length ? { stands } : {}), durationMs: Date.now() - started };
+          separation: result.separation, quality: result.quality, ...(stands.length ? { stands } : {}), ...(pieces.length ? { pieces } : {}), durationMs: Date.now() - started };
         p.preparing = { status: 'done', startedAt: at, paid, engine };
         const ai = result.separation.method === 'seedream' && !result.separation.ai?.offline;
         p.activity = { ...p.activity, aiCalls: p.activity.aiCalls + (ai ? 1 : 0), segmentRequests: p.activity.segmentRequests + (ai ? 1 : result.separation.method === 'sam3' ? result.separation.requests : 0), costUsd: Math.round((p.activity.costUsd + result.separation.costUsd) * 10000) / 10000 };
         delete p.approved;
-        history(p, { action: 'prepared', detail: `${result.cutouts.length} object(s) cut out (${result.separation.method === 'seedream' ? `AI: ${result.separation.ai?.planner} plan → ${result.separation.ai?.engine}, ${result.separation.ai?.matched.length} element(s) from its layers${result.separation.ai?.unmatched.length ? `, ${result.separation.ai.unmatched.length} locally` : ''}, $${result.separation.costUsd.toFixed(2)}` : result.separation.method === 'sam3' ? `SAM-3, ${result.separation.requests} request(s)` : 'locally'})${stands.length ? `, ${stands.length} display stand(s) on their own layers` : ''}; ${result.quality.issues.length} check(s) to look at.` });
+        history(p, { action: 'prepared', detail: `${result.cutouts.length} object(s) cut out (${result.separation.method === 'seedream' ? `AI: ${result.separation.ai?.planner} plan → ${result.separation.ai?.engine}, ${result.separation.ai?.matched.length} element(s) from its layers${result.separation.ai?.unmatched.length ? `, ${result.separation.ai.unmatched.length} locally` : ''}, $${result.separation.costUsd.toFixed(2)}` : result.separation.method === 'sam3' ? `SAM-3, ${result.separation.requests} request(s)` : 'locally'})${stands.length ? `, ${stands.length} display stand(s) on their own layers` : ''}${pieces.length ? `, ${pieces.length} piece(s) of artwork in front on their own layers` : ''}; ${result.quality.issues.length} check(s) to look at.` });
       });
     } catch (error) {
       const message = error instanceof OverlayGateError ? gateMessage(error, t.textAnalysis) : error instanceof Error ? error.message.slice(0, 300) : String(error);
@@ -901,7 +965,8 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     if (!p.prepared || p.prepared.objectsRevision !== p.objectsRevision || p.prepared.analysisRevision !== (t.textAnalysis?.revision ?? 0)) fail('NOT_READY', 'Prepare the current reviewed elements first.');
     const a = t.textAnalysis, revision = (p.revisions[p.revisions.length - 1]?.revision ?? 0) + 1, at = nowIso(), generation = p.generation ?? await derivedBrief(t);
     const snapshot: ProductSnapshot = { schemaVersion: PRODUCT_SCHEMA_VERSION, templateId: id, revision, publishedAt: at, name: t.name, canvas: { width: t.source.width, height: t.source.height },
-      source: { file: t.source.inputFile, sha256: t.source.sha256 }, clean: p.prepared.clean, base: p.prepared.base, objects: [...p.objects.filter(o => !o.hidden && o.cutout), ...(p.prepared.stands ?? []).map(o => Object.fromEntries(Object.entries(o).filter(([k]) => k !== 'stand')) as ProductObject)],
+      source: { file: t.source.inputFile, sha256: t.source.sha256 }, clean: p.prepared.clean, base: p.prepared.base, objects: [...p.objects.filter(o => !o.hidden && o.cutout), ...(p.prepared.stands ?? []).map(o => Object.fromEntries(Object.entries(o).filter(([k]) => k !== 'stand')) as ProductObject),
+        ...(p.prepared.pieces ?? []).map(o => Object.fromEntries(Object.entries(o).filter(([k]) => k !== 'piece')) as ProductObject)],
       words: (a?.words ?? []).filter(w => w.review.status !== 'rejected'), groups: a?.groups ?? [], logoSlots: (a?.logoSlots ?? []).filter(s => s.review.status !== 'rejected' && !s.inBackground), plates: (a?.plates ?? []).filter(pl => pl.review.status !== 'rejected'),
       detection: p.detection, backgroundStructure: p.objects.filter(o => !['character', 'product', 'brand-logo'].includes(o.kind)), quality: p.prepared.quality, prepareVersion: p.prepared.version,
       preparation: p.prepared, selectedObjects: p.objects,
@@ -933,7 +998,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     return JSON.parse(store.read(id, ref.file).toString('utf8')) as ProductSnapshot;
   }
 
-  const creatives = createProductCreatives({ store, runsDir: options.runsDir, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision });
+  const creatives = createProductCreatives({ store, runsDir: options.runsDir, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, regenerator: options.regenerator });
   /** Enter the existing Konva editor through the existing creative/run adapter. This does not approve quality. */
   const openEditor = (id: string) => locked(id, async () => {
     let t = requireProduct(id);

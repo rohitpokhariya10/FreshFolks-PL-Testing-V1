@@ -24,7 +24,7 @@ import { svgPng, textInkExact, textSvg } from '../../../templateStudio/masterCre
  * kept, only hidden ones are filled, and the share that is an estimate is reported, never claimed exact.
  */
 import sharp from 'sharp';
-import type { LogoSlot, PixelRect, ProductAiSeparation, ProductObject, ProductQuality, ProductQualityIssue, TextAnalysis } from '@frameflow/shared';
+import type { LogoSlot, PixelRect, ProductAiSeparation, ProductCutoutVerification, ProductLayerEvidence, ProductObject, ProductQuality, ProductQualityIssue, TextAnalysis } from '@frameflow/shared';
 import { flattenRgb, sha256, type Rgba } from '../pixels.js';
 import { removalMask } from '../master/removal.js';
 import { extendLineToInk } from '../master/scan.js';
@@ -39,6 +39,8 @@ import { completeStands, findRisers, type Riser } from './risers.js';
 import { binDown, dilate, maskDown, sampleRgb, upsampleLabels, workIndex, workSize, type WorkSize } from './multiscale.js';
 import { sentSize, type AiDecomposition, type ProductLayerizer } from './aiDecompose.js';
 import { refineMasks } from './segment.js';
+import { verifyProductCutouts } from './cutoutVerification.js';
+import { alignBackground, artPieceOf, completionOf, evidenceCutout, explainLayers, forArt, type LayerEvidence } from './layerEvidence.js';
 import type { Segmenter } from '../../creativeTemplates/segmenter.js';
 
 type Box = PixelRect;
@@ -1025,7 +1027,17 @@ async function aiLayers(layerizer: ProductLayerizer, rgb: Uint8Array, clean: Uin
     background = { rgb, alpha };
   }
   save('ai-mapping.json', { sent: { width: W, height: H }, background: bgIndex >= 0 ? { source: 'seedream-layer', sha256: sha256(layers[bgIndex].png), z: layers[bgIndex].zIndex } : null, layers: layers.map((l, k) => ({ z: l.zIndex, name: l.name ?? null, opaquePixels: opaque[k], role: k === bgIndex ? 'background' : assigned.get(k) ?? 'unassigned' })), matched: [...masks.keys()], unmatched });
-  return { result, masks, unmatched, background, sent: { width: W, height: H } };
+  // Each matched element's own layer (RGBA on the sent canvas; several given to one element, laid back to front): the
+  // evidence of the cut-out check (layerEvidence.ts).
+  const layerOf = new Map<string, Uint8Array>();
+  for (const [k, id] of [...assigned].sort((a, b) => a[0] - b[0])) {
+    if (!masks.has(id)) continue;
+    const top = layers[k].data, under = layerOf.get(id);
+    if (!under) { layerOf.set(id, Uint8Array.from(top)); continue; }
+    for (let q = 0; q < N; q++) { const a = top[q * 4 + 3] / 255; if (!a) continue; const b = under[q * 4 + 3] / 255, o = a + b * (1 - a);
+      for (let c = 0; c < 3; c++) under[q * 4 + c] = Math.round((top[q * 4 + c] * a + under[q * 4 + c] * b * (1 - a)) / o); under[q * 4 + 3] = Math.round(o * 255); }
+  }
+  return { result, masks, unmatched, background, sent: { width: W, height: H }, layerOf };
 }
 
 /** Square neighbourhood (side 2r+1) dilation: separable running counts, linear in the picture whatever `r` is. */
@@ -1262,13 +1274,24 @@ export interface PrepareInput {
   /** A requested paid variation must not pass quality checks on local fallback cutouts. */
   requireAiMatches?: boolean;
   /**
+   * Check each product's layer after the decomposition and repair it on this computer (cutoutVerification.ts): server
+   * option `cutoutVerification`, off by default — off, nothing of it runs.
+   */
+  verifyCutouts?: boolean;
+  /**
    * A template made from a generated variation (variationTemplate.ts): its background, its picture without text and logos
    * (exact), and each element's layer at its place. An element whose box is still its layer's keeps that layer — its
    * pixels and its mask — and what is behind it is the variation's own background; anything else is decomposed as usual.
    */
   known?: { verifiedComposition?: boolean; background: Rgba; clean: Rgba; layers: { label: string; kind: ProductObject['kind']; box: Box; png: Buffer }[]; plates?: { box: Box; png: Buffer }[] };
 }
-export interface PreparedCutout { id: string; png: Buffer; placement: Box; method: 'sam3' | 'local' | 'layer' | 'seedream'; coverage: number; quality: 'good' | 'check'; note?: string; contactY: number }
+export interface PreparedCutout { id: string; png: Buffer; placement: Box; method: 'sam3' | 'local' | 'layer' | 'seedream'; coverage: number; quality: 'good' | 'check'; note?: string; contactY: number;
+  /** With `verifyCutouts`: what the check found and did, and the layer as the decomposition made it (when changed). */
+  verification?: ProductCutoutVerification; original?: Buffer;
+  /** With `verifyCutouts` and the AI decomposition: the layer made from its own layer as evidence, and that layer as it came (PNG, sent canvas). */
+  evidence?: ProductLayerEvidence; evidenceLayer?: Buffer }
+/** Artwork in front of a decomposed element, on a layer of its own just over it (layerEvidence.ts). */
+export interface PreparedPiece { key: string; label: string; png: Buffer; placement: Box; over: string; pixels: number }
 /** A display stand on its own layer: `key` names it (its place), `hint` the administrator's box it came from. */
 export interface PreparedStand { key: string; label: string; png: Buffer; placement: Box; under: string[]; visiblePixels: number; completedPixels: number; uncertain: boolean; source: 'auto' | 'user'; hint?: string }
 export interface PrepareResult {
@@ -1276,6 +1299,8 @@ export interface PrepareResult {
   /** Where the background is an estimate (amber: guessed by patches; blue: the scene's structure continued), over clear. */
   estimated: Buffer;
   cutouts: PreparedCutout[]; stands: PreparedStand[]; quality: ProductQuality;
+  /** With `verifyCutouts`: artwork in front of decomposed elements, each on a layer just over its element. */
+  pieces?: PreparedPiece[];
   separation: { method: 'sam3' | 'local' | 'seedream'; requests: number; costUsd: number; inputSha256?: string; ai?: ProductAiSeparation };
 }
 
@@ -1413,11 +1438,29 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
   const ws = workSize(w, h, input.workSide), wclean = ws ? binDown(clean, w, h, ws) : undefined;
   // (A stand with its own layer is that layer: not looked for again.)
   const toSeparate = input.objects.filter(o => !(o.kind === 'podium' && known.has(o.id)));
+  // 3c (option `verifyCutouts`) The decomposition's own layers as evidence (layerEvidence.ts): each element's mask is
+  // where the picture shows it — not wherever its layer reaches — and what stands in front of it is completed from its
+  // own layer (step 4), artwork in front lifted onto a layer of its own. An element whose layer does not line up keeps
+  // the mask as before.
+  const evidence = new Map<string, LayerEvidence>();
+  if (input.verifyCutouts && ai?.background && ai.masks.size) {
+    const ids = [...ai.masks.keys()].filter(id => ai!.layerOf.has(id));
+    const all = explainLayers({ picture: clean, w, h, background: ai.background.rgb, sent: ai.sent,
+      layers: ids.map(id => { const o = input.objects.find(x => x.id === id)!; return { id, kind: o.kind, label: o.label, z: o.z, rgba: ai!.layerOf.get(id)! }; }),
+      scenery: input.objects.filter(o => !o.hidden && !decomposesObject(o) && o.kind !== 'brand-logo').map(o => ({ label: o.label, box: o.box })) });
+    for (const [id, e] of all) {
+      const o = input.objects.find(x => x.id === id)!;
+      if (!e.usable) { issues.push({ id: `evidence-${id}`, area: o.box, elementId: id, blocking: false, message: `“${o.label}”: its AI layer was not used as evidence (${e.reasons.join('; ')}); it is cut out as before — check its edges and what it keeps of its neighbours.` }); continue; }
+      evidence.set(id, e); ai.masks.set(id, Uint8Array.from(e.visible));
+    }
+    input.save('layer-evidence.json', { sent: ai.sent, layers: [...all.values()].map(e => ({ id: e.id, label: input.objects.find(x => x.id === e.id)?.label, usable: e.usable, reasons: e.reasons, registration: e.registration, offset: e.offset, crop: e.crop, counts: e.counts, hiddenBehind: e.hiddenBehind, art: e.art ?? null })) });
+  }
   let separated = ws ? separateLarge(clean, w, h, wclean!, ws, toSeparate, method === 'sam3' ? masks : undefined) : separateObjects(clean, w, h, toSeparate, method === 'sam3' ? masks : undefined);
   // (Seedream's masks for the elements it returned, the local ones for the rest; the stands found again around them.)
   if (ai?.masks.size) { const merged = new Map(separated.masks); for (const [id, m] of ai.masks) merged.set(id, m); separated = ws ? separateLarge(clean, w, h, wclean!, ws, toSeparate, merged) : separateObjects(clean, w, h, toSeparate, merged); }
   masks = separated.masks;
-  absorbFragments(clean, w, h, live, masks);
+  // (Not an element with evidence: what its mask leaves out is explained — artwork in front of it, another element.)
+  absorbFragments(clean, w, h, evidence.size ? live.filter(o => !evidence.has(o.id)) : live, masks);
   for (const [id, k] of complete) known.set(id, k);
   // Known layers win: their masks are their own, and no other mask keeps the pixels where they show (where something in
   // front hides a product, those pixels stay that thing's: the character before a product keeps its whole outline).
@@ -1455,10 +1498,25 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
   for (const m of masks.values()) for (let i = 0; i < n; i++) if (m[i]) all[i] = 1;
   for (const r of risers) for (let i = 0; i < n; i++) if (r.visible[i]) all[i] = 1;
   for (const o of knownStands) { const k = known.get(o.id)!; for (let i = 0; i < n; i++) if (k.mask[i]) all[i] = 1; }
+  // A product's removal domain includes its reviewed footprint, not only its opaque silhouette.
+  // Contact shadows/base fragments can sit below the provider alpha (the fridge's old dark dash).
+  // The provider already supplied a clean plate there. Keep separately identified scenery protected.
+  if (evidence.size) {
+    const scenery = input.objects.filter(o => !o.hidden && !decomposesObject(o) && (o.kind === 'decoration' || o.kind === 'frame'));
+    for (const o of live.filter(o => o.kind === 'product' && evidence.has(o.id))) {
+      const b = o.box;
+      for (let y = Math.max(0, b.y - 1); y < Math.min(h, b.y + b.height + 1); y++) for (let x = Math.max(0, b.x - 1); x < Math.min(w, b.x + b.width + 1); x++) {
+        const i = y * w + x;
+        if (!all[i] && !scenery.some(s => x >= s.box.x && x < s.box.x + s.box.width && y >= s.box.y && y < s.box.y + s.box.height)) all[i] = 2;
+      }
+    }
+  }
   // (The objects' soft edges beyond their first pixel, at a large size, are rebuilt with what is behind them.)
   if (rimR > 1) for (let i = 0; i < n; i++) if (!all[i] && rimBand[i]) all[i] = 2;
   // Each object's soft rim (1 px) is taken with it.
   for (let i = 0; i < n; i++) if (!all[i]) { const x = i % w; if ((x > 0 && all[i - 1] === 1) || (x < w - 1 && all[i + 1] === 1) || (i >= w && all[i - w] === 1) || (i + w < n && all[i + w] === 1)) all[i] = 2; }
+  // (Artwork in front of an element with evidence, along its visible edge, diagonals too: rebuilt — see artPieceOf.)
+  for (const e of evidence.values()) forArt(e, w, (i, edge) => { if (edge && !all[i]) all[i] = 2; });
   const hole = Uint8Array.from(all, v => (v ? 1 : 0)), noBlur = !!input.analysis?.words.some(w => w.origin === 'ai');
   const baseFill = ws ? await rebuildLarge(clean, w, h, hole, wclean!, ws, noBlur, separated.guide) : await rebuildBehind(clean, w, h, hole, noBlur, separated.guide), base = baseFill.rgb;
   // Behind a known layer — everything it covers, its soft edge too — is the variation's own background: exact, never an
@@ -1480,7 +1538,10 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
     // An uploaded creative: the AI's clean plate over everything it took out with the objects (aiPlate), and what of that
     // the creative shows besides the objects (stands, a backdrop panel) on stand layers of their own, over it.
     const stage = input.objects.filter(o => !o.hidden && o.kind === 'podium' && o.layer !== 'own').sort((a, b) => b.box.width * b.box.height - a.box.width * a.box.height)[0]?.box;
-    const bg = ai.background, plate = aiPlate(clean, bg, w, h, hole, live.filter(o => o.kind === 'product' || o.kind === 'character').map(o => ({ kind: o.kind, box: o.box, mask: masks.get(o.id)! })),
+    // (With evidence (step 3c): the background lined up with the picture round each such element first — layerEvidence.ts.)
+    const aligned = evidence.size ? alignBackground(clean, ai.background.rgb, w, h, [...evidence.keys()].map(id => masks.get(id)!), hole) : undefined;
+    if (aligned) input.save('background-alignment.json', { shifts: [...evidence.keys()].map((id, k) => ({ id, shift: aligned.shifts[k] })) });
+    const bg = aligned ? { rgb: aligned.rgb, alpha: ai.background.alpha } : ai.background, plate = aiPlate(clean, bg, w, h, hole, live.filter(o => o.kind === 'product' || o.kind === 'character').map(o => ({ kind: o.kind, box: o.box, mask: masks.get(o.id)! })),
       input.objects.filter(o => !o.hidden && (o.kind === 'decoration' || o.kind === 'frame') && !decomposesObject(o)).map(o => o.box), stage);
     for (let i = 0; i < n; i++) if (plate.weight[i] && !exact[i]) {
       const t = plate.weight[i] / 255;
@@ -1536,6 +1597,10 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
     if (filled) issues.push({ id: 'ai-background', area: { x: 0, y: 0, width: w, height: h }, blocking: false, message: `Behind the elements Seedream decomposed, ${round(100 * filled / n, 1)}% of the canvas is Seedream's own reconstruction of the background (an AI estimate, never the original pixels): it shows only when they are moved or hidden. Inspect Background only.` });
     for (const id of ai.unmatched) { const o = input.objects.find(x => x.id === id)!; issues.push({ id: `ai-missing-${id}`, area: o.box, elementId: id, blocking: !!input.requireAiMatches, message: `Seedream returned no layer for “${o.label}”: it was cut out on this computer instead. Check its edges.` }); }
   }
+  // Behind the artwork lifted onto layers of its own (step 3c): the picture's pixels — that artwork is the background's,
+  // seen (under its own layer, the same pixels: neither shows a seam when the element is moved) — except along the
+  // element's visible edge, rebuilt with it (its layer there is the artwork's colour at an opacity: artPieceOf).
+  for (const e of evidence.values()) forArt(e, w, (i, edge) => { if (edge) return; for (let c = 0; c < 3; c++) base[i * 3 + c] = clean[i * 3 + c]; aiFilled[i] = 0; baseFill.unknown[i] = 0; baseFill.patched[i] = 0; });
   // Opaque everywhere: what was behind the objects is rebuilt (an estimate), never a transparent hole.
   const baseRgba=Buffer.alloc(n*4);
   for(let i=0;i<n;i++){ for(let c=0;c<3;c++)baseRgba[i*4+c]=base[i*3+c];baseRgba[i*4+3]=255; }
@@ -1564,18 +1629,21 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
   }
   // 4 Cut-outs: each object's pixels; at its rim, its colour over what is behind it at the opacity both colours give. A
   // stand also carries its completed part (opaque, the estimate).
-  const cutOut = async (m: Uint8Array, back: Uint8Array, completed?: { shape: Uint8Array; box: Box; rgb: Uint8Array }) => {
+  // (`completed.alpha`: a completion from the element's own layer — its outline's soft edge kept, and its pixels count as
+  // the element's inside, so where the picture's pixels meet them there is no rim.)
+  const cutOut = async (m: Uint8Array, back: Uint8Array, completed?: { shape: Uint8Array; box: Box; rgb: Uint8Array; alpha?: Uint8Array }) => {
     let x0 = w, y0 = h, x1 = -1, y1 = -1, count = 0;
     for (let i = 0; i < n; i++) if (m[i] || completed?.shape[i]) { const x = i % w, y = (i - x) / w; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; if (m[i]) count++; }
     if (!count) return undefined;
     x0 = Math.max(0, x0 - 1); y0 = Math.max(0, y0 - 1); x1 = Math.min(w - 1, x1 + 1); y1 = Math.min(h - 1, y1 + 1);
     const W = x1 - x0 + 1, H = y1 - y0 + 1, px = Buffer.alloc(W * H * 4);
-    const inner = (i: number) => { const x = i % w; return m[i] && (x === 0 || m[i - 1]) && (x === w - 1 || m[i + 1]) && (i < w || m[i - w]) && (i + w >= n || m[i + w]); };
+    const own = completed?.alpha ? (j: number) => m[j] || completed.shape[j] : (j: number) => m[j];
+    const inner = (i: number) => { const x = i % w; return m[i] && (x === 0 || own(i - 1)) && (x === w - 1 || own(i + 1)) && (i < w || own(i - w)) && (i + w >= n || own(i + w)); };
     for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
       const i = y * w + x, o4 = ((y - y0) * W + (x - x0)) * 4, colour = [clean[i * 3], clean[i * 3 + 1], clean[i * 3 + 2]];
       if (completed && completed.shape[i] && !m[i]) {
-        const o = ((y - completed.box.y) * completed.box.width + x - completed.box.x) * 3;
-        px[o4] = completed.rgb[o]; px[o4 + 1] = completed.rgb[o + 1]; px[o4 + 2] = completed.rgb[o + 2]; px[o4 + 3] = 255; continue;
+        const o = (y - completed.box.y) * completed.box.width + x - completed.box.x;
+        px[o4] = completed.rgb[o * 3]; px[o4 + 1] = completed.rgb[o * 3 + 1]; px[o4 + 2] = completed.rgb[o * 3 + 2]; px[o4 + 3] = completed.alpha ? completed.alpha[o] : 255; continue;
       }
       if (method === 'local' && input.analysis?.words.some(word => word.origin === 'ai')) {
         // The hidden background is uncertain: alpha unmixing against it discolours product rims.
@@ -1599,8 +1667,18 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
   // and earbuds): the part of it they hide — within its own outline — is continued from its own pixels (an estimate,
   // reported), so moving or hiding them shows the product, not a hole of background in it. Not done when they hide as
   // much as half of it (too much would be invented).
-  const completions = new Map<string, { shape: Uint8Array; box: Box; rgb: Uint8Array; pixels: number; by: string[] }>();
-  for (const o of live.filter(x => x.kind === 'product' && !known.has(x.id))) {
+  const completions = new Map<string, { shape: Uint8Array; box: Box; rgb: Uint8Array; alpha?: Uint8Array; pixels: number; by: string[] }>();
+  // An element with evidence (step 3c): what hides it is completed from its own layer — the decomposition drew it whole
+  // (a refrigerator's side behind the dishwasher, the sleeves behind the arch) — its colours matched to the picture
+  // around; a character too.
+  for (const o of live.filter(x => evidence.has(x.id))) {
+    const e = evidence.get(o.id)!, c = completionOf(e, w, h); if (!c) continue;
+    completions.set(o.id, { ...c, by: e.hiddenBehind });
+    const parts = [e.counts.behindLayers ? `behind ${e.hiddenBehind.slice(0, 3).join(', ') || 'the elements in front of it'}` : '', e.counts.behindArt ? `behind ${e.art?.label ?? 'artwork'} (now on a layer of its own over it)` : ''].filter(Boolean);
+    issues.push({ id: `completed-${o.id}`, area: o.box, elementId: o.id, blocking: false,
+      message: `“${o.label}”: the part of it hidden ${parts.join(' and ')} (${Math.max(1, Math.round(100 * c.pixels / Math.max(1, e.counts.solid)))}% of it) was completed from its own AI layer — an estimate using the layer's drawing and local continuation where it copied foreground content, not recovered original pixels. Inspect it with the foreground moved or hidden.` });
+  }
+  for (const o of live.filter(x => x.kind === 'product' && !known.has(x.id) && !evidence.has(x.id))) {
     // Where it is hidden: inside the extent of its own visible pixels (a little inside) — the detected box can run past
     // it (a microwave's box over the top of the purifier in front of it), and its outline cannot say it, as what stands
     // in front covers its edges (phones over a laptop's corner).
@@ -1649,7 +1727,83 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
     if (note) issues.push({ id: `cutout-${o.id}`, area: o.box, message: `${o.label}: ${note}`, blocking: false, elementId: o.id });
     cutouts.push({ id: o.id, png: made.png, placement: made.placement, method: ai ? (ai.masks.has(o.id) ? 'seedream' : 'local') : method === 'seedream' ? 'local' : method, coverage: round(coverage), quality: note ? 'check' : 'good', ...(note ? { note } : {}), contactY: made.contactY });
   }
+  // 4b The check after the decomposition (option `verifyCutouts`): each product's layer against the picture, the layers in
+  // front of it and the background plate; repaired here, the original kept, what is uncertain reported.
+  // (An element with evidence carries its own report, and is not checked again by what is left of the picture: its
+  // completion is its own layer's, never rebuilt from its edges.)
+  const pieces: PreparedPiece[] = [];
+  for (const c of cutouts) {
+    const e = evidence.get(c.id), o = live.find(x => x.id === c.id)!; if (!e) continue;
+    const native = evidenceCutout(e, clean, w);
+    if (native) {
+      c.png = await sharp(Buffer.from(native.rgba), { raw: { width: native.box.width, height: native.box.height, channels: 4 } }).png().toBuffer();
+      c.placement = native.box; c.contactY = native.box.y + native.box.height - 1;
+    }
+    const completed = e.counts.behindLayers + e.counts.behindArt, reasons: string[] = [];
+    if (completed) reasons.push('the hidden shape cannot be verified from the flattened picture; inspect the completed silhouette or supply an authentic reference');
+    if (e.counts.inferred) reasons.push(`${e.counts.inferred} copied foreground pixels were replaced by local colour continuation, not recovered geometry`);
+    if (e.counts.unresolved) reasons.push(`${e.counts.unresolved} pixels have no trustworthy completion and remain transparent`);
+    if (completed > e.counts.solid * 0.25) reasons.push(`${Math.round(100 * completed / e.counts.solid)}% of it is the AI layer's drawing of what is hidden (an estimate)`);
+    if (e.counts.conflict > e.counts.solid * 0.01) reasons.push(`${Math.round(100 * e.counts.conflict / e.counts.solid)}% of its AI layer lies where an element drawn behind it shows: left out — check the order of the elements`);
+    if (e.registration.agreement < 0.5) reasons.push(`its AI layer matches the picture at only ${Math.round(100 * e.registration.agreement)}% of its pixels: what was completed may not join it exactly`);
+    let artInFront: ProductLayerEvidence['artInFront'];
+    const piece = e.art ? artPieceOf(e, clean, w) : undefined;
+    if (piece && e.art) {
+      const key = `art-${c.id}`, objectId = `po-${sha256(Buffer.from(`${key}:${piece.box.x},${piece.box.y},${piece.box.width},${piece.box.height}`)).slice(0, 10)}`;
+      pieces.push({ key, label: `${e.art.label} · in front of ${o.label}`.slice(0, 80), png: await sharp(Buffer.from(piece.rgba), { raw: { width: piece.box.width, height: piece.box.height, channels: 4 } }).png().toBuffer(), placement: piece.box, over: c.id, pixels: piece.pixels });
+      artInFront = { label: e.art.label, pixels: piece.pixels, objectId };
+    }
+    c.evidence = { version: 1, registration: e.registration, solidPixels: e.counts.solid, visiblePixels: e.counts.visible, extendedPixels: e.counts.extended, behindLayerPixels: e.counts.behindLayers, behindArtPixels: e.counts.behindArt, outlinePixels: e.counts.outline, conflictPixels: e.counts.conflict,
+      inferredPixels: e.counts.inferred, unresolvedPixels: e.counts.unresolved, hiddenBehind: e.hiddenBehind, ...(artInFront ? { artInFront } : {}), uncertain: reasons.length > 0, reasons };
+    c.evidenceLayer = await sharp(Buffer.from(ai!.layerOf.get(c.id)!), { raw: { width: ai!.sent.width, height: ai!.sent.height, channels: 4 } }).png().toBuffer();
+    if (reasons.length) issues.push({ id: `uncertain-${o.id}`, area: o.box, elementId: o.id, blocking: false,
+      message: `“${o.label}”: ${reasons.join('; ')}. Verified interior pixels come from the picture; mixed boundary pixels retain the registered AI layer. An authentic reference can establish the hidden shape; Refine cutout → Complete with AI requires cost approval and remains an estimate.` });
+    if (reasons.length) c.quality = 'check';
+  }
+  if (pieces.length) issues.push({ id: 'art-in-front', area: { x: 0, y: 0, width: w, height: h }, blocking: false,
+    message: `Artwork left in the background stands in front of ${pieces.length === 1 ? 'an element' : `${pieces.length} elements`} (${pieces.slice(0, 4).map(p => `“${p.label}”`).join(', ')}): each overlap is a stacking overlay just above its element. The rest of that artwork remains in the background: moving this overlay does not move the whole decoration. Independent decoration movement remains unresolved. Hide or move the underlying element to inspect its completion.` });
+  const toVerify = cutouts.filter(c => !evidence.has(c.id));
+  if (input.verifyCutouts && toVerify.length) {
+    const picture = await sharp(Buffer.from(rgb.buffer, rgb.byteOffset, rgb.byteLength), { raw: { width: w, height: h, channels: 3 } }).png().toBuffer();
+    const byId = new Map(live.map(o => [o.id, o]));
+    const checked = await verifyProductCutouts({ picture, plate: basePng,
+      cutouts: cutouts.map(c => { const o = byId.get(c.id)!; return { id: c.id, kind: o.kind, label: o.label, z: o.z, png: c.png, placement: c.placement, method: evidence.has(c.id) ? 'layer' : c.method }; }) });
+    const repaired: string[] = [];
+    for (const c of cutouts) {
+      const v = checked.get(c.id), o = byId.get(c.id)!; if (!v) continue;
+      c.verification = v.report;
+      if (v.changed) { c.original = c.png; c.png = v.png; repaired.push(o.label); }
+      if (v.report.uncertain) issues.push({ id: `uncertain-${o.id}`, area: o.box, elementId: o.id, blocking: false,
+        message: `“${o.label}”: ${v.report.reasons.join('; ')}. Its layer is the best estimate from the picture, not an exact product photo: Refine cutout → Complete with AI (its cost shown first) or a product photo makes it exact.` });
+    }
+    if (repaired.length) issues.push({ id: 'cutouts-verified', area: { x: 0, y: 0, width: w, height: h }, blocking: false,
+      message: `Checked after the decomposition: ${repaired.length === 1 ? 'the layer' : `${repaired.length} layers`} of ${repaired.slice(0, 4).join(', ')}${repaired.length > 4 ? ` and ${repaired.length - 4} more` : ''} repaired on this computer — what other layers or the background left in them removed, what was hidden rebuilt from their own pixels. Their verified pixels are unchanged; the originals are kept.` });
+  }
   // Each stand's layer, named after what stands on it (or the administrator's box).
+  // A missed/unusable provider layer cannot participate in evidence ownership. Its locally extracted
+  // neighbour may therefore still be copied into an evidence-backed object (for example a TV's soundbar).
+  // Detect this unresolved duplication in the FINAL cutouts; never report the underlying layer as clean.
+  // This is a warning, not an instruction to erase similar-coloured legitimate product details.
+  if (input.verifyCutouts && evidence.size && cutouts.some(c => !evidence.has(c.id))) {
+    const decoded = new Map(await Promise.all(cutouts.map(async c => [c.id, await sharp(c.png).ensureAlpha().raw().toBuffer()] as const)));
+    for (const c of cutouts.filter(c => c.evidence)) {
+      const o = live.find(o => o.id === c.id)!, a = c.placement, pixels = decoded.get(c.id)!;
+      for (const f of cutouts.filter(f => !evidence.has(f.id) && live.find(o => o.id === f.id)!.z > o.z)) {
+        const front = live.find(o => o.id === f.id)!, b = f.placement, fp = decoded.get(f.id)!;
+        let same = 0, overlap = 0;
+        for (let y = Math.max(a.y, b.y); y < Math.min(a.y + a.height, b.y + b.height); y++) for (let x = Math.max(a.x, b.x); x < Math.min(a.x + a.width, b.x + b.width); x++) {
+          const i = ((y - a.y) * a.width + x - a.x) * 4, j = ((y - b.y) * b.width + x - b.x) * 4;
+          if (pixels[i + 3] < 240 || fp[j + 3] < 240) continue;
+          overlap++;
+          if (Math.max(...[0, 1, 2].map(k => Math.abs(pixels[i + k] - fp[j + k]))) <= 8) same++;
+        }
+        if (same < Math.max(20, Math.min(a.width * a.height, b.width * b.height) * 0.05) || same < overlap * 0.8) continue;
+        const reason = `${same} pixels also appear in “${front.label}”, whose provider layer could not establish ownership; this layer may still contain that neighbour — separation unresolved`;
+        c.evidence!.uncertain = true; c.evidence!.reasons.push(reason); c.quality = 'check';
+        issues.push({ id: `ownership-${c.id}-${f.id}`, area: b, elementId: c.id, blocking: false, message: `“${o.label}”: ${reason}. Supply a clean reference or review a separately approved completion.` });
+      }
+    }
+  }
   const stands: PreparedStand[] = [];
   for (const o of knownStands) { const k = known.get(o.id)!; stands.push({ key: `${k.box.x},${k.box.y},${k.box.width},${k.box.height}`, label: o.label.slice(0, 80), png: k.png, placement: { ...k.box }, under: [], visiblePixels: k.count, completedPixels: 0, uncertain: false, source: 'user', hint: o.id }); }
   for (const r of risers) {
@@ -1716,7 +1870,8 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
   // 6 Checks: recombined against the original (overlays as their own pixels) and against the clean picture.
   const recombine = async (withOverlays: boolean) => {
     let img = sharp(basePng);
-    const layers = [...stands, ...cutouts].map(c => ({ input: c.png, left: c.placement.x, top: c.placement.y }));
+    // (Each piece of artwork in front of an element just over it.)
+    const layers = [...stands, ...cutouts.flatMap(c => [c, ...pieces.filter(p => p.over === c.id)])].map(c => ({ input: c.png, left: c.placement.x, top: c.placement.y }));
     let png = layers.length ? await sharp(await img.toBuffer()).composite(layers).png().toBuffer() : await img.toBuffer();
     if (withOverlays) png = await sharp(png).composite([{ input: editableOverlays, left: 0, top: 0 }]).png().toBuffer();
     img = sharp(png);
@@ -1803,7 +1958,7 @@ export async function prepareProduct(input: PrepareInput): Promise<PrepareResult
     view: 'base plus stands and objects behind each selected object', residualChecks,
     blockingIssues: issues.filter(i => i.blocking).map(i => ({ id: i.id, message: i.message })) });
   const maskPng = await sharp(Buffer.from(overlays.mask.map(v => (v ? 255 : 0))), { raw: { width: w, height: h, channels: 1 } }).png().toBuffer();
-  return { clean: cleanPng, base: basePng, overlayMask: maskPng, overlays: editableOverlays, estimated: estimatedPng, recombined: full.png, recombinedClean: plain.png, cutouts, stands, quality,
+  return { clean: cleanPng, base: basePng, overlayMask: maskPng, overlays: editableOverlays, estimated: estimatedPng, recombined: full.png, recombinedClean: plain.png, cutouts, stands, quality, ...(pieces.length ? { pieces } : {}),
     separation: { method, requests, costUsd: ai ? Math.round((ai.result.planner.costUsd + ai.result.seedream.costUsd) * 10000) / 10000 : round(requests * 0.01, 2), ...(inputSha256 ? { inputSha256 } : {}),
       ...(ai ? { ai: { planner: ai.result.planner.model, engine: ai.result.seedream.endpoint, offline: ai.result.planner.offline || ai.result.seedream.offline, prompt: ai.result.plan.prompt, ...(ai.result.seedream.requestId ? { requestId: ai.result.seedream.requestId } : {}),
         layers: ai.result.seedream.layers, matched: [...ai.masks.keys()], unmatched: ai.unmatched, backgroundPercent: round(100 * aiFilled.reduce((s2, v) => s2 + v, 0) / n, 2), sentSize: ai.sent, warnings: ai.result.plan.warnings } } : {}) } };

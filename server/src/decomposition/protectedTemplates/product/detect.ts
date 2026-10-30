@@ -27,6 +27,7 @@ import type { SceneAnalyzer } from '../../creativeTemplates/smartProviders.js';
 
 import { ProductAnalysisError, type ProductScene } from './analyzer.js';
 import { fitSceneWords, fitWordsToInk } from './wordFit.js';
+import { artworkGroups } from './artworkText.js';
 import { measureWord } from '../../../textRecognition/measure.js';
 import { productInkBounds } from './typography.js';
 import { matchLineFont, offerFontFile } from '../../../textRecognition/fontMatch.js';
@@ -176,7 +177,7 @@ export async function detectProduct(input: ProductDetectInput): Promise<ProductD
   // Preserve partial local evidence, but report skipped/failed AI separately; preparation is gated by the service.
   let scene: ProductScene | undefined, ai: ProductDetectResult['ai'] = { status: 'skipped' };
   if (input.analyzer) {
-    try { scene = await input.analyzer.analyze(input.png, 'image/png', input.save); if (!scene.words && !input.analyzer.model.startsWith('offline')) throw new Error('AI word-level manifest missing. Retry with the Product with Text analyzer.'); ai = { status: 'done', model: input.analyzer.model, ...(input.analyzer.model.startsWith('offline') ? { offline: true } : {}), objects: scene.objects.length, costUsd: scene.analysisUsage?.costUsd }; }
+    try { scene = await input.analyzer.analyze(input.png, 'image/png', input.save); if (!scene.words && !input.analyzer.model.startsWith('offline')) throw new Error('AI word-level manifest missing. Retry with the Product with Text analyzer.'); ai = { status: 'done', model: input.analyzer.model, ...(input.analyzer.model.startsWith('offline') ? { offline: true } : {}), objects: scene.objects.length, costUsd: scene.analysisUsage?.costUsd, ...(scene.referenceWarnings?.length ? { warnings: scene.referenceWarnings } : {}) }; }
     catch (error) {
       scene = undefined;
       const known = error instanceof ProductAnalysisError ? error : undefined;
@@ -323,6 +324,14 @@ export async function detectProduct(input: ProductDetectInput): Promise<ProductD
     const on = owners.find(o => inside(b, o.box) >= 0.8);
     if (on) w.review = { status: 'rejected', at };
   }
+  // A symbol drawn into a badge's artwork (live 2026-10-30: a discount seal's embossed white "%", listed as text and
+  // coloured as the seal): a text block of symbols only (no letter or digit to edit), wholly inside one compact
+  // decoration, is that decoration's, as advertising text or not. It stays in the picture with the badge; removing it
+  // as text would cut into the badge. (A badge's lettering and numbers stay editable text.)
+  const symbols = analysis.words.filter(w => w.review.status !== 'rejected' && analysis.words.every(x => x.groupId !== w.groupId || x.review.status === 'rejected' || !/[\p{L}\p{N}]/u.test(x.text)));
+  const decorations = objects.filter(o => o.kind === 'decoration' && !o.hidden).map(o => ({ label: o.label, box: o.box }));
+  const artwork = new Set(artworkGroups(size, decorations, symbols.map(w => ({ groupId: w.groupId, box: w.box }))).map(g => g.groupId));
+  for (const w of symbols) if (artwork.has(w.groupId)) w.review = { status: 'rejected', at };
   // Text blocks take the analysis's roles; confident words are accepted at once.
   const roleCategory: Record<string, MasterCategory> = { headline: 'headline', offer: 'offer', price: 'offer', legal: 'legal', cta: 'cta', caption: 'supporting', other: 'supporting' };
   for (const g of analysis.groups) {
@@ -338,7 +347,7 @@ export async function detectProduct(input: ProductDetectInput): Promise<ProductD
   // Text the analysis saw that the reading did not: for a quick check.
   const missingText = (scene?.overlays ?? []).flatMap((t, i) => {
     const box = overlayBoxes[i];
-    return analysis.words.some(w => w.review.status !== 'rejected' && inside({ x: w.box.x, y: w.box.y, width: w.box.width, height: w.box.height }, box) >= 0.5) || !t.text.trim() ? [] : [{ text: t.text.slice(0, 300), box }];
+    return analysis.words.some(w => (w.review.status !== 'rejected' || artwork.has(w.groupId)) && inside({ x: w.box.x, y: w.box.y, width: w.box.width, height: w.box.height }, box) >= 0.5) || !t.text.trim() ? [] : [{ text: t.text.slice(0, 300), box }];
   });
   // Back to front (supports behind what stands on them); an object in front covers the ones it overlaps.
   const ordered = orderProductObjects(objects);
