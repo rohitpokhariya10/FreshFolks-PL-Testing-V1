@@ -13,7 +13,9 @@ export interface VisionWord {
   box: SourceBox; confidence: number; z: number;
 }
 export interface ProductAnalysisUsage { inputTokens: number; outputTokens: number; cachedInputTokens: number; costUsd?: number }
-export type ProductScene = SceneDescription & { words?: VisionWord[]; analysisUsage?: ProductAnalysisUsage };
+export type ProductScene = SceneDescription & { words?: VisionWord[]; analysisUsage?: ProductAnalysisUsage;
+  /** Main or advertised ids naming nothing the answer lists: left out, and said in the review (never made into an object). */
+  referenceWarnings?: string[] };
 export const PRODUCT_ANALYSIS_MAX_OUTPUT_TOKENS = 16000;
 export const PRODUCT_ANALYSIS_PRICE = { model: 'gpt-5.6-sol', inputPerMillion: 4, cachedPerMillion: 0.4, outputPerMillion: 20, checkedAt: '2026-10-22', source: 'https://developers.openai.com/api/docs/models/gpt-5.6-sol' } as const;
 /**
@@ -118,7 +120,7 @@ text_overlays: all advertising blocks, exact transcription, fractional boxes, va
  *   itself, or of an unknown kind is left out; the objects, words and logos stand.
  */
 export function trimProductObjects(value: unknown, max: number = PRODUCT_LIMITS.maxObjects): unknown {
-  const v = value as { objects?: unknown; relations?: unknown; marks?: unknown } | undefined;
+  const v = value as { objects?: unknown; relations?: unknown; marks?: unknown; main_candidates?: unknown; advertised_ids?: unknown } | undefined;
   if (!v || typeof v !== 'object' || !Array.isArray(v.objects)) return value;
   const rank = (o: { kind?: unknown }) => (o?.kind === 'character' ? 0 : o?.kind === 'product' ? 1 : 2);
   const kept = v.objects.length <= max ? v.objects as { id?: unknown }[] : [...(v.objects as { id?: unknown; kind?: unknown; confidence?: unknown }[])].sort((a, b) => rank(a) - rank(b) || (Number(b?.confidence) || 0) - (Number(a?.confidence) || 0)).slice(0, max);
@@ -126,11 +128,22 @@ export function trimProductObjects(value: unknown, max: number = PRODUCT_LIMITS.
   const relations = Array.isArray(v.relations) ? (v.relations as { source?: unknown; target?: unknown; relation?: unknown; confidence?: unknown }[]).filter(r => r && ids.has(r.source) && ids.has(r.target) && r.source !== r.target
     && (SCENE_RELATIONS as readonly unknown[]).includes(r.relation) && typeof r.confidence === 'number' && r.confidence >= 0 && r.confidence <= 1) : v.relations;
   const marks = Array.isArray(v.marks) ? (v.marks as { owner_id?: unknown }[]).map(m => (m && typeof m === 'object' && typeof m.owner_id === 'string' && m.owner_id && !ids.has(m.owner_id) ? { ...m, owner_id: '' } : m)) : v.marks;
-  return { ...v, objects: kept, relations, marks };
+  // Main and advertised ids name objects: one naming a logo or text of the answer (live 2026-10-30: the Navi logo
+  // `mark_logo_1`), or an object left out above, is left out; it stays what it is. (A non-string still fails validation.)
+  const only = (list: unknown) => (Array.isArray(list) ? list.filter(id => typeof id !== 'string' || ids.has(id)) : list);
+  return { ...v, objects: kept, relations, marks, main_candidates: only(v.main_candidates), advertised_ids: only(v.advertised_ids) };
+}
+/** Main or advertised ids that name nothing in the answer (no object, logo or text): what the review should check. */
+function unresolvedReferences(value: unknown): string[] {
+  const v = (value ?? {}) as Record<string, unknown>, listed = new Set<unknown>();
+  for (const key of ['objects', 'marks', 'text_overlays']) for (const item of Array.isArray(v[key]) ? v[key] as { id?: unknown }[] : []) listed.add(item?.id);
+  const named = [...(Array.isArray(v.main_candidates) ? v.main_candidates : []), ...(Array.isArray(v.advertised_ids) ? v.advertised_ids : [])];
+  return [...new Set(named.filter((id): id is string => typeof id === 'string' && !listed.has(id)))];
 }
 
 export function parseProductScene(value: unknown, size: { width: number; height: number }): ProductScene {
   const scene = parseSceneDescription(trimProductObjects(value), { objects: PRODUCT_LIMITS.maxObjects }), words = (value as { words?: unknown }).words;
+  const unresolved = unresolvedReferences(value);
   if (!Array.isArray(words) || words.length > 400) throw new Error('AI word detection is missing or exceeds 400 words.');
   const ids = new Set<string>();
   const parsed = words.map((w: VisionWord) => {
@@ -160,7 +173,7 @@ export function parseProductScene(value: unknown, size: { width: number; height:
     }
     if (missing.length) throw new ProductAnalysisError('PARTIAL_WORDS', `AI word manifest does not cover text block “${overlay.id}” (${missing.length} missing token(s)). Review or retry; detection is incomplete.`);
   }
-  return { ...scene, words: parsed };
+  return { ...scene, words: parsed, ...(unresolved.length ? { referenceWarnings: unresolved.map(id => `The analysis named “${id.slice(0, 60)}” as what this creative is about, but listed no such element. Nothing was added for it: check that no product or character is missing, and add it if one is.`) } : {}) };
 }
 
 /** One source image, no tools, no retries; this builder never makes a network request. */

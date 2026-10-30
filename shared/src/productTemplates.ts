@@ -191,6 +191,8 @@ export interface ProductDetection {
      * REQUEST_REJECTED, PROVIDER_ERROR, INCOMPLETE, REFUSAL, INVALID_RESPONSE, …), the HTTP status when there was one,
      * how long it waited. */
     code?: string; httpStatus?: number; elapsedMs?: number;
+    /** A completed answer's unresolved points, for the review (e.g. a main element it names but does not list). */
+    warnings?: string[];
     /** The picture the model was given (a copy at most 2048 px on its longest side) and the creative it came from. */
     sent?: ProductAnalysisSent };
   /** Detection run again on a reviewed template: the corrections kept (they win over what was found at their place). */

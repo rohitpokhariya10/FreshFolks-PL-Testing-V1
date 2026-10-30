@@ -242,6 +242,7 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
       : head(2, 'AI detection did not complete', 'Local candidates are retained. Recover a saved response or approve a new AI analysis before preparation.')}
     {/* The last Decompose attempt's failure (a later step): the review and its element analysis stand; the person continues to Choose. */}
     {view.product.preparing?.status === 'failed' && <Alert tone="warn"><strong>The last decomposition attempt did not finish:</strong> {view.product.preparing.error} Your reviewed elements are kept and nothing was retried: continue to Choose to decompose again.</Alert>}
+    {aiDone && view.product.detection?.ai?.warnings?.map(w => <Alert key={w} tone="warn">{w}</Alert>)}
     {aiDone && view.counts.words > 0 && <FitText view={view} onDone={v => { setView(v); setFitted(n => n + 1); }} onError={setError} />}
     {aiDone ? <p>{view.counts.characters} Characters · {view.counts.products} Products · {view.counts.words} Text words · {view.counts.text} Text groups · {view.counts.logos} Logos
       {(view.product.detection?.ai?.costUsd ?? 0) > 0 && <> <button type="button" className="ws-btn ws-btn-quiet" onClick={useSaved}>Find the elements again from the saved AI answer (free; your corrections are kept)</button></>}</p>

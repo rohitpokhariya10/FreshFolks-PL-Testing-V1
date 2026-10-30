@@ -176,7 +176,7 @@ export async function detectProduct(input: ProductDetectInput): Promise<ProductD
   // Preserve partial local evidence, but report skipped/failed AI separately; preparation is gated by the service.
   let scene: ProductScene | undefined, ai: ProductDetectResult['ai'] = { status: 'skipped' };
   if (input.analyzer) {
-    try { scene = await input.analyzer.analyze(input.png, 'image/png', input.save); if (!scene.words && !input.analyzer.model.startsWith('offline')) throw new Error('AI word-level manifest missing. Retry with the Product with Text analyzer.'); ai = { status: 'done', model: input.analyzer.model, ...(input.analyzer.model.startsWith('offline') ? { offline: true } : {}), objects: scene.objects.length, costUsd: scene.analysisUsage?.costUsd }; }
+    try { scene = await input.analyzer.analyze(input.png, 'image/png', input.save); if (!scene.words && !input.analyzer.model.startsWith('offline')) throw new Error('AI word-level manifest missing. Retry with the Product with Text analyzer.'); ai = { status: 'done', model: input.analyzer.model, ...(input.analyzer.model.startsWith('offline') ? { offline: true } : {}), objects: scene.objects.length, costUsd: scene.analysisUsage?.costUsd, ...(scene.referenceWarnings?.length ? { warnings: scene.referenceWarnings } : {}) }; }
     catch (error) {
       scene = undefined;
       const known = error instanceof ProductAnalysisError ? error : undefined;
