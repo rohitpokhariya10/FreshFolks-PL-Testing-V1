@@ -91,8 +91,8 @@ export interface ProductTemplateOptions {
   /** The creative regenerated in a common ratio by the image model (ratioRegeneration.ts; only with approval of its cost), for both workflows. */
   regenerator?: () => RatioRegenerator | undefined;
   /**
-   * Check each product's layer after its decomposition and repair it on this computer (cutoutVerification.ts); off when
-   * absent or false (the router reads FRAMEFLOW_CUTOUT_VERIFICATION=1). Nothing is sent or charged either way.
+   * Check each layer after its decomposition and repair it on this computer (layerEvidence.ts, cutoutVerification.ts); off
+   * when absent or false (the router turns it on unless FRAMEFLOW_CUTOUT_VERIFICATION=0). Nothing is sent or charged either way.
    */
   cutoutVerification?: () => boolean;
 }
@@ -849,6 +849,14 @@ export function createProductTemplates(options: ProductTemplateOptions) {
             quality: s.uncertain ? 'check' as const : 'good' as const, ...(s.uncertain ? { note: 'Mostly hidden behind the products: most of it is an estimate.' } : {}) },
           stand: { under: s.under, visiblePixels: s.visiblePixels, completedPixels: s.completedPixels, uncertain: s.uncertain } };
       });
+      // Artwork in front of an element (the cut-out check): a decoration layer of its own just over that element.
+      const pieces: NonNullable<ProductPrepared['pieces']> = (result.pieces ?? []).map(s => {
+        const over = t.product.objects.find(o => o.id === s.over)!, f = file(`ppiece-${sha256(Buffer.from(`${id}:${s.key}`)).slice(0, 10)}`, s.png);
+        return { id: `po-${sha256(Buffer.from(`${s.key}:${s.placement.x},${s.placement.y},${s.placement.width},${s.placement.height}`)).slice(0, 10)}`, kind: 'decoration' as const, label: s.label, box: { ...s.placement },
+          confidence: 0.9, z: over.z + 0.5, covers: [s.over], origin: 'local' as const, review: { status: 'accepted' as const, by: 'auto' as const }, decompose: true,
+          cutout: { file: f.file, sha256: f.sha256, placement: { ...s.placement }, method: 'local' as const, coverage: 1, quality: 'check' as const, note: `Overlap of background artwork in front of “${over.label}”; the rest remains in the background. Moving this overlay does not move the whole decoration.` },
+          piece: { over: s.over, pixels: s.pixels } };
+      });
       await service.updateMaster(id, undefined, x => {
         const p = x.product!;
         if (p.objectsRevision !== objectsRevision || (x.textAnalysis?.revision ?? 0) !== analysisRevision) { p.preparing = { status: 'failed', startedAt: at, paid, error: 'The elements changed while preparing: prepare again.' }; return; }
@@ -857,17 +865,18 @@ export function createProductTemplates(options: ProductTemplateOptions) {
           const c = cutouts.get(o.id);
           if (!c) { delete o.cutout; delete o.slot; continue; }
           o.cutout = { file: c.file, sha256: c.sha256, placement: c.placement, method: c.method, coverage: c.coverage, quality: c.quality, ...(c.note ? { note: c.note } : {}),
-            ...(c.verification ? { verification: { ...c.verification, ...(c.original ? { original: file(`pcut-${c.id}`, c.original) } : {}) } } : {}) };
+            ...(c.verification ? { verification: { ...c.verification, ...(c.original ? { original: file(`pcut-${c.id}`, c.original) } : {}) } } : {}),
+            ...(c.evidence ? { evidence: { ...c.evidence, ...(c.evidenceLayer ? { layer: file(`pseedream-${c.id}`, c.evidenceLayer) } : {}) } } : {}) };
           if (o.kind === 'character' || o.kind === 'product') o.slot = { box: { ...c.placement }, contactY: c.contactY, targetHeight: c.contactY - c.placement.y + 1, z: o.z };
         }
         p.prepared = { version: PRODUCT_PREPARE_VERSION, at: nowIso(), objectsRevision, analysisRevision, clean, base,
           previews: { recombined: file('precombined', result.recombined).file, recombinedClean: file('precombined-clean', result.recombinedClean).file, overlayMask: file('pmask', result.overlayMask).file, overlays: file('poverlays', result.overlays).file, estimated: file('pestimated', result.estimated).file },
-          separation: result.separation, quality: result.quality, ...(stands.length ? { stands } : {}), durationMs: Date.now() - started };
+          separation: result.separation, quality: result.quality, ...(stands.length ? { stands } : {}), ...(pieces.length ? { pieces } : {}), durationMs: Date.now() - started };
         p.preparing = { status: 'done', startedAt: at, paid, engine };
         const ai = result.separation.method === 'seedream' && !result.separation.ai?.offline;
         p.activity = { ...p.activity, aiCalls: p.activity.aiCalls + (ai ? 1 : 0), segmentRequests: p.activity.segmentRequests + (ai ? 1 : result.separation.method === 'sam3' ? result.separation.requests : 0), costUsd: Math.round((p.activity.costUsd + result.separation.costUsd) * 10000) / 10000 };
         delete p.approved;
-        history(p, { action: 'prepared', detail: `${result.cutouts.length} object(s) cut out (${result.separation.method === 'seedream' ? `AI: ${result.separation.ai?.planner} plan → ${result.separation.ai?.engine}, ${result.separation.ai?.matched.length} element(s) from its layers${result.separation.ai?.unmatched.length ? `, ${result.separation.ai.unmatched.length} locally` : ''}, $${result.separation.costUsd.toFixed(2)}` : result.separation.method === 'sam3' ? `SAM-3, ${result.separation.requests} request(s)` : 'locally'})${stands.length ? `, ${stands.length} display stand(s) on their own layers` : ''}; ${result.quality.issues.length} check(s) to look at.` });
+        history(p, { action: 'prepared', detail: `${result.cutouts.length} object(s) cut out (${result.separation.method === 'seedream' ? `AI: ${result.separation.ai?.planner} plan → ${result.separation.ai?.engine}, ${result.separation.ai?.matched.length} element(s) from its layers${result.separation.ai?.unmatched.length ? `, ${result.separation.ai.unmatched.length} locally` : ''}, $${result.separation.costUsd.toFixed(2)}` : result.separation.method === 'sam3' ? `SAM-3, ${result.separation.requests} request(s)` : 'locally'})${stands.length ? `, ${stands.length} display stand(s) on their own layers` : ''}${pieces.length ? `, ${pieces.length} piece(s) of artwork in front on their own layers` : ''}; ${result.quality.issues.length} check(s) to look at.` });
       });
     } catch (error) {
       const message = error instanceof OverlayGateError ? gateMessage(error, t.textAnalysis) : error instanceof Error ? error.message.slice(0, 300) : String(error);
@@ -930,7 +939,8 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     if (!p.prepared || p.prepared.objectsRevision !== p.objectsRevision || p.prepared.analysisRevision !== (t.textAnalysis?.revision ?? 0)) fail('NOT_READY', 'Prepare the current reviewed elements first.');
     const a = t.textAnalysis, revision = (p.revisions[p.revisions.length - 1]?.revision ?? 0) + 1, at = nowIso(), generation = p.generation ?? await derivedBrief(t);
     const snapshot: ProductSnapshot = { schemaVersion: PRODUCT_SCHEMA_VERSION, templateId: id, revision, publishedAt: at, name: t.name, canvas: { width: t.source.width, height: t.source.height },
-      source: { file: t.source.inputFile, sha256: t.source.sha256 }, clean: p.prepared.clean, base: p.prepared.base, objects: [...p.objects.filter(o => !o.hidden && o.cutout), ...(p.prepared.stands ?? []).map(o => Object.fromEntries(Object.entries(o).filter(([k]) => k !== 'stand')) as ProductObject)],
+      source: { file: t.source.inputFile, sha256: t.source.sha256 }, clean: p.prepared.clean, base: p.prepared.base, objects: [...p.objects.filter(o => !o.hidden && o.cutout), ...(p.prepared.stands ?? []).map(o => Object.fromEntries(Object.entries(o).filter(([k]) => k !== 'stand')) as ProductObject),
+        ...(p.prepared.pieces ?? []).map(o => Object.fromEntries(Object.entries(o).filter(([k]) => k !== 'piece')) as ProductObject)],
       words: (a?.words ?? []).filter(w => w.review.status !== 'rejected'), groups: a?.groups ?? [], logoSlots: (a?.logoSlots ?? []).filter(s => s.review.status !== 'rejected' && !s.inBackground), plates: (a?.plates ?? []).filter(pl => pl.review.status !== 'rejected'),
       detection: p.detection, backgroundStructure: p.objects.filter(o => !['character', 'product', 'brand-logo'].includes(o.kind)), quality: p.prepared.quality, prepareVersion: p.prepared.version,
       preparation: p.prepared, selectedObjects: p.objects,

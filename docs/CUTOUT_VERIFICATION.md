@@ -1,12 +1,44 @@
 # Cut-out verification after a decomposition
 
+## Current continuation (30 October 2026)
+
+**Incomplete: do not treat passing workflow tests as visual acceptance.** The historical implementation and measurements
+below describe the earlier product-only verifier, not the current layer-evidence output.
+
+On by default (`FRAMEFLOW_CUTOUT_VERIFICATION=0` turns it off), usable Seedream layers now drive ownership for products and characters. Each raw
+RGBA layer is registered against the source and competing layers. Final cutouts retain registered alpha, verified source
+interiors, and the provider's hidden-object drawing. A confirmed copied foreground is continued locally only when donors
+exist; missing donors remain transparent. Hidden shape, local interpolation, rejected evidence, and duplicated foreground
+ownership are reported as uncertain. In particular, an inferred surface is not authentic recovered geometry.
+
+The previous conversion to a binary mask discarded soft alpha, grew foreign source pixels into the edge, and switched
+silhouettes at occlusions. `evidenceCutout` removes that conversion for usable evidence. Background removal also includes
+the reviewed product footprint while protecting identified decorations and frames. This removed the central Navratri
+floor dash but did not eliminate every shadow remnant.
+
+Raw provider PNGs and evidence reports persist through preparation, snapshots, creative duplication, and editor import.
+Partial artwork overlaps retain stacking and explicitly warn that the rest of the decoration remains in the background.
+They are **not complete independently movable decorations**. Non-evidence products still use the older verifier below.
+The check is on by default since 30 October 2026 (`FRAMEFLOW_CUTOUT_VERIFICATION=0` turns it off); it applies to templates prepared from then on, and saved creatives are not rewritten.
+
+`recordedLayerizer.ts` is an explicit offline test adapter: it requires an exact decoded provider-input match and valid
+PNG layers, never fetches expired provider URLs, and never activates in production. Run a copied-store replay with:
+
+```sh
+node --conditions=development --import tsx tests/fixtures/layerEvidenceReplay.ts SOURCE LAYERS NEW_OUTPUT on
+```
+
+Current image acceptance and validation details: [DECOMPOSITION_CONTINUATION.md](DECOMPOSITION_CONTINUATION.md).
+
+## Historical product-only verifier (superseded where layer evidence is available)
+
 A post-processing stage behind a feature flag. After the decomposition (OpenAI planner → Seedream Layerize, or the local or SAM 3 separation) has made each object's layer, every **product** layer is checked against the evidence the decomposition left and repaired on this computer, before the template is reviewed. It sends nothing anywhere and charges nothing.
 
 ## Turning it on
 
 | Where | How |
 | --- | --- |
-| Server | `FRAMEFLOW_CUTOUT_VERIFICATION=1` in the environment (`.env`). With it unset, the stage does not run, and `prepare` behaves exactly as before. |
+| Server | On by default. `FRAMEFLOW_CUTOUT_VERIFICATION=0` in the environment (`.env`) turns it off, and `prepare` then behaves exactly as before. |
 | Code | `createLayerizeRouter({ productCutoutVerification: () => true })`, which passes `cutoutVerification` to the product service and `verifyCutouts` to `prepareProduct`. |
 | Tests | `setup({ cutoutVerification: true })` (`productServer.fixture.ts`). |
 

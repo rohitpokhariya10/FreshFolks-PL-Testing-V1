@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import sharp from 'sharp';
 import { describe, expect, it } from 'vitest';
-import type { ProductCreative, ProtectedTemplate } from '@frameflow/shared';
+import type { ProductCreative, ProtectedTemplate, ProductSnapshot } from '@frameflow/shared';
 import { fakeRecognizer } from '../../../textRecognition/recognizer.js';
 import type { LayerizedLayer, ProductLayerizer } from './aiDecompose.js';
 import { setup } from './productServer.fixture.js';
@@ -46,8 +46,8 @@ const layerizer: ProductLayerizer = { planner: 'test planner (no network)', engi
 } };
 
 type View = { template: ProtectedTemplate & { id: string; revision: number }; stage: string; product: ProtectedTemplate['product'] & object };
-async function prepared(cutoutVerification: boolean) {
-  const s = await setup({ analyzer: fakeProductAnalyzer(ANSWER), recognizer: fakeRecognizer([]), layerizer, cutoutVerification });
+async function prepared(cutoutVerification: boolean, provider = layerizer) {
+  const s = await setup({ analyzer: fakeProductAnalyzer(ANSWER), recognizer: fakeRecognizer([]), layerizer: provider, cutoutVerification });
   const made = await s.form('', await raw(colour), { name: 'Cut-out check' });
   let v = await s.detected(made.body.template.id) as unknown as View;
   v = (await s.send('PUT', `/${v.template.id}/review`, { expectedRevision: v.template.revision, objects: v.product!.objects.map(o => ({ ...o, accepted: true })), texts: [], logos: [], dismissMissingText: true })).body as unknown as View;
@@ -59,6 +59,19 @@ const file = (s: Awaited<ReturnType<typeof setup>>, id: string, f: string) => re
 const colourful = async (png: Buffer) => { const { data } = await sharp(png).ensureAlpha().raw().toBuffer({ resolveWithObject: true }); let k = 0; for (let i = 0; i < data.length / 4; i++) if (data[i * 4 + 3] >= 128 && Math.max(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]) - Math.min(data[i * 4], data[i * 4 + 1], data[i * 4 + 2]) > 40) k++; return k; };
 
 describe('Cut-out check after a decomposition (HTTP)', { timeout: 300000 }, () => {
+  it('reports duplicate neighbour pixels when the provider omitted the foreground object', async () => {
+    const missing: ProductLayerizer = { ...layerizer, async decompose(req, save) {
+      const r = await layerizer.decompose(req, save);
+      return { ...r, layers: r.layers.filter(l => !/dishwasher/i.test(l.name ?? '')) };
+    } };
+    const on = await prepared(true, missing);
+    try {
+      const c = on.v.product!.objects.find(o => /refrigerator/i.test(o.label))!.cutout!;
+      expect(c.evidence!.uncertain).toBe(true); expect(c.quality).toBe('check');
+      expect(c.evidence!.reasons.join()).toMatch(/Dishwasher.*separation unresolved/);
+      expect(on.v.product!.prepared!.quality.issues.some(i => i.id.startsWith('ownership-'))).toBe(true);
+    } finally { await on.s.close(); }
+  });
   it('off: the flow as before; on: the refrigerator\'s layer repaired from the same decomposition, the original kept, used downstream', async () => {
     const off = await prepared(false), on = await prepared(true);
     try {
@@ -66,26 +79,50 @@ describe('Cut-out check after a decomposition (HTTP)', { timeout: 300000 }, () =
       const objs = (v: View) => v.product!.objects, fr = (v: View) => objs(v).find(o => o.kind === 'product' && /refrigerator/i.test(o.label))!, dw = (v: View) => objs(v).find(o => /dishwasher/i.test(o.label))!;
       expect(dw(on.v).z).toBeGreaterThan(fr(on.v).z);
       // Off: nothing of the check — no report on any layer, no check in the list.
-      for (const o of objs(off.v)) expect(o.cutout?.verification).toBeUndefined();
+      for (const o of objs(off.v)) { expect(o.cutout?.verification).toBeUndefined(); expect(o.cutout?.evidence).toBeUndefined(); }
+      expect(off.v.product!.prepared!.pieces).toBeUndefined();
       expect(off.v.product!.prepared!.quality.issues.map(i => i.id).filter(i => /^(uncertain-|cutouts-verified)/.test(i))).toEqual([]);
-      // The same decomposition: the dishwasher's layer identical either way; the refrigerator's original is the old one.
-      expect(dw(on.v).cutout!.sha256).toBe(dw(off.v).cutout!.sha256);
-      const report = fr(on.v).cutout!.verification!;
-      expect(report.original!.sha256).toBe(fr(off.v).cutout!.sha256);
-      expect(file(on.s, on.id, report.original!.file).equals(file(off.s, off.id, fr(off.v).cutout!.file))).toBe(true);
+      // Evidence is applied before cutout construction. Keep the provider's full RGBA layer as provenance;
+      // the OFF cutout is no longer the input to this stage. Even the front object's edge can be corrected.
+      const report = fr(on.v).cutout!.evidence!;
+      expect(report.registration.agreement).toBeGreaterThan(0.9);
+      expect(report.layer).toBeDefined();
+      expect(await colourful(file(on.s, on.id, report.layer!.file))).toBeGreaterThan(1000);
+      expect(dw(on.v).cutout!.evidence!.behindLayerPixels).toBe(0);
       // On: the wheel in the old layer, none of it in the repaired one; what the dishwasher hides rebuilt; outline the same.
       const before = file(off.s, off.id, fr(off.v).cutout!.file), after = file(on.s, on.id, fr(on.v).cutout!.file);
       expect(await colourful(before)).toBeGreaterThan(1000); expect(await colourful(after)).toBe(0);
-      expect(report.backgroundPixels).toBeGreaterThan(1000); expect(report.applied).toBe(true); expect(report.hiddenBehind.join()).toMatch(/dishwasher/i);
-      expect(fr(on.v).cutout!.placement).toEqual(fr(off.v).cutout!.placement);
-      expect(on.v.product!.prepared!.quality.issues.some(i => i.id === 'cutouts-verified' && /refrigerator/i.test(i.message) && !i.blocking)).toBe(true);
+      expect(report.behindArtPixels).toBeGreaterThan(1000); expect(report.behindLayerPixels).toBeGreaterThan(10000); expect(report.hiddenBehind.join()).toMatch(/dishwasher/i);
+      const sample = async (o: ReturnType<typeof fr>, x: number, y: number) => {
+        const c = o.cutout!, { data, info } = await sharp(file(on.s, on.id, c.file)).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+        const i = ((y - c.placement.y) * info.width + x - c.placement.x) * 4;
+        return [...data.subarray(i, i + 4)];
+      };
+      expect(await sample(fr(on.v), 350, 200)).toEqual([...door(200), 255]);
+      expect(await sample(dw(on.v), 500, 400)).toEqual([222, 222, 226, 255]);
+      // Completion is the underlying door, not the copied dishwasher's 222 grey.
+      expect((await sample(fr(on.v), 450, 400))[0]).toBeLessThan(190);
+      const piece = on.v.product!.prepared!.pieces!.find(p => p.id === report.artInFront!.objectId)!;
+      expect(piece.piece.over).toBe(fr(on.v).id); expect(piece.z).toBeGreaterThan(fr(on.v).z); expect(piece.z).toBeLessThan(dw(on.v).z);
+      expect(await colourful(file(on.s, on.id, piece.cutout!.file))).toBeGreaterThan(1000);
+      expect(on.v.product!.prepared!.quality.issues.some(i => i.id === 'art-in-front' && !i.blocking)).toBe(true);
       // Downstream: approved and saved; a creative and the editor's run use the repaired layer.
       const approved = (await on.s.send('POST', `/${on.id}/approve`, { expectedRevision: on.v.template.revision, acknowledge: on.v.product!.prepared!.quality.issues.map(i => i.id) })).body as unknown as View;
       expect((await on.s.send('POST', `/${on.id}/publish`, { expectedRevision: approved.template.revision })).status).toBe(201);
+      const saved = (await on.s.call<View>(`/${on.id}`)).body;
+      const snapshot = JSON.parse(file(on.s, on.id, saved.product!.revisions.at(-1)!.file).toString()) as ProductSnapshot;
+      expect(snapshot.objects.find(o => o.id === piece.id)!.cutout!.sha256).toBe(piece.cutout!.sha256);
+      expect(snapshot.objects.find(o => o.id === fr(on.v).id)!.cutout!.evidence).toEqual(report);
       const c = (await on.s.send<ProductCreative>('POST', `/${on.id}/creatives`, { name: 'After the check' })).body;
       expect(c.objects.find(o => o.id === fr(on.v).id)!.asset.file).toBe(fr(on.v).cutout!.file);
+      expect(c.objects.find(o => o.id === piece.id)!.asset.file).toBe(piece.cutout!.file);
+      const duplicate = (await on.s.send<ProductCreative>('POST', `/${on.id}/creatives/${c.id}/duplicate`, {})).body;
+      expect(duplicate.objects.map(o => o.asset)).toEqual(c.objects.map(o => o.asset));
       const run = (await on.s.send<{ runId: string }>('POST', `/${on.id}/creatives/${c.id}/open`, {})).body;
       expect(run.runId).toBeTruthy();
+      const editor = JSON.parse(readFileSync(join(on.s.root, 'runs', run.runId, 'run.json'), 'utf8'));
+      expect(editor.creative.layers.some((l: { elementIds: string[] }) => l.elementIds.includes(piece.id))).toBe(true);
+      expect((await sharp(readFileSync(join(on.s.root, 'runs', run.runId, 'reconstructed.png'))).metadata()).width).toBe(W);
     } finally { await off.s.close(); await on.s.close(); }
   });
 });

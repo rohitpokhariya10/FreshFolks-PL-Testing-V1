@@ -105,6 +105,32 @@ export interface ProductCutout {
    * it): what was found and repaired in this layer, and `original`, the layer as the decomposition made it.
    */
   verification?: ProductCutoutVerification & { original?: { file: string; sha256: string } };
+  /**
+   * The decomposition's own layer as evidence (layerEvidence.ts, with the same server option; absent otherwise): where the
+   * picture shows it, what was completed behind what, and `layer`, the decomposition's layer for it as it came.
+   */
+  evidence?: ProductLayerEvidence & { layer?: { file: string; sha256: string } };
+}
+/** A layer made from the decomposition's own layer for it, every pixel explained against the picture (layerEvidence.ts). */
+export interface ProductLayerEvidence {
+  version: 1;
+  /** Its layer lined up with the picture: the shift (source pixels), the scale, and the share of its solid pixels that match then. */
+  registration: { dx: number; dy: number; scale: number; agreement: number };
+  /**
+   * Ownership classifications, not a count of final source bytes. Verified visible interiors use source pixels;
+   * mixed boundaries retain registered provider RGBA. Completed from its layer where a decomposed element in
+   * front hides it, or where artwork left in the background stands in front of it; a thin outline band the picture shows
+   * as something else (provider outline retained); shown by an element drawn behind it (left out).
+   * `extendedPixels`: source ownership support just past the provider outline; final alpha remains provider-backed.
+   */
+  solidPixels: number; visiblePixels: number; extendedPixels: number; behindLayerPixels: number; behindArtPixels: number; outlinePixels: number; conflictPixels: number;
+  /** Copied foreign pixels continued locally; unresolved pixels have no trustworthy donor. Optional on older reports. */
+  inferredPixels?: number; unresolvedPixels?: number;
+  hiddenBehind: string[];
+  /** A partial artwork overlap above it (`objectId`), not necessarily the entire movable decoration. */
+  artInFront?: { label: string; pixels: number; objectId: string };
+  /** An estimate too large to present as exact, or a conflict in the order: see `reasons`. */
+  uncertain: boolean; reasons: string[];
 }
 /** A product layer's check after its decomposition (cutoutVerification.ts): pixels, and why it is `uncertain`. */
 export interface ProductCutoutVerification {
@@ -204,6 +230,12 @@ export interface ProductPrepared {
    * cut-out (`podium` kind; `origin` local when found, user when the administrator marked it). Absent on older preparations.
    */
   stands?: (ProductObject & { stand: { under: string[]; visiblePixels: number; completedPixels: number; uncertain: boolean } })[];
+  /**
+   * Artwork left in the background that stands in front of a decomposed element (a medallion over a refrigerator's corner,
+   * the arch over the deity's sleeves): its pixels there on a layer of its own just over that element (`decoration` kind),
+   * so the element is whole when moved and the creative unchanged. Only with the cut-out check (layerEvidence.ts).
+   */
+  pieces?: (ProductObject & { piece: { over: string; pixels: number } })[];
   durationMs: number;
 }
 export interface ProductRevisionRef { revision: number; file: string; sha256: string; publishedAt: string; /** A draft saved with quality warnings. */ draft?: boolean;
