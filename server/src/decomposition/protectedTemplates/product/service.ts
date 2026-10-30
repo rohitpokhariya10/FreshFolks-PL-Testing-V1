@@ -24,7 +24,7 @@ import { newProtectedTemplateId, type ProtectedStore } from '../store.js';
 import type { WordRecognizer } from '../../../textRecognition/recognizer.js';
 import type { SceneAnalyzer } from '../../creativeTemplates/smartProviders.js';
 import type { Segmenter } from '../../creativeTemplates/segmenter.js';
-import { aiDecompositionEstimate, sentSize, type ProductLayerizer } from './aiDecompose.js';
+import { aiDecompositionEstimate, sentSize, type ProductLayerizer, type RecordedPlannerAnswer } from './aiDecompose.js';
 import { OverlayGateError, prepareProduct } from './prepare.js';
 import { createProductCreatives } from './creatives.js';
 import { createProductVariations, type ProductVariationPlanner } from './variations.js';
@@ -293,6 +293,28 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     }
     return undefined;
   }
+  /**
+   * The decomposition planner's completed answer to this very request, recorded by an AI decomposition of the same picture
+   * (this template or another made from the same upload) — no new planner request, nothing spent. Only the files of a
+   * template whose LAST prepare was that AI decomposition and finished are read (a later run, failed or not, rewrites the
+   * request file, so the pair would not belong together), and only when the answer, read with today's checks, is the very
+   * prompt that decomposition used. Anything less is not replayed: the live planner is asked.
+   */
+  const recordedPlanner = (target: ProtectedTemplate): RecordedPlannerAnswer => ({ request, imageSha256, derive }) => {
+    const wanted = JSON.stringify(request);
+    for (const owner of [target, ...store.list().filter(o => o.id !== target.id)]) {
+      try {
+        const p = owner.product, s = p?.prepared?.separation;
+        if (!p || owner.source.sha256 !== target.source.sha256 || owner.source.width !== target.source.width || owner.source.height !== target.source.height) continue;
+        if (p.preparing?.status !== 'done' || p.preparing.engine !== 'ai' || s?.method !== 'seedream' || !s.ai || s.ai.offline || s.inputSha256 !== imageSha256) continue;
+        if (JSON.stringify(JSON.parse(store.read(owner.id, 'prepare-ai-planner-request.json').toString('utf8'))) !== wanted) continue;
+        const response: unknown = JSON.parse(store.read(owner.id, 'prepare-ai-planner-response.json').toString('utf8'));
+        if (derive(response).prompt !== s.ai.prompt) continue;
+        return { response, from: owner.id };
+      } catch { /* A missing, unreadable or refused recording is never replayed. */ }
+    }
+    return undefined;
+  };
   /** A base template's approved creative (its source picture) and words (its latest revision), or nothing if it is gone. */
   function sourceTemplate(baseId: string): { png: Buffer; words: { text: string }[] } | undefined {
     try {
@@ -818,6 +840,8 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       .map(g => `“${g.label.length > 48 ? `${g.label.slice(0, 48)}…` : g.label}”`);
     return `${error.message}${named.length ? ` (${named.slice(0, 2).join(', ')})` : ''} Its text boxes may not sit on the letters: use “Fit text to the letters” in the review (free, on this computer), or correct the boxes, then prepare again.`;
   };
+  const withRecordedPlanner = (layerizer: ProductLayerizer | undefined, t: ProtectedTemplate): ProductLayerizer | undefined =>
+    layerizer && { ...layerizer, decompose: (request, save) => layerizer.decompose(request, save, { recordedPlanner: recordedPlanner(t) }) };
   async function runPrepare(id: string, engine: 'ai' | 'sam3' | 'local') {
     const started = Date.now(), at = nowIso(), t = requireProduct(id), objectsRevision = t.product.objectsRevision, analysisRevision = t.textAnalysis?.revision ?? 0, paid = engine !== 'local';
     await service.updateMaster(id, undefined, x => { x.product!.preparing = { status: 'running', startedAt: at, paid, engine }; });
@@ -832,7 +856,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
       // Every saved logo is restored independently, including legacy logos previously kept in the background.
       for (const logo of analysis?.logoSlots ?? []) delete logo.inBackground;
       const result = await prepareProduct({ source, analysis, objects: t.product.objects, segmenter: engine === 'sam3' ? options.segmenter?.() : undefined, paidApproved: paid,
-        ...(engine === 'ai' ? { layerizer: options.layerizer?.(), requireAiMatches: !!v } : {}), ...(known ? { known } : {}), ...(options.cutoutVerification?.() ? { verifyCutouts: true } : {}),
+        ...(engine === 'ai' ? { layerizer: withRecordedPlanner(options.layerizer?.(), t), requireAiMatches: !!v } : {}), ...(known ? { known } : {}), ...(options.cutoutVerification?.() ? { verifyCutouts: true } : {}),
         save: (f, value) => store.write(id, `prepare-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 80)}.json`, Buffer.from(JSON.stringify(value, null, 2))),
         saveImage: (f, png) => store.write(id, `prepare-${f.replace(/\.png$/i, '')}-${sha256(png).slice(0, 12)}.png`, png) });
       const file = (prefix: string, png: Buffer) => { const name = `${prefix}-${sha256(png).slice(0, 12)}.png`; if (!store.has(id, name)) store.write(id, name, png); return { file: name, sha256: sha256(png) }; };

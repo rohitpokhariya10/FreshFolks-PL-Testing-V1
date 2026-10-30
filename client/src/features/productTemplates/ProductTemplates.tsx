@@ -237,7 +237,8 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
   if (reviewing || view.stage === 'review' || view.stage === 'changed') return <div className="ot-page prt-page-wide">{aiDone ? head(2, "Here’s what we found", 'Each box is one element. Fix anything that looks wrong, then prepare the template. Items that need a look are listed first.')
       : notApproved ? head(2, 'Approve AI detection to find characters and products', 'Your text and logos were read on this computer. Characters and products are found by one AI request, which was not approved, so none was sent.')
       : head(2, 'AI detection did not complete', 'Local candidates are retained. Recover a saved response or approve a new AI analysis before preparation.')}
-    {view.product.preparing?.status === 'failed' && <Alert>{view.product.preparing.error}</Alert>}
+    {/* The last Decompose attempt's failure (a later step): the review and its element analysis stand; the person continues to Choose. */}
+    {view.product.preparing?.status === 'failed' && <Alert tone="warn"><strong>The last decomposition attempt did not finish:</strong> {view.product.preparing.error} Your reviewed elements are kept and nothing was retried: continue to Choose to decompose again.</Alert>}
     {aiDone && view.counts.words > 0 && <FitText view={view} onDone={v => { setView(v); setFitted(n => n + 1); }} onError={setError} />}
     {aiDone ? <p>{view.counts.characters} Characters · {view.counts.products} Products · {view.counts.words} Text words · {view.counts.text} Text groups · {view.counts.logos} Logos
       {(view.product.detection?.ai?.costUsd ?? 0) > 0 && <> <button type="button" className="ws-btn ws-btn-quiet" onClick={useSaved}>Find the elements again from the saved AI answer (free; your corrections are kept)</button></>}</p>
@@ -253,7 +254,7 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
       <button type="button" className="ws-btn" onClick={approveAi}>Approve one AI detection request</button>
       <button type="button" className="ws-btn" onClick={() => setRetryAi(false)}>Cancel</button></section>}
     {view.product.detection?.ai?.offline && <p role="status">Offline fixture detections — not verified AI provider results.</p>}
-    {view.product.detection?.ai?.model?.includes('(recorded answer') && <p role="status">A recorded AI answer for this exact image, replayed: no new AI request was made.</p>}
+    {view.product.detection?.ai?.model?.includes('(recorded answer') && <p role="status">Element analysis: a recorded AI answer for this exact image, replayed: no new AI request was made.</p>}
     <ProductReview key={`${view.product.objectsRevision}:${fitted}`} view={view} onSaved={async (v, next) => { setView(v); if (next) { setReviewing(false); setChoosing(true); } }} onError={setError} /></div>;
   if (sizing && view.product.revisions.length) return <div className="ot-page prt-page-wide">{head(5, `Your master in ${REUSE_ASPECT_LABELS[sizing]}`, 'Preview the master in the size you chose, made from your saved original. Save it when it looks right, or keep the original size.')}
     <MasterSize key={sizing} view={view} ratio={sizing} onRatio={setSizing} onSaved={v => { setSizing(undefined); setInspecting(false); setView(v); }} onKeepOriginal={() => { setSizing(undefined); setInspecting(false); }} /></div>;

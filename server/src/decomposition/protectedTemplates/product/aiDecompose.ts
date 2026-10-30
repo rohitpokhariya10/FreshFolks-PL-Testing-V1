@@ -51,11 +51,16 @@ export interface AiDecomposition {
   layers: LayerizedLayer[];
 }
 export type Save = (file: string, value: object) => void;
-export interface ProductDecompositionPlanner { model: string; offline: boolean; plan(request: DecompositionRequest, save: Save): Promise<{ plan: DecompositionPlan; responseId?: string; usage?: PlannerUsage }> }
+/**
+ * A completed planner answer recorded for this very request (the same model, instructions, elements and picture), or
+ * nothing. `derive` reads an answer through the same checks as a live one (it throws on an unusable answer).
+ */
+export type RecordedPlannerAnswer = (call: { request: object; imageSha256: string; derive: (response: unknown) => DecompositionPlan }) => { response: unknown; from: string } | undefined;
+export interface ProductDecompositionPlanner { model: string; offline: boolean; plan(request: DecompositionRequest, save: Save, recorded?: RecordedPlannerAnswer): Promise<{ plan: DecompositionPlan; responseId?: string; usage?: PlannerUsage; replayed?: boolean }> }
 export interface ProductLayerizer {
   /** Shown to the person: what plans and what decomposes. */
   planner: string; engine: string; offline: boolean;
-  decompose(request: DecompositionRequest, save: Save): Promise<AiDecomposition>;
+  decompose(request: DecompositionRequest, save: Save, options?: { recordedPlanner?: RecordedPlannerAnswer }): Promise<AiDecomposition>;
 }
 export class AiDecompositionError extends Error {
   constructor(public readonly code: string, message: string, public readonly details: { requestId?: string; stage: 'planner' | 'seedream' } = { stage: 'seedream' }) { super(message); this.name = 'AiDecompositionError'; }
@@ -100,12 +105,13 @@ Write:
 - background: one line on what the background layer contains.
 - warnings: anything that may go wrong (an element partly hidden, two elements touching, a tiny element), else empty.`;
 
-/** The live planner: one OpenAI Responses request with the picture (no text, no overlay logos) and the reviewed elements. */
+/**
+ * The live planner: one OpenAI Responses request with the picture (no text, no overlay logos) and the reviewed elements.
+ * A completed answer already recorded for this very request (`recorded`) is replayed instead: no request, nothing spent.
+ */
 export function liveDecompositionPlanner(options: { apiKey?: string; model?: string; client?: Pick<OpenAI, 'responses'> & Partial<Pick<OpenAI, 'baseURL'>> } = {}): ProductDecompositionPlanner {
   const model = options.model?.trim() || decompositionPlannerModel();
-  return { model, offline: false, async plan(request, save) {
-    if (!options.client && !(options.apiKey ?? process.env.OPENAI_API_KEY)?.trim()) throw new AiDecompositionError('PLANNER_NOT_CONFIGURED', 'Set OPENAI_API_KEY in server/.env for the decomposition planner.', { stage: 'planner' });
-    const client = options.client ?? new OpenAI({ apiKey: options.apiKey ?? process.env.OPENAI_API_KEY, maxRetries: 0, timeout: 180_000 });
+  return { model, offline: false, async plan(request, save, recorded) {
     const elements = request.elements.map(e => ({ id: e.id, kind: e.kind, name: e.label, box: e.box, bbox: bboxTag(e.box, request.width, request.height), decompose: e.decompose }));
     const body = { picture: { width: request.width, height: request.height }, elements, removed_before: { text_blocks: request.excluded.textBlocks, words: request.excluded.words, logos: request.excluded.logos } };
     const call = {
@@ -116,7 +122,16 @@ export function liveDecompositionPlanner(options: { apiKey?: string; model?: str
       ] }],
       text: { format: { type: 'json_schema' as const, name: 'product_decomposition_plan', schema: PLAN_SCHEMA as unknown as Record<string, unknown>, strict: true } },
     };
-    save('ai-planner-request.json', { ...call, input: [{ role: 'user', content: [call.input[0].content[0], { type: 'input_image', image_url: `<image/png, ${request.image.length} bytes, sha256 ${sha256(request.image)}>` }] }] });
+    const sent = { ...call, input: [{ role: 'user', content: [call.input[0].content[0], { type: 'input_image', image_url: `<image/png, ${request.image.length} bytes, sha256 ${sha256(request.image)}>` }] }] };
+    save('ai-planner-request.json', sent);
+    const replay = recorded?.({ request: sent, imageSha256: sha256(request.image), derive: response => plannerAnswer(response, request).plan });
+    if (replay) {
+      save('ai-planner-response.json', replay.response as object);
+      save('ai-planner-replay.json', { replayOf: replay.from, model, imageSha256: sha256(request.image) });
+      return { ...plannerAnswer(replay.response, request), replayed: true };
+    }
+    if (!options.client && !(options.apiKey ?? process.env.OPENAI_API_KEY)?.trim()) throw new AiDecompositionError('PLANNER_NOT_CONFIGURED', 'Set OPENAI_API_KEY in server/.env for the decomposition planner.', { stage: 'planner' });
+    const client = options.client ?? new OpenAI({ apiKey: options.apiKey ?? process.env.OPENAI_API_KEY, maxRetries: 0, timeout: 180_000 });
     const started = Date.now();
     let response: unknown;
     try { response = await client.responses.create(call); }
@@ -125,17 +140,22 @@ export function liveDecompositionPlanner(options: { apiKey?: string; model?: str
       throw new AiDecompositionError('PLANNER_API_ERROR', `The OpenAI planner (${model}) request failed: ${openAIFailureSummary(d.error)}. Seedream was not called.`, { stage: 'planner' });
     }
     save('ai-planner-response.json', response as object);
-    const r = response as { id?: string; status?: string; output?: { type: string; content?: { type: string; refusal?: string; text?: string }[] }[]; output_text?: string; usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number; output_tokens_details?: { reasoning_tokens?: number } } };
-    const content = (r.output ?? []).filter(o => o.type === 'message').flatMap(o => o.content ?? []);
-    const refusal = content.find(c => c.type === 'refusal');
-    if (refusal) throw new AiDecompositionError('PLANNER_REFUSED', `The planner refused: ${refusal.refusal ?? '(no reason given)'}. Seedream was not called.`, { stage: 'planner' });
-    if (r.status !== 'completed') throw new AiDecompositionError('PLANNER_INCOMPLETE', `The planner's answer is ${r.status ?? 'unknown'}. Seedream was not called.`, { stage: 'planner' });
-    let parsed: unknown;
-    try { parsed = JSON.parse(r.output_text ?? content.filter(c => c.type === 'output_text').map(c => c.text ?? '').join('')); }
-    catch { throw new AiDecompositionError('PLANNER_INVALID_JSON', 'The planner did not return valid JSON. Seedream was not called.', { stage: 'planner' }); }
-    return { plan: checkDecompositionPlan(parsed, request), responseId: r.id,
-      ...(r.usage ? { usage: { input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens, reasoning_tokens: r.usage.output_tokens_details?.reasoning_tokens, total_tokens: r.usage.total_tokens } } : {}) };
+    return plannerAnswer(response, request);
   } };
+}
+
+/** A planner answer (live or recorded) read: a refusal, an unfinished answer or one that is not the plan's JSON is refused. */
+function plannerAnswer(response: unknown, request: DecompositionRequest): { plan: DecompositionPlan; responseId?: string; usage?: PlannerUsage } {
+  const r = response as { id?: string; status?: string; output?: { type: string; content?: { type: string; refusal?: string; text?: string }[] }[]; output_text?: string; usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number; output_tokens_details?: { reasoning_tokens?: number } } };
+  const content = (r.output ?? []).filter(o => o.type === 'message').flatMap(o => o.content ?? []);
+  const refusal = content.find(c => c.type === 'refusal');
+  if (refusal) throw new AiDecompositionError('PLANNER_REFUSED', `The planner refused: ${refusal.refusal ?? '(no reason given)'}. Seedream was not called.`, { stage: 'planner' });
+  if (r.status !== 'completed') throw new AiDecompositionError('PLANNER_INCOMPLETE', `The planner's answer is ${r.status ?? 'unknown'}. Seedream was not called.`, { stage: 'planner' });
+  let parsed: unknown;
+  try { parsed = JSON.parse(r.output_text ?? content.filter(c => c.type === 'output_text').map(c => c.text ?? '').join('')); }
+  catch { throw new AiDecompositionError('PLANNER_INVALID_JSON', 'The planner did not return valid JSON. Seedream was not called.', { stage: 'planner' }); }
+  return { plan: checkDecompositionPlan(parsed, request), responseId: r.id,
+    ...(r.usage ? { usage: { input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens, reasoning_tokens: r.usage.output_tokens_details?.reasoning_tokens, total_tokens: r.usage.total_tokens } } : {}) };
 }
 
 /** The planner's answer checked: a prompt within Seedream's limit, layers naming only elements chosen for decomposition. */
@@ -247,15 +267,16 @@ export async function seedreamLayerize(options: { transport: FalTransport; image
 
 /** The decomposition core: the planner's prompt, then Seedream. */
 export function createProductLayerizer(options: { planner: ProductDecompositionPlanner; transport: () => FalTransport; sleep?: (ms: number) => Promise<void>; pollIntervalMs?: number }): ProductLayerizer {
-  return { planner: options.planner.model, engine: SEEDREAM_LAYERIZE, offline: options.planner.offline, async decompose(request, save) {
+  return { planner: options.planner.model, engine: SEEDREAM_LAYERIZE, offline: options.planner.offline, async decompose(request, save, extra) {
     // fal first, and free: no key, a refused key or a locked account stops here, before the planner is paid for.
     let transport: FalTransport;
     try { transport = options.transport(); } catch (error) { throw new AiDecompositionError('FAL_NOT_CONFIGURED', `${error instanceof Error ? error.message : String(error)} Nothing was sent to OpenAI or Seedream.`); }
     const uploaded = await uploadForSeedream(transport, request.image, save);
-    const planned = await options.planner.plan(request, save);
+    const planned = await options.planner.plan(request, save, extra?.recordedPlanner);
     save('ai-plan.json', planned.plan);
     const s = await seedreamLayerize({ transport, image: request.image, width: request.width, height: request.height, prompt: planned.plan.prompt, save, uploaded, ...(options.sleep ? { sleep: options.sleep } : {}), ...(options.pollIntervalMs !== undefined ? { pollIntervalMs: options.pollIntervalMs } : {}) });
-    return { plan: planned.plan, planner: { model: options.planner.model, offline: options.planner.offline, ...(planned.responseId ? { responseId: planned.responseId } : {}), ...(planned.usage ? { usage: planned.usage } : {}), costUsd: options.planner.offline ? 0 : DECOMPOSITION_PLANNER_USD },
+    // A replayed answer was paid for when it was recorded: it is named so, and costs nothing now.
+    return { plan: planned.plan, planner: { model: planned.replayed ? `${options.planner.model} (recorded answer, replayed)` : options.planner.model, offline: options.planner.offline, ...(planned.responseId ? { responseId: planned.responseId } : {}), ...(planned.usage && !planned.replayed ? { usage: planned.usage } : {}), costUsd: options.planner.offline || planned.replayed ? 0 : DECOMPOSITION_PLANNER_USD },
       seedream: { endpoint: SEEDREAM_LAYERIZE, offline: false, requestId: s.requestId, layers: s.layers.length, costUsd: s.costUsd, imageSha256: s.imageSha256 }, layers: s.layers };
   } };
 }
