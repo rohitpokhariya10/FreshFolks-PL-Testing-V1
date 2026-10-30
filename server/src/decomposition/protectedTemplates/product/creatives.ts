@@ -16,6 +16,7 @@ import type { ProtectedStore } from '../store.js';
 import { sha256 } from '../pixels.js';
 import { cutOutUpload } from './uploadCutout.js';
 import { cutoutDefects, refineCutout, refinePrompt, refineRequest, refineResult } from './cutoutRefine.js';
+import { lockedCompletion, lockedRequest } from './lockedCompletion.js';
 import type { RatioRegenerator } from './ratioRegeneration.js';
 import { createProductCreativeRun, existingProductCreativeRun } from './creativeRun.js';
 import { artworkBase } from './artworkText.js';
@@ -171,9 +172,14 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
     const { c, o, png } = refinable(id, cid, objectId), d = await defectsOf(id, c, o, png), r = await refineCutout(png, repairOf(d));
     return { before: o.asset.file, file: await refined(id, cid, r.png), width: r.width, height: r.height, removedPixels: r.removedPixels, filledPixels: r.filledPixels, defringedPixels: r.defringedPixels, rebuiltPixels: r.rebuiltPixels, clearedPixels: r.clearedPixels, ...defectReport(d), requests: 0 };
   });
+  /**
+   * The AI repair's request: with known defects, geometry-locked (lockedCompletion.ts: a crop round them, a real edit mask,
+   * the model's pixels kept only inside them, then checked); without, the whole cut-out on the plain ground (refineRequest).
+   */
+  const aiRepairRequest = async (png: Buffer, label: string, d: Awaited<ReturnType<typeof defectsOf>>) => (d ? await lockedRequest(png, repairOf(d)!, label) : undefined) ?? await refineRequest(png, repairOf(d));
   /** What one AI repair of this object sends and may cost (shown before it is approved). */
   const refineEstimate = async (id: string, cid: string, objectId: string) => {
-    const { png } = refinable(id, cid, objectId), r = deps.regenerator?.(), { size } = await refineRequest(png);
+    const { c, o, png } = refinable(id, cid, objectId), r = deps.regenerator?.(), { size } = await aiRepairRequest(png, o.label, await defectsOf(id, c, o, png));
     return { available: !!r, model: r?.model ?? '', offline: r?.offline ?? true, size, estimateUsd: r && !r.offline ? regenEstimateUsdForSize(size) : 0 };
   };
   /**
@@ -182,14 +188,23 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
    */
   const refineWithAi = (id: string, cid: string, objectId: string, input: { approveUsd?: unknown }) => locked(`${id}:${cid}`, async () => {
     const { c, o, png } = refinable(id, cid, objectId), r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI repair is not available on this server (no OpenAI key is configured). Use the free clean-up.');
-    const d = await defectsOf(id, c, o, png), place = await refineRequest(png, repairOf(d)), estimateUsd = r.offline ? 0 : regenEstimateUsdForSize(place.size);
+    const d = await defectsOf(id, c, o, png), place = await aiRepairRequest(png, o.label, d), locked = 'crop' in place ? place : undefined, estimateUsd = r.offline ? 0 : regenEstimateUsdForSize(place.size);
     if (estimateUsd && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= estimateUsd)) fail('APPROVAL_REQUIRED', `Repairing ${o.label} with AI sends one request to ${r.model} (${place.size.width} × ${place.size.height}), at most about $${estimateUsd.toFixed(2)}. Approve the cost first.`, { estimateUsd });
     const op = randomBytes(4).toString('hex'), save = (f: string, v: object) => store.write(id, `pcr-${cid.slice(3)}-${op}-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`, Buffer.from(JSON.stringify(v, null, 2)));
     let out: Awaited<ReturnType<RatioRegenerator['regenerate']>>;
-    try { out = await r.regenerate({ image: place.image, prompt: refinePrompt(o.label, !!d), size: place.size }, save, op); }
+    try { out = await r.regenerate({ image: place.image, prompt: locked ? locked.prompt : refinePrompt(o.label, !!d), size: place.size, ...(locked ? { mask: locked.mask } : {}) }, save, op); }
     catch (error) { fail('PROVIDER_FAILED', `The AI repair did not complete: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}. Nothing was retried; ${o.label} is unchanged.`, { estimateUsd }); }
+    const cost = { model: r.model, offline: r.offline, size: place.size, estimateUsd, ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}), ...(out.requestId ? { requestId: out.requestId } : {}) };
+    if ('crop' in place) {
+      // Checked before it is offered: a rejected result is kept to look at (pcx-: never applicable), the layer unchanged.
+      const g = await lockedCompletion(out.image, png, place, repairOf(d)!), m = await sharp(png).metadata();
+      const file = g.gate.accepted ? await refined(id, cid, g.png) : (() => { const f = `pcx-${cid.slice(3)}-${sha256(g.candidate).slice(0, 12)}.png`; if (!store.has(id, f)) store.write(id, f, g.candidate); return f; })();
+      const usage = { ...cost, file, ...defectReport(d), unrepairedPixels: g.gate.unfilledPixels, gate: g.gate, rejected: !g.gate.accepted };
+      save('ai-repair.json', usage);
+      return { before: o.asset.file, ...usage, width: m.width ?? 1, height: m.height ?? 1, requests: 1 };
+    }
     const res = await refineResult(out.image, png, place, repairOf(d)), file = await refined(id, cid, res.png);
-    const usage = { model: r.model, offline: r.offline, size: place.size, estimateUsd, ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}), ...(out.requestId ? { requestId: out.requestId } : {}), file, ...defectReport(d), clearedPixels: res.clearedPixels, unrepairedPixels: res.unrepairedPixels };
+    const usage = { ...cost, file, ...defectReport(d), clearedPixels: res.clearedPixels, unrepairedPixels: res.unrepairedPixels };
     save('ai-repair.json', usage);
     return { before: o.asset.file, ...usage, width: res.width, height: res.height, requests: 1 };
   });
