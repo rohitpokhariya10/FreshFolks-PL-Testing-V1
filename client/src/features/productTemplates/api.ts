@@ -34,7 +34,9 @@ export interface TextBlock { id: string; category: MasterCategory; text: string;
 export interface LogoView { id: string; label: string; category: string; box: PixelRect; file: string; removed: boolean; attention: boolean; confidence: number; /** A brand logo or graphic kept in the picture (not its own layer). */ inBackground?: boolean }
 export interface Attention { type: 'object' | 'text' | 'logo' | 'missing'; id: string; label: string; reason: string; box: PixelRect }
 export interface ProductView {
-  recovery?: { savedAnswer: boolean; retrievable: boolean; interrupted: boolean };
+  recovery?: { savedAnswer: boolean; retrievable: boolean; interrupted: boolean;
+    /** The element analysis request as OpenAI last reported it (`in_progress`, `completed`, `failed`, …): when it was submitted and last checked. */
+    job?: { status: string; startedAt: string; checkedAt?: string } };
   template: { id: string; name: string; revision: number; createdAt: string; updatedAt: string; source: ProtectedTemplate['source'] };
   stage: ProductStage; product: ProductInfo; texts: TextBlock[]; logos: LogoView[]; attention: Attention[];
   counts: { characters: number; products: number; text: number; words: number; logos: number; background: number };

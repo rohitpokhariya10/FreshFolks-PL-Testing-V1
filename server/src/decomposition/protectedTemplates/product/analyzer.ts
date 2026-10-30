@@ -33,6 +33,8 @@ export interface ProductAnalysisJob {
   model: string; imageSha256: string; sent: ProductAnalysisSent; startedAt: string;
   responseId?: string; status: 'submitting' | 'unknown' | 'rejected' | 'unavailable' | NonNullable<OpenAI.Responses.Response['status']>;
   lastError?: { code: string; message: string; at: string };
+  /** When OpenAI was last asked for this response (its `status` is what it said then). */
+  checkedAt?: string;
 }
 export interface RecoverableProductAnalyzer extends SceneAnalyzer {
   recover(image: Buffer, save: (file: string, value: object) => void, job: ProductAnalysisJob): Promise<ProductScene>;
@@ -187,7 +189,7 @@ export function liveProductAnalyzer(options: { model?: string; client?: Pick<Ope
     let response: OpenAI.Responses.Response;
     const started = Date.now();
     const checkpoint = (r: OpenAI.Responses.Response) => {
-      job.responseId = r.id; job.status = r.status ?? 'unknown'; delete job.lastError; save('product.job.json', job);
+      job.responseId = r.id; job.status = r.status ?? 'unknown'; job.checkedAt = new Date().toISOString(); delete job.lastError; save('product.job.json', job);
       save('product.response.json', r);
       // The request dimensions and answer are paired atomically; a later attempt cannot mislabel an older answer.
       if (r.status === 'completed') save('product.completed.json', { job, response: r });
@@ -205,6 +207,12 @@ export function liveProductAnalyzer(options: { model?: string; client?: Pick<Ope
     }
     catch (error) {
       const f = productProviderFailure(error, timeoutMs), elapsedMs = Date.now() - started;
+      // Still running at OpenAI after the wait: said with OpenAI's own status. Not a failure, never done; checking again is free.
+      if (error instanceof ProductAnalysisError && error.code === 'PENDING') {
+        save('product.error.json', { code: 'PENDING', status: job.status, responseId: job.responseId, startedAt: job.startedAt, checkedAt: job.checkedAt, elapsedMs, timeoutMs, sent, model: job.model, retried: false, at: new Date().toISOString() });
+        const minutes = Math.max(1, Math.round((Date.now() - Date.parse(job.startedAt)) / 60_000));
+        throw new ProductAnalysisError('PENDING', `OpenAI still reports this request as ${job.status} (submitted ${minutes} min ago), so there is no answer yet. Use “Retrieve existing request” to check it again: checking is free and submits no new request.`, undefined, { elapsedMs, sent: job.sent });
+      }
       const unavailable = !!job.responseId && (f.httpStatus === 404 || f.httpStatus === 410);
       if (unavailable) job.status = 'unavailable';
       else if (!job.responseId) job.status = f.httpStatus && [400, 401, 403, 404, 413, 422, 429].includes(f.httpStatus) ? 'rejected' : 'unknown';
@@ -227,10 +235,11 @@ export function liveProductAnalyzer(options: { model?: string; client?: Pick<Ope
  * A Responses answer made into the product scene: everything that happens after the network (usage, completion,
  * refusal, empty answer, JSON, the schema checks). Shared by the live analyzer and the replay of a recorded answer.
  */
-export function productSceneFromResponse(response: Pick<OpenAI.Responses.Response, 'status' | 'usage' | 'incomplete_details' | 'output' | 'output_text'>, size: { width: number; height: number }, model: string, save: (file: string, value: object) => void): ProductScene {
+export function productSceneFromResponse(response: Pick<OpenAI.Responses.Response, 'status' | 'usage' | 'incomplete_details' | 'output' | 'output_text'> & Partial<Pick<OpenAI.Responses.Response, 'error'>>, size: { width: number; height: number }, model: string, save: (file: string, value: object) => void): ProductScene {
   const usage = productAnalysisUsage(model, response.usage);
   if (usage) save('product.usage.json', { model, ...usage });
-  if (response.status !== 'completed') throw new ProductAnalysisError('INCOMPLETE', `AI detection not completed (${response.status}: ${response.incomplete_details?.reason ?? 'unknown'}). No automatic retry was made.`, usage);
+  // OpenAI's own reason (a failed response's error, an incomplete one's cause): this request has ended and cannot be collected again.
+  if (response.status !== 'completed') throw new ProductAnalysisError('INCOMPLETE', `AI detection not completed (${response.status}: ${response.error?.message ?? response.incomplete_details?.reason ?? 'unknown'}). OpenAI has ended this request, so it cannot be retrieved again; a new analysis needs your approval. No automatic retry was made.`, usage);
   if (response.output?.some(item => item.type === 'message' && item.content.some(c => c.type === 'refusal'))) throw new ProductAnalysisError('REFUSAL', 'The model declined this analysis. No detections were accepted.', usage);
   if (!response.output_text?.trim()) throw new ProductAnalysisError('EMPTY_RESPONSE', 'AI returned no word manifest. No detections were accepted.', usage);
   try { return { ...parseProductScene(JSON.parse(response.output_text), size), analysisUsage: usage }; }

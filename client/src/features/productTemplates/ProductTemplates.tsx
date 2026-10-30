@@ -32,10 +32,12 @@ const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
  * Why the AI detection did not complete, in its own words, with what was sent and how long it waited: never a local
  * reading presented as a finished detection.
  */
-function AiDetectionFailed({ detection, onUseSaved }: { detection?: ProductDetection; onUseSaved?: () => void }) {
-  const ai = detection?.ai, answered = !!ai && (ai.costUsd ?? 0) > 0;
-  return <Alert>
-    <strong>AI detection did not complete{ai?.code ? ` (${ai.code})` : ''}.</strong>{' '}
+function AiDetectionFailed({ detection, onUseSaved, job }: { detection?: ProductDetection; onUseSaved?: () => void; job?: NonNullable<ProductView['recovery']>['job'] }) {
+  const ai = detection?.ai, answered = !!ai && (ai.costUsd ?? 0) > 0, pending = ai?.code === 'PENDING';
+  const at = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return <Alert tone={pending ? 'warn' : undefined}>
+    {/* Still running at OpenAI is not a failure, and never shown as done. */}
+    <strong>{pending ? 'AI detection is still processing at OpenAI.' : `AI detection did not complete${ai?.code ? ` (${ai.code})` : ''}.`}</strong>{' '}
     {answered ? <>OpenAI did answer (this request was billed, about ${(ai.costUsd ?? 0).toFixed(2)}), but FrameFlow could not use the answer: {ai.error ?? 'it did not pass the checks.'} </> : ai?.error ?? detection?.error ?? 'No answer was received.'}
     {ai && (ai.sent || ai.elapsedMs !== undefined || ai.httpStatus) && <span className="prt-ai-facts">
       {ai.model && <>Model {ai.model}. </>}
@@ -43,6 +45,7 @@ function AiDetectionFailed({ detection, onUseSaved }: { detection?: ProductDetec
       {ai.elapsedMs !== undefined && <>Waited {Math.round(ai.elapsedMs / 1000)} s. </>}
       {ai.httpStatus ? <>HTTP {ai.httpStatus}.</> : null}
     </span>}
+    {job && <span className="prt-ai-facts" data-testid="analysis-job">OpenAI status of the saved request: <strong>{job.status.replace(/_/g, ' ')}</strong>. Submitted at {at(job.startedAt)}{job.checkedAt ? `, last checked at ${at(job.checkedAt)}` : ''}.</span>}
     <span className="prt-ai-facts">This attempt did not complete detection. The source image and any previous detections and corrections are retained.</span>
     {onUseSaved && <span className="prt-ai-facts"><button type="button" className="ws-btn ws-btn-primary" onClick={onUseSaved}>Recover saved analysis for this image (free)</button> Only a completed answer with verified image identity is accepted.</span>}
   </Alert>;
@@ -216,7 +219,7 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
   if (view.stage === 'detecting') return <div className="ot-page">{head(2, 'Finding what is in your creative', 'Reading the text and logos on this computer' + (view.product.detection?.ai?.status === 'skipped' ? '.' : ', and asking the AI for the characters and products.'))}
     <Waiting label="Finding text, logos, products and characters…" /><p>You can return from the template library after refreshing. The saved request can be retrieved without submitting detection again.</p></div>;
   if (view.stage === 'detect-failed') return <div className="ot-page">{head(2, 'Finding the elements did not finish', 'Nothing was lost: your creative is stored unchanged.')}
-    <AiDetectionFailed detection={view.product.detection} onUseSaved={useSaved} />{recovery}
+    <AiDetectionFailed detection={view.product.detection} onUseSaved={useSaved} job={view.recovery?.job} />{recovery}
     {/* Characters and products need the AI analysis: a free retry reads the text only and cannot complete detection. */}
     {retryAi ? <section className="ts-card"><div className="ts-card-body"><p>Authorize one new OpenAI vision analysis request if no matching saved answer exists. {AI_REQUEST_COST} An earlier timed-out request may still finish and be billed; try recovery first. Nothing is retried automatically.</p>
       <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" onClick={() => void productApi.detect(id, { force: true, useAi: true, newRequest: true }).then(r => { setRetryAi(false); setView(r.template); }).catch((e: Error) => setError(e.message))}>Approve one AI detection request</button>
@@ -246,7 +249,7 @@ function ProductSetup({ id, onBack, onUse, initialChoosing, onOpenRunInEditor }:
     {!aiDone && (notApproved ? <section className="ts-card" role="group" aria-label="Approve AI detection"><div className="ts-card-body">
       <p>AI detection was not approved for this creative, so no AI request was sent. Characters and products can only be found by it, and they are needed to decompose the creative: one request to OpenAI, for the creative shown below. {AI_REQUEST_COST}</p>
       <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" onClick={approveAi}>Approve AI detection and continue</button></div></div></section>
-      : <><AiDetectionFailed detection={view.product.detection} onUseSaved={useSaved} />{recovery}
+      : <><AiDetectionFailed detection={view.product.detection} onUseSaved={useSaved} job={view.recovery?.job} />{recovery}
       <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" onClick={() => setRetryAi(true)}>Retry AI analysis…</button></div></>)}
     {aiDone && added === 0 && <Alert>Object detection needs attention: no characters or products were found. Retry analysis or correct the result.
       <button type="button" className="ws-btn" onClick={() => setRetryAi(true)}>Retry AI analysis</button></Alert>}

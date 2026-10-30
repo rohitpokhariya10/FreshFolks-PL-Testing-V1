@@ -158,7 +158,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     });
   }
   function view(id: string) {
-    const t = requireProduct(id), p = t.product, a = t.textAnalysis, blocks = textBlocks(t);
+    const t = requireProduct(id), p = t.product, a = t.textAnalysis, blocks = textBlocks(t), job = readJob(id);
     const logos = (a?.logoSlots ?? []).map(s => ({ id: s.id, label: s.label, category: s.category ?? 'partner-logo', box: boxOf(s.box), file: s.replacement?.file ?? s.original.file, removed: s.review.status === 'rejected', attention: s.review.status === 'needs-review', confidence: s.confidence, ...(s.inBackground ? { inBackground: true } : {}) }));
     const live = p.objects.filter(o => !o.hidden);
     const attention = [
@@ -171,7 +171,9 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     return {
       template: { id: t.id, name: t.name, revision: t.revision, createdAt: t.createdAt, updatedAt: t.updatedAt, source: t.source },
       recovery: { savedAnswer: store.has(id, 'analysis-product-completed.json') || store.list().some(s => s.source.sha256 === t.source.sha256 && s.product?.detection?.status === 'done' && store.has(s.id, 'analysis-product-response.json')),
-        retrievable: !!readJob(id)?.responseId, interrupted: p.detection?.status === 'running' && !detecting.has(id) },
+        // Retrievable while OpenAI may still give an answer for it; one it ended (failed, cancelled, incomplete, expired) is not.
+        retrievable: !!job?.responseId && !['failed', 'cancelled', 'incomplete', 'unavailable', 'rejected'].includes(job.status), interrupted: p.detection?.status === 'running' && !detecting.has(id),
+        ...(job ? { job: { status: job.status, startedAt: job.startedAt, ...(job.checkedAt ? { checkedAt: job.checkedAt } : {}) } } : {}) },
       stage: stageOf(t), texts: blocks, logos, attention,
       product: p.preparing?.status === 'running' && !preparingNow(t.id) ? { ...p, preparing: { ...p.preparing, status: 'failed' as const, error: 'Preparing was interrupted: prepare again.' } } : p,
       counts: { characters: count('character'), products: count('product'), text: blocks.filter(b => !b.removed).length, words: (a?.words ?? []).filter(w => w.review.status !== 'rejected').length, logos: logos.filter(l => !l.removed && !l.inBackground).length + count('brand-logo'), background: count('podium') + count('frame') + count('decoration') },
@@ -328,7 +330,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     const before = requireProduct(id);
     // Keep the last successful analysis intact even while a new attempt is running or fails.
     // (What this run asks of the AI is shown while it runs: a previous skipped or failed attempt's outcome is not.)
-    if (before.product.detection?.status !== 'done') await service.updateMaster(id, undefined, x => { const d = { ...x.product!.detection, status: 'running' as const, startedAt, sourceSha256: x.source.sha256 }; delete d.ai; x.product!.detection = useAi ? d : { ...d, ai: { status: 'skipped' } }; });
+    if (before.product.detection?.status !== 'done') await service.updateMaster(id, undefined, x => { const d = { ...x.product!.detection, status: 'running' as const, startedAt, sourceSha256: x.source.sha256 }; delete d.ai; x.product!.detection = useAi || recover ? d : { ...d, ai: { status: 'skipped' } }; });
     try {
       const t = requireProduct(id), png = store.read(id, t.source.inputFile);
       if (sha256(png) !== t.source.sha256) fail('SOURCE_MISMATCH', 'The stored image does not match its original hash. No saved analysis or provider request was used.');
