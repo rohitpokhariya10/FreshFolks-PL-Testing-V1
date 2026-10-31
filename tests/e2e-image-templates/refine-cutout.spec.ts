@@ -44,9 +44,17 @@ test('Refine Cutout: a product layer cleaned for free, compared, approved; only 
   const tv = before.objects.find(o => o.label === 'Television')!;
   await change.getByRole('listitem').filter({ hasText: 'Television' }).getByRole('button', { name: 'Refine cutout' }).click();
   const refine = change.getByRole('region', { name: 'Refine cutout: Television' });
+  // This intact fixture has no missing region. The real API reports the limitation without offering a paid request.
+  await refine.getByRole('button', { name: 'Complete with AI…' }).click();
+  await expect(refine.getByText(/reliable missing region/)).toBeVisible();
+  await expect(refine.getByRole('button', { name: /Yes, spend/ })).toHaveCount(0);
+  // Reopen and inject only the estimate to exercise the confirmation UI; Cancel sends no repair request.
+  await refine.getByRole('button', { name: 'Close', exact: true }).click();
+  await change.getByRole('listitem').filter({ hasText: 'Television' }).getByRole('button', { name: 'Refine cutout' }).click();
+  await page.route(`**/objects/${tv.id}/refine`, r => r.fulfill({ json: { available: true, provider: 'fal.ai', model: 'fal-ai/flux-pro/v1/fill (test estimate)', offline: false, size: { width: 160, height: 224 }, estimateUsd: 0.05 } }));
   // The AI repair: provider, model, size and estimate shown; Cancel sends nothing.
   await refine.getByRole('button', { name: 'Complete with AI…' }).click();
-  await expect(refine.getByRole('group', { name: 'Confirm the AI repair cost' })).toContainText(/Provider OpenAI, model .*, \d+ × \d+/);
+  await expect(refine.getByRole('group', { name: 'Confirm the AI repair cost' })).toContainText(/Provider fal.ai, model .*, \d+ × \d+/);
   await refine.getByRole('button', { name: 'Cancel' }).click();
   // The free clean-up: compared with the current picture, applied only when looked at.
   await refine.getByRole('button', { name: 'Clean up (free)' }).click();

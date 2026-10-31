@@ -481,7 +481,7 @@ const router = createLayerizeRouter({
   },
   runsDir: join(root, 'runs'), imageTemplatesDir: join(root, 'templates'), protectedDir: join(root, 'protected'), wordRecognizer: () => variationRecognizer, masterRecognizer: () => masterRecognizer,
   // Product with Text templates: the fixture poster's words (no OCR), the fixture's vision answer and a fake cut-out service, each counted.
-  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, productRegenerator: () => ratioRegenerator, productArtwork: () => productArtwork,
+  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, productRegenerator: () => ratioRegenerator, productRepairProvider: () => ({ model: 'fal-ai/flux-pro/v1/fill (offline test double)', offline: false, async repair({ image }) { return { image, requestId: 'offline-flux-repair' }; } }), productArtwork: () => productArtwork,
   templatesDir: join(root, 'creative-templates'), executionsDir: join(root, 'executions'),
   inspector: () => ({ model: 'gpt-5.6-luna', inspect: async (_bytes, _mime, save) => {
     callCounts.openai++;

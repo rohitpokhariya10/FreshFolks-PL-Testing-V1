@@ -39,9 +39,9 @@ export function RefineCutout({ templateId, creativeId, object, onApplied, onClos
       {!ask && <button type="button" className="ws-btn ws-btn-quiet" disabled={!!busy} onClick={() => void askAi()}><Sparkles size={14} aria-hidden="true" />Complete with AI…</button>}
     </div>
     {ask && info && (info.available ? <div className="prt-confirm" role="group" aria-label="Confirm the AI repair cost">
-      <p>Repair only {object.label} with AI? Provider OpenAI, model {info.model}, {info.size.width} × {info.size.height}, {info.estimateUsd > 0 ? <>at most about <strong>${info.estimateUsd.toFixed(2)}</strong> (an estimate, not a billing cap)</> : 'free (test model)'}. One request, never retried; the rest of the creative is not sent or changed.</p>
+      <p>Repair only {object.label} with AI? Provider {info.provider}, model {info.model}, {info.size.width} × {info.size.height}, {info.estimateUsd > 0 ? <>at most about <strong>${info.estimateUsd.toFixed(2)}</strong> (an estimate, not a billing cap)</> : 'free (test model)'}. One request, never retried; the rest of the creative is not sent or changed.</p>
       <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" disabled={!!busy} onClick={() => void ai()}><Sparkles size={14} aria-hidden="true" />{busy === 'ai' ? 'Repairing…' : info.estimateUsd > 0 ? `Yes, spend up to $${info.estimateUsd.toFixed(2)}` : 'Yes, repair it'}</button><button type="button" className="ws-btn ws-btn-quiet" onClick={() => setAsk(false)}>Cancel</button></div>
-    </div> : <p className="ot-muted">AI repair is not available on this server; use the free clean-up.</p>)}
+    </div> : <p className="ot-muted">{info.reason ?? 'AI repair is not available on this server; use the free clean-up.'}</p>)}
     {result && !result.rejected && <div className="prt-confirm" role="group" aria-label="Use the refined picture">
       <label className="ot-check"><input type="checkbox" checked={looked} onChange={e => setLooked(e.target.checked)} /><span>I have compared it with the current picture: this {object.label.toLowerCase()} is right.</span></label>
       <div className="ot-row"><button type="button" className="ws-btn ws-btn-primary" disabled={!looked || !!busy} onClick={() => void apply()}><Check size={14} aria-hidden="true" />{busy === 'apply' ? 'Saving…' : 'Use this picture'}</button>

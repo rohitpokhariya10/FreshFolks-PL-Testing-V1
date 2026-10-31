@@ -12,6 +12,9 @@
  *             green ground (a green fringe otherwise). The alpha stays the layer's (the silhouette the decomposition gave
  *             it). Every other pixel is the layer's own, byte for byte. Where the model left the green ground, the local
  *             repair stays.
+ *   FLUX     the same crop at native resolution, padded to a 32 px grid (no upscale), with an opaque black/white mask:
+ *             white only in the known hole, black everywhere else. No extra editable margin. The compositor and gate
+ *             below are shared with the legacy OpenAI request format; neither trusts the provider to return alpha.
  *   gate      accepted only when the model kept the object where it was (its pixels next to the hole agree with the
  *             verified ones, and no small shift agrees better), filled the hole, left no green in it, and its fill meets
  *             the verified pixels round it at least about as smoothly, and in the same tone, as the local repair. Anything
@@ -50,11 +53,11 @@ const holeOf = (repair: CutoutRepair) => (repair instanceof Uint8Array ? repair 
 const greenish = (r: number, g: number, b: number) => g - Math.max(r, b) > 24;
 const luma = (r: number, g: number, b: number) => 0.299 * r + 0.587 * g + 0.114 * b;
 
-export const lockedPrompt = (label: string) => [
-  `Edit only the transparent area of the mask. It covers parts of this ${label.replace(/\s+/g, ' ').slice(0, 80)} that were hidden behind other objects or damaged.`,
+export const lockedPrompt = (label: string, provider: 'openai' | 'flux' = 'openai') => [
+  `Edit only the ${provider === 'flux' ? 'white area of the mask; black areas are protected' : 'transparent area of the mask'}. It covers parts of this ${label.replace(/\s+/g, ' ').slice(0, 80)} that were hidden behind other objects or damaged.`,
   'Redraw only those parts as the natural continuation of the object\'s own visible surfaces, edges, seams, panel lines, handles, shading and colours, matching the pixels right next to them.',
   'Keep every pixel outside the mask exactly as it is: the object stays in the same place, at the same size, proportions and perspective. Do not move, resize, redraw or redesign the object.',
-  'Do not add labels, logos, reflections of other objects or anything else, and keep the plain flat pure green (#00FF00) background.',
+  'Do not invent labels, logos, model numbers, branded details or reflections of other objects, and keep the plain flat pure green (#00FF00) background.',
 ].join(' ');
 
 /** A 0/1 map grown by `r` pixels (square neighbourhood). */
@@ -66,8 +69,16 @@ function grow(map: Uint8Array, w: number, h: number, r: number) {
 }
 
 /** The targeted request for a layer with defects (see the top of this file), or nothing when no defect is inside its outline. */
-export async function lockedRequest(asset: Buffer, repair: CutoutRepair, label: string): Promise<LockedRequest | undefined> {
+export async function lockedRequest(asset: Buffer, repair: CutoutRepair, label: string, provider: 'openai' | 'flux' = 'openai'): Promise<LockedRequest | undefined> {
   const { data: px, info } = await sharp(asset).ensureAlpha().raw().toBuffer({ resolveWithObject: true }), w = info.width, h = info.height, hole = holeOf(repair);
+  if (hole.length !== w * h) throw new Error('Repair mask dimensions do not match the layer.');
+  if (provider === 'flux') {
+    // Evidence must include solid pixels to reconstruct and verified neighbours to constrain the completion.
+    const near = grow(hole, w, h, RING);
+    let solid = 0, verified = 0;
+    for (let i = 0; i < w * h; i++) if (px[i * 4 + 3] >= 250) { if (hole[i]) solid++; else if (near[i]) verified++; }
+    if (!solid || verified < 16) return undefined;
+  }
   let x0 = w, y0 = h, x1 = -1, y1 = -1;
   for (let i = 0; i < w * h; i++) if (hole[i] && px[i * 4 + 3]) { const x = i % w, y = (i - x) / w; x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
   if (x1 < 0) return undefined;
@@ -78,19 +89,29 @@ export async function lockedRequest(asset: Buffer, repair: CutoutRepair, label: 
   // Proportions the model takes (1:3 to 3:1): the short side widened round its centre (more ground, never a stretch).
   if (crop.width > 3 * crop.height) { const add = Math.ceil(crop.width / 3) - crop.height; crop.y -= add >> 1; crop.height += add; }
   if (crop.height > 3 * crop.width) { const add = Math.ceil(crop.height / 3) - crop.width; crop.x -= add >> 1; crop.width += add; }
-  const size = reconstructionSize(crop)!;
+  // FLUX uses the native crop: pad to a 32 px grid without enlarging or stretching object pixels. The legacy OpenAI
+  // sizing stays available for rollback. Reject oversized crops instead of silently losing detail or over-spending.
+  if (provider === 'flux') {
+    const width = Math.max(64, Math.ceil(crop.width / 32) * 32), height = Math.max(64, Math.ceil(crop.height / 32) * 32);
+    if (width > 4096 || height > 4096) return undefined;
+    crop.x -= Math.floor((width - crop.width) / 2); crop.y -= Math.floor((height - crop.height) / 2);
+    crop.width = width; crop.height = height;
+  }
+  const size = provider === 'flux' ? { width: crop.width, height: crop.height } : reconstructionSize(crop)!;
   // The crop on the green ground (the layer composited over it), and the mask: transparent where the model may paint.
   const cw = crop.width, ch = crop.height, rgb = Buffer.alloc(cw * ch * 3), keep = Buffer.alloc(cw * ch * 4), open = new Uint8Array(w * h);
   for (let i = 0; i < w * h; i++) open[i] = hole[i] && px[i * 4 + 3] ? 1 : 0;
-  const editable = grow(open, w, h, 2);
+  const editable = provider === 'flux' ? open : grow(open, w, h, 2);
   for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
     const X = x + crop.x, Y = y + crop.y, o = (y * cw + x), inside = X >= 0 && Y >= 0 && X < w && Y < h, i = Y * w + X, a = inside ? px[i * 4 + 3] / 255 : 0;
     for (let c = 0; c < 3; c++) rgb[o * 3 + c] = Math.round(a * (inside ? px[i * 4 + c] : 0) + (1 - a) * REFINE_KEY[c]);
-    keep[o * 4 + 3] = inside && editable[i] ? 0 : 255;
+    const edit = inside && editable[i];
+    if (provider === 'flux') { keep[o * 4] = keep[o * 4 + 1] = keep[o * 4 + 2] = edit ? 255 : 0; keep[o * 4 + 3] = 255; }
+    else keep[o * 4 + 3] = edit ? 0 : 255;
   }
   const image = await sharp(rgb, { raw: { width: cw, height: ch, channels: 3 } }).resize(size.width, size.height, { fit: 'fill' }).png().toBuffer();
   const mask = await sharp(keep, { raw: { width: cw, height: ch, channels: 4 } }).resize(size.width, size.height, { fit: 'fill', kernel: 'nearest' }).png({ compressionLevel: 9 }).toBuffer();
-  return { image, mask, prompt: lockedPrompt(label), size, crop, rect: { left: 0, top: 0, width: size.width, height: size.height } };
+  return { image, mask, prompt: lockedPrompt(label, provider), size, crop, rect: { left: 0, top: 0, width: size.width, height: size.height } };
 }
 
 /**

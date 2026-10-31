@@ -27,6 +27,7 @@ import type { Segmenter } from '../../creativeTemplates/segmenter.js';
 import { aiDecompositionEstimate, sentSize, type ProductLayerizer, type RecordedPlannerAnswer } from './aiDecompose.js';
 import { OverlayGateError, prepareProduct } from './prepare.js';
 import { createProductCreatives } from './creatives.js';
+import type { CutoutRepairProvider } from './fluxFillRepair.js';
 import { createProductVariations, type ProductVariationPlanner } from './variations.js';
 import type { ArtworkGenerator } from './artwork.js';
 import { detectProduct, logoSlot, styleLine, wholeLogoSlots } from './detect.js';
@@ -90,6 +91,8 @@ export interface ProductTemplateOptions {
   composer?: () => ReuseComposer | undefined;
   /** The creative regenerated in a common ratio by the image model (ratioRegeneration.ts; only with approval of its cost), for both workflows. */
   regenerator?: () => RatioRegenerator | undefined;
+  /** Refine Cutout only: one masked FLUX completion after cost approval. */
+  repairProvider?: () => CutoutRepairProvider | undefined;
   /**
    * Check each layer after its decomposition and repair it on this computer (layerEvidence.ts, cutoutVerification.ts); off
    * when absent or false (the router turns it on unless FRAMEFLOW_CUTOUT_VERIFICATION=0). Nothing is sent or charged either way.
@@ -998,7 +1001,7 @@ export function createProductTemplates(options: ProductTemplateOptions) {
     return JSON.parse(store.read(id, ref.file).toString('utf8')) as ProductSnapshot;
   }
 
-  const creatives = createProductCreatives({ store, runsDir: options.runsDir, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, regenerator: options.regenerator });
+  const creatives = createProductCreatives({ store, runsDir: options.runsDir, requireProduct, snapshot, locked, latestRevision: id => requireProduct(id).product.revisions.at(-1)?.revision, repairProvider: options.repairProvider });
   /** Enter the existing Konva editor through the existing creative/run adapter. This does not approve quality. */
   const openEditor = (id: string) => locked(id, async () => {
     let t = requireProduct(id);

@@ -43,21 +43,30 @@ async function answer(req: NonNullable<Awaited<ReturnType<typeof lockedRequest>>
   return sharp(out, { raw: { width: crop.width, height: crop.height, channels: 3 } }).resize(req.size.width, req.size.height, { fit: 'fill', kernel: 'nearest' }).png().toBuffer();
 }
 
-describe('geometry-locked AI completion', () => {
+describe.each(['openai', 'flux'] as const)('geometry-locked AI completion (%s)', provider => {
   it('asks only for the hole: a crop round it on the green ground, its proportions kept, a mask open exactly there', async () => {
-    const l = await layer(), req = (await lockedRequest(l.png, l.hole, 'Refrigerator'))!;
-    expect(req.prompt).toContain('Edit only the transparent area of the mask');
+    const l = await layer(), req = (await lockedRequest(l.png, l.hole, 'Refrigerator', provider))!;
+    expect(req.prompt).toContain(provider === 'flux' ? 'white area of the mask; black areas are protected' : 'Edit only the transparent area of the mask');
     expect(Math.abs(req.size.width / req.crop.width - req.size.height / req.crop.height)).toBeLessThan(0.15);
-    const mask = await sharp(req.mask).ensureAlpha().extractChannel(3).raw().toBuffer();
+    const mask = await sharp(req.mask).ensureAlpha().extractChannel(provider === 'flux' ? 0 : 3).raw().toBuffer();
     const sx = req.size.width / req.crop.width, sy = req.size.height / req.crop.height;
     const at = (x: number, y: number) => mask[Math.floor((y - req.crop.y + 0.5) * sy) * req.size.width + Math.floor((x - req.crop.x + 0.5) * sx)];
-    expect(at(95, 180)).toBe(0);      // hidden: editable
-    expect(at(40, 60)).toBe(255);     // verified: kept
-    expect(await lockedRequest(l.png, new Uint8Array(W * H), 'Refrigerator')).toBeUndefined();
+    expect(at(95, 180)).toBe(provider === 'flux' ? 255 : 0);      // hidden: editable
+    expect(at(40, 60)).toBe(provider === 'flux' ? 0 : 255);     // verified: kept
+    if (provider === 'flux') {
+      expect(req.size).toEqual({ width: req.crop.width, height: req.crop.height });
+      expect(req.size.width * req.size.height).toBeLessThan(W * H * 2);
+      for (let y = 0; y < req.size.height; y++) for (let x = 0; x < req.size.width; x++) {
+        const X = x + req.crop.x, Y = y + req.crop.y, expected = X >= 0 && X < W && Y >= 0 && Y < H && l.hole[Y * W + X] ? 255 : 0;
+        expect(mask[y * req.size.width + x]).toBe(expected);
+      }
+      expect(await lockedRequest(l.png, new Uint8Array(W * H).fill(1), 'Refrigerator', provider)).toBeUndefined();
+    }
+    expect(await lockedRequest(l.png, new Uint8Array(W * H), 'Refrigerator', provider)).toBeUndefined();
   });
 
   it('accepts a faithful completion: only the hole changes, to the truth; every other pixel and the outline exactly kept', async () => {
-    const l = await layer(), req = (await lockedRequest(l.png, l.hole, 'Refrigerator'))!;
+    const l = await layer(), req = (await lockedRequest(l.png, l.hole, 'Refrigerator', provider))!;
     const r = await lockedCompletion(await answer(req, (x, y) => truth(x, y)), l.png, req, l.hole);
     expect(r.gate.reasons).toEqual([]);
     expect(r.gate).toMatchObject({ accepted: true, preserved: true, unfilledPixels: 0 });
@@ -76,7 +85,7 @@ describe('geometry-locked AI completion', () => {
   });
 
   it('rejects a drifted drawing (narrower, as the whole-object request was) and keeps the layer unchanged', async () => {
-    const l = await layer(), req = (await lockedRequest(l.png, l.hole, 'Refrigerator'))!;
+    const l = await layer(), req = (await lockedRequest(l.png, l.hole, 'Refrigerator', provider))!;
     const r = await lockedCompletion(await answer(req, (x, y) => truth(x, y, 0.93, -2)), l.png, req, l.hole);
     expect(r.gate.accepted).toBe(false);
     expect(r.gate.reasons.join(' ')).toMatch(/did not keep the object in place|shifted/);
@@ -84,10 +93,30 @@ describe('geometry-locked AI completion', () => {
   });
 
   it('rejects a hole left as the green ground', async () => {
-    const l = await layer(), req = (await lockedRequest(l.png, l.hole, 'Refrigerator'))!;
+    const l = await layer(), req = (await lockedRequest(l.png, l.hole, 'Refrigerator', provider))!;
     const r = await lockedCompletion(await answer(req, (x, y) => (hidden(x, y) ? undefined : truth(x, y))), l.png, req, l.hole);
     expect(r.gate.accepted).toBe(false);
     expect(r.gate.reasons.join(' ')).toContain('unfilled');
     expect(r.png.equals(l.png)).toBe(true);
+  });
+
+  it('rejects a bright fill with a bad seam even when the verified surrounding pixels are correct', async () => {
+    const l = await layer(), req = (await lockedRequest(l.png, l.hole, 'Refrigerator', provider))!;
+    const r = await lockedCompletion(await answer(req, (x, y) => hidden(x, y) && truth(x, y) ? [250, 250, 250] : truth(x, y)), l.png, req, l.hole);
+    expect(r.gate.accepted).toBe(false);
+    expect(r.gate.reasons.join(' ')).toMatch(/seam|different tone/);
+    expect(r.png.equals(l.png)).toBe(true);
+  });
+
+  it('retains soft-edge RGBA exactly even when that edge is inside the repair mask', async () => {
+    const l = await layer(), i = (211 * W + 105) * 4;
+    l.px.set([143, 143, 147, 128], i);
+    l.png = await sharp(l.px, { raw: { width: W, height: H, channels: 4 } }).png().toBuffer();
+    const req = (await lockedRequest(l.png, l.hole, 'Refrigerator', provider))!;
+    const r = await lockedCompletion(await answer(req, (x, y) => truth(x, y)), l.png, req, l.hole);
+    expect(r.gate.accepted).toBe(true);
+    const out = await sharp(r.png).ensureAlpha().raw().toBuffer();
+    expect(out.subarray(i, i + 4)).toEqual(l.px.subarray(i, i + 4));
+    for (let j = 3; j < out.length; j += 4) expect(out[j]).toBe(l.px[j]);
   });
 });

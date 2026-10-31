@@ -42,6 +42,7 @@ import { liveVariationPlanner, type ProductVariationPlanner } from './protectedT
 import { liveReusePlacementPlanner, type ReusePlacementPlanner } from './protectedTemplates/product/reusePlacement.js';
 import { liveReuseComposer, type ReuseComposer } from './protectedTemplates/product/reuseCompose.js';
 import { liveRatioRegenerator, type RatioRegenerator } from './protectedTemplates/product/ratioRegeneration.js';
+import { liveFluxFillRepair, type CutoutRepairProvider } from './protectedTemplates/product/fluxFillRepair.js';
 import { liveArtworkGenerator, type ArtworkGenerator } from './protectedTemplates/product/artwork.js';
 import type { SceneAnalyzer } from './creativeTemplates/smartProviders.js';
 import { localRecognizer, type WordRecognizer } from '../textRecognition/recognizer.js';
@@ -143,6 +144,8 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
   productComposer?: () => ReuseComposer | undefined;
   /** The creative regenerated in a common ratio by the image model (both workflows); default: the live one when an OpenAI key is set. */
   productRegenerator?: () => RatioRegenerator | undefined;
+  /** Refine Cutout only; defaults to FLUX Fill using the server FAL_KEY. */
+  productRepairProvider?: () => CutoutRepairProvider | undefined;
   /** The cut-out check after a decomposition (product/layerEvidence.ts, cutoutVerification.ts); default on, FRAMEFLOW_CUTOUT_VERIFICATION=0 turns it off. */
   productCutoutVerification?: () => boolean;
   /** Product with Text templates: the image model for new AI artwork of recomposed variations (used only with approval). */
@@ -231,6 +234,7 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
     placement: options.productPlacement ?? (() => (process.env.OPENAI_API_KEY ? liveReusePlacementPlanner() : undefined)),
     composer: options.productComposer ?? (() => (process.env.OPENAI_API_KEY ? liveReuseComposer() : undefined)),
     regenerator: options.productRegenerator ?? (() => (process.env.OPENAI_API_KEY ? liveRatioRegenerator() : undefined)),
+    repairProvider: options.productRepairProvider ?? liveFluxFillRepair,
     cutoutVerification: options.productCutoutVerification ?? (() => process.env.FRAMEFLOW_CUTOUT_VERIFICATION !== '0') }) });
 
   router.get('/runs/:id/diagnostics', async (req, res, next) => {

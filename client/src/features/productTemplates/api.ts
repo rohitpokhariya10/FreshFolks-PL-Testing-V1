@@ -200,7 +200,7 @@ export interface ReuseStudioView {
   regeneration?: RegenerationInfo;
 }
 /** Refine Cutout: what one AI repair sends and may cost; a refined picture to compare (local: what was cleaned; ai: the request's model and cost). */
-export interface RefineInfo { available: boolean; model: string; offline: boolean; size: { width: number; height: number }; estimateUsd: number }
+export interface RefineInfo { provider: string; reason?: string; available: boolean; model: string; offline: boolean; size: { width: number; height: number }; estimateUsd: number }
 export interface RefineResult { before: string; file: string; width: number; height: number; requests: number; removedPixels?: number; filledPixels?: number; defringedPixels?: number; rebuiltPixels?: number; defectPixels?: number; hiddenPixels?: number; differingPixels?: number; foreignPixels?: number; keptPixels?: number; clearedPixels?: number; unrepairedPixels?: number; model?: string; offline?: boolean; size?: { width: number; height: number }; estimateUsd?: number; costUsd?: number; requestId?: string;
   /** Geometry-locked AI completion: the automatic check, and whether it rejected the result (the layer is then kept). */
   gate?: { accepted: boolean; reasons: string[]; holePixels: number; filledPixels: number }; rejected?: boolean }

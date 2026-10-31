@@ -8,16 +8,16 @@
 import { randomBytes } from 'node:crypto';
 import sharp from 'sharp';
 import {
-  creativeFromSnapshot, fitToSlot, regenEstimateUsdForSize, isMasterCategory, isOfferFont, offerWeights, PRODUCT_CREATIVE_LIMITS, PRODUCT_CREATIVE_SCHEMA_VERSION, PRODUCT_OBJECT_KINDS, validCreativeElementId,
+  creativeFromSnapshot, fitToSlot, isMasterCategory, isOfferFont, offerWeights, PRODUCT_CREATIVE_LIMITS, PRODUCT_CREATIVE_SCHEMA_VERSION, PRODUCT_OBJECT_KINDS, validCreativeElementId,
   type CreativeImage, type CreativeShape, type CreativeText, type MasterSnapshot, type PixelRect, type ProductCreative, type ProductCreativeObject, type ProductObjectKind, type ProductSnapshot, type SourceBox,
 } from '@frameflow/shared';
 import { RunError } from '../../layerizeExperiment.js';
 import type { ProtectedStore } from '../store.js';
 import { sha256 } from '../pixels.js';
 import { cutOutUpload } from './uploadCutout.js';
-import { cutoutDefects, refineCutout, refinePrompt, refineRequest, refineResult } from './cutoutRefine.js';
+import { cutoutDefects, refineCutout } from './cutoutRefine.js';
 import { lockedCompletion, lockedRequest } from './lockedCompletion.js';
-import type { RatioRegenerator } from './ratioRegeneration.js';
+import { fluxRepairEstimateUsd, type CutoutRepairProvider } from './fluxFillRepair.js';
 import { createProductCreativeRun, existingProductCreativeRun } from './creativeRun.js';
 import { artworkBase } from './artworkText.js';
 
@@ -59,8 +59,8 @@ export interface ProductCreativeDeps {
   snapshot: (id: string, revision: number) => ProductSnapshot;
   latestRevision: (id: string) => number | undefined;
   locked: <T>(key: string, work: () => Promise<T>) => Promise<T>;
-  /** The image model (the shared regenerator) for an approved AI repair of one object's cut-out (Refine Cutout). */
-  regenerator?: () => RatioRegenerator | undefined;
+  /** The repair-only provider; resizing and other generation keep their existing regenerator. */
+  repairProvider?: () => CutoutRepairProvider | undefined;
 }
 
 export function createProductCreatives(deps: ProductCreativeDeps) {
@@ -173,40 +173,39 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
     return { before: o.asset.file, file: await refined(id, cid, r.png), width: r.width, height: r.height, removedPixels: r.removedPixels, filledPixels: r.filledPixels, defringedPixels: r.defringedPixels, rebuiltPixels: r.rebuiltPixels, clearedPixels: r.clearedPixels, ...defectReport(d), requests: 0 };
   });
   /**
-   * The AI repair's request: with known defects, geometry-locked (lockedCompletion.ts: a crop round them, a real edit mask,
-   * the model's pixels kept only inside them, then checked); without, the whole cut-out on the plain ground (refineRequest).
+   * The existing geometry-locked crop, with FLUX's white-means-edit mask. No whole-object fallback without evidence.
    */
-  const aiRepairRequest = async (png: Buffer, label: string, d: Awaited<ReturnType<typeof defectsOf>>) => (d ? await lockedRequest(png, repairOf(d)!, label) : undefined) ?? await refineRequest(png, repairOf(d));
+  const aiRepairRequest = async (png: Buffer, label: string, d: Awaited<ReturnType<typeof defectsOf>>) => d ? lockedRequest(png, repairOf(d)!, label, 'flux') : undefined;
+  const noRepairRegion = 'A reliable missing region with visible reference pixels could not be identified within the existing outline, or its crop exceeds 4096 px per side. Use the free clean-up or an authentic product cutout; no AI request was sent.';
   /** What one AI repair of this object sends and may cost (shown before it is approved). */
   const refineEstimate = async (id: string, cid: string, objectId: string) => {
-    const { c, o, png } = refinable(id, cid, objectId), r = deps.regenerator?.(), { size } = await aiRepairRequest(png, o.label, await defectsOf(id, c, o, png));
-    return { available: !!r, model: r?.model ?? '', offline: r?.offline ?? true, size, estimateUsd: r && !r.offline ? regenEstimateUsdForSize(size) : 0 };
+    const { c, o, png } = refinable(id, cid, objectId), r = deps.repairProvider?.(), place = await aiRepairRequest(png, o.label, await defectsOf(id, c, o, png));
+    return { available: !!r && !!place, provider: 'fal.ai', model: r?.model ?? '', offline: r?.offline ?? true, size: place?.size ?? { width: 0, height: 0 }, estimateUsd: r && !r.offline && place ? fluxRepairEstimateUsd(place.size) : 0,
+      ...(!place ? { reason: noRepairRegion } : !r ? { reason: 'AI repair needs FAL_KEY on the server. Use the free clean-up.' } : {}) };
   };
   /**
    * One approved AI repair (one request, never retried, no other candidate): the result to compare with the current
    * picture. The creative is not changed — a failure leaves it exactly as it was.
    */
   const refineWithAi = (id: string, cid: string, objectId: string, input: { approveUsd?: unknown }) => locked(`${id}:${cid}`, async () => {
-    const { c, o, png } = refinable(id, cid, objectId), r = deps.regenerator?.() ?? fail('NOT_CONFIGURED', 'AI repair is not available on this server (no OpenAI key is configured). Use the free clean-up.');
-    const d = await defectsOf(id, c, o, png), place = await aiRepairRequest(png, o.label, d), locked = 'crop' in place ? place : undefined, estimateUsd = r.offline ? 0 : regenEstimateUsdForSize(place.size);
-    if (estimateUsd && !(typeof input.approveUsd === 'number' && input.approveUsd + 1e-8 >= estimateUsd)) fail('APPROVAL_REQUIRED', `Repairing ${o.label} with AI sends one request to ${r.model} (${place.size.width} × ${place.size.height}), at most about $${estimateUsd.toFixed(2)}. Approve the cost first.`, { estimateUsd });
+    const { c, o, png } = refinable(id, cid, objectId), r = deps.repairProvider?.() ?? fail('NOT_CONFIGURED', 'AI repair is not available on this server (FAL_KEY is not configured). Use the free clean-up.');
+    const d = await defectsOf(id, c, o, png), place = await aiRepairRequest(png, o.label, d) ?? fail('REPAIR_REGION_UNKNOWN', noRepairRegion), estimateUsd = r.offline ? 0 : fluxRepairEstimateUsd(place.size);
+    if (estimateUsd && !(typeof input.approveUsd === 'number' && Number.isFinite(input.approveUsd) && input.approveUsd + 1e-8 >= estimateUsd)) fail('APPROVAL_REQUIRED', `Repairing ${o.label} with AI sends one request to ${r.model} (${place.size.width} × ${place.size.height}), at most about $${estimateUsd.toFixed(2)}. Approve the cost first.`, { estimateUsd });
     const op = randomBytes(4).toString('hex'), save = (f: string, v: object) => store.write(id, `pcr-${cid.slice(3)}-${op}-${f.replace(/\.json$/i, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase().slice(0, 40)}.json`, Buffer.from(JSON.stringify(v, null, 2)));
-    let out: Awaited<ReturnType<RatioRegenerator['regenerate']>>;
-    try { out = await r.regenerate({ image: place.image, prompt: locked ? locked.prompt : refinePrompt(o.label, !!d), size: place.size, ...(locked ? { mask: locked.mask } : {}) }, save, op); }
-    catch (error) { fail('PROVIDER_FAILED', `The AI repair did not complete: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}. Nothing was retried; ${o.label} is unchanged.`, { estimateUsd }); }
-    const cost = { model: r.model, offline: r.offline, size: place.size, estimateUsd, ...(out.costUsd !== undefined ? { costUsd: out.costUsd } : {}), ...(out.requestId ? { requestId: out.requestId } : {}) };
-    if ('crop' in place) {
-      // Checked before it is offered: a rejected result is kept to look at (pcx-: never applicable), the layer unchanged.
-      const g = await lockedCompletion(out.image, png, place, repairOf(d)!), m = await sharp(png).metadata();
-      const file = g.gate.accepted ? await refined(id, cid, g.png) : (() => { const f = `pcx-${cid.slice(3)}-${sha256(g.candidate).slice(0, 12)}.png`; if (!store.has(id, f)) store.write(id, f, g.candidate); return f; })();
-      const usage = { ...cost, file, ...defectReport(d), unrepairedPixels: g.gate.unfilledPixels, gate: g.gate, rejected: !g.gate.accepted };
-      save('ai-repair.json', usage);
-      return { before: o.asset.file, ...usage, width: m.width ?? 1, height: m.height ?? 1, requests: 1 };
+    let out: Awaited<ReturnType<CutoutRepairProvider['repair']>>;
+    try {
+      out = await r.repair(place, save, op);
+      const m = await sharp(out.image).metadata();
+      if (m.format !== 'png' || m.width !== place.size.width || m.height !== place.size.height) throw new Error('The repair output changed the request dimensions or was not PNG.');
     }
-    const res = await refineResult(out.image, png, place, repairOf(d)), file = await refined(id, cid, res.png);
-    const usage = { ...cost, file, ...defectReport(d), clearedPixels: res.clearedPixels, unrepairedPixels: res.unrepairedPixels };
+    catch (error) { fail('PROVIDER_FAILED', `The AI repair did not complete: ${(error instanceof Error ? error.message : String(error)).slice(0, 300)}. Nothing was retried; ${o.label} is unchanged.`, { estimateUsd }); }
+    const cost = { model: r.model, offline: r.offline, size: place.size, estimateUsd, ...(out.requestId ? { requestId: out.requestId } : {}) };
+    // Checked before it is offered: a rejected result is kept to look at (pcx-: never applicable), the layer unchanged.
+    const g = await lockedCompletion(out.image, png, place, repairOf(d)!), m = await sharp(png).metadata();
+    const file = g.gate.accepted ? await refined(id, cid, g.png) : (() => { const f = `pcx-${cid.slice(3)}-${sha256(g.candidate).slice(0, 12)}.png`; if (!store.has(id, f)) store.write(id, f, g.candidate); return f; })();
+    const usage = { ...cost, file, ...defectReport(d), unrepairedPixels: g.gate.unfilledPixels, gate: g.gate, rejected: !g.gate.accepted };
     save('ai-repair.json', usage);
-    return { before: o.asset.file, ...usage, width: res.width, height: res.height, requests: 1 };
+    return { before: o.asset.file, ...usage, width: m.width ?? 1, height: m.height ?? 1, requests: 1 };
   });
   /** The refined picture, looked at and approved, in place of the object's: a new revision (the previous ones kept); nothing else changes. */
   const applyRefinement = (id: string, cid: string, objectId: string, input: { expectedRevision?: unknown; file?: unknown; approved?: unknown }) => locked(`${id}:${cid}`, async () => {
