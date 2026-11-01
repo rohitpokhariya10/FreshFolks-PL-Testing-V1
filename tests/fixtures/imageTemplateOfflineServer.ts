@@ -98,6 +98,8 @@ const imageUsage = { input_tokens: 1867, input_tokens_details: { image_tokens: 1
 const plannerUsage = { input_tokens: 3376, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 3373 }, output_tokens: 4835, output_tokens_details: { reasoning_tokens: 1552 } };
 const referenceUsage = { input_tokens: 2616, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1937 };
 const callCounts = { openai: 0, fal: 0, seedream: 0 };
+/** AI layer edits whose prompt contains "hold test" wait here until a test releases them by prompt text. */
+const heldLayerEdits: { prompt: string; release: () => void }[] = [];
 const generate = async (request: { size: string; prompt: string; image?: File | File[]; mask?: File }) => {
   callCounts.openai++;
   const images = request.image ? Array.isArray(request.image) ? request.image : [request.image] : [];
@@ -483,11 +485,17 @@ const router = createLayerizeRouter({
   // Product with Text templates: the fixture poster's words (no OCR), the fixture's vision answer and a fake cut-out service, each counted.
   productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, layerEditor: () => ({ model: 'offline-layer-editor', offline: true, async regenerate({ image, prompt }) {
     callCounts.openai++; events.push({ kind: 'generation', source: digest(image), inputs: [digest(image)], prompt, size: '1024x1024' });
+    if (prompt.includes('invalid parameter test')) throw Object.assign(new Error('private provider response'), { status: 400, code: 'invalid_value', param: 'background', request_id: 'req_offline_rejection' });
     if (prompt.includes('slow test')) await new Promise(resolve => setTimeout(resolve, 1500));
-    const person = prompt.includes('Raise'), body = person
+    if (prompt.includes('hold test')) await new Promise<void>(release => heldLayerEdits.push({ prompt, release }));
+    if (prompt.includes('balance test')) throw Object.assign(new Error('private provider response'), { status: 429, code: 'insufficient_quota', request_id: 'req_offline_quota' });
+    const edit = prompt.split('Requested edit: ').at(-1) ?? '', person = prompt.includes('Raise'), body = person
       ? '<circle cx="512" cy="280" r="60" fill="#a96848"/><path d="M440 340 H580 L770 125 L820 165 L610 440 V850 H430 V450 L300 540 L270 490 Z" fill="#3b82f6"/>'
+      : /close.*door/i.test(edit) ? '<rect x="390" y="210" width="244" height="600" rx="16" fill="#94a3b8"/><path d="M512 230 V790 M410 500 H614" stroke="#334155" stroke-width="12"/>'
+      : /change.*colou?r/i.test(edit) ? '<rect x="390" y="210" width="244" height="600" rx="28" fill="#dc2626"/><path d="M512 230 V790 M410 500 H614" stroke="#0f172a" stroke-width="12"/>'
       : '<path d="M132 300 L392 232 H632 L892 300 V740 L632 792 H392 L132 740 Z" fill="#9e6847"/><rect x="410" y="270" width="204" height="490" fill="#334155"/>';
-    return { image: await svgPng(1024, 1024, body), costUsd: 0, requestId: 'offline-layer-edit' };
+    const ground = prompt.match(/completely flat (#[0-9a-f]{6}) background/)?.[1];
+    return { image: await svgPng(1024, 1024, `${ground ? `<rect width="1000" height="1000" fill="${ground}"/>` : ''}${body}`), costUsd: 0, requestId: 'offline-layer-edit' };
   } }), productRegenerator: () => ratioRegenerator, productArtwork: () => productArtwork,
   templatesDir: join(root, 'creative-templates'), executionsDir: join(root, 'executions'),
   inspector: () => ({ model: 'gpt-5.6-luna', inspect: async (_bytes, _mime, save) => {
@@ -615,6 +623,13 @@ app.get('/__test__/extractions', (req, res) => res.json({ count: submitted.filte
 app.get('/__test__/call-counts', (_req, res) => res.json(callCounts));
 // Image requests whose prompt carries a test's own token: an exact count even while other specs share this server.
 app.get('/__test__/image-calls', (req, res) => res.json({ count: events.filter(e => e.kind === 'generation' && e.prompt?.includes(String(req.query.contains ?? '\u0000'))).length }));
+// AI layer edits held by a "hold test" prompt: count them, or release them, by the test's own prompt text.
+app.get('/__test__/layer-edits-held', (req, res) => res.json({ count: heldLayerEdits.filter(h => h.prompt.includes(String(req.query.contains ?? '\u0000'))).length }));
+app.post('/__test__/layer-edits-release', (req, res) => {
+  const contains = String(req.query.contains ?? '\u0000'), released = heldLayerEdits.filter(h => h.prompt.includes(contains));
+  for (const h of released) { heldLayerEdits.splice(heldLayerEdits.indexOf(h), 1); h.release(); }
+  res.json({ released: released.length });
+});
 app.get('/__test__/reference-events', (req, res) => res.json(events.filter(event => event.source === String(req.query.source))));
 app.get('/__test__/offer-reference.png', async (req, res) => {
   const seed = String(req.query.seed ?? ''), color = createHash('sha256').update(seed).digest('hex').slice(0, 6);

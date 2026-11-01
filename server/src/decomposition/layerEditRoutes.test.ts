@@ -38,7 +38,8 @@ it('resolves a real creative object, enforces access/type/revision/hash, and nev
     const quote = await post('/estimate', input); expect(quote.status).toBe(200);
     const response = await post('', input); expect(response.status).toBe(200);
     const candidate = await response.json() as LayerEditCandidate;
-    expect(regenerate.mock.calls[0][0]).toMatchObject({ background: 'transparent', prompt: expect.stringContaining('Refrigerator') });
+    expect(regenerate.mock.calls[0][0]).toMatchObject({ prompt: expect.stringContaining('Refrigerator') });
+    expect(regenerate.mock.calls[0][0]).not.toHaveProperty('background');
     expect((await post('', input)).status).toBe(409); expect(regenerate).toHaveBeenCalledTimes(1);
     expect((await s.call<ProductCreative>(`/${id}/creatives/${c.id}`)).body).toEqual(c);
     expect((await post(`/${candidate.operationId}/apply`, {})).status).toBe(200);

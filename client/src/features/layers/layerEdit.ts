@@ -11,7 +11,14 @@ export function editableLayer(variant: DesignVariant, layer: DesignLayer): { tar
     return { target: { kind: 'run', runId: layer.source.jobId, layerId: layer.source.layerId } };
   return { reason: 'Open this object from a saved product creative or a decomposition run to verify its source.' };
 }
-export const layerEditSnapshot = (variant: DesignVariant, layer: DesignLayer) => JSON.stringify([variant.id, variant.revision, variant.creative, layer]);
+/** Image/placement and owning creative identify the source. Save acknowledgements and unrelated document revisions do not. */
+export const layerEditSnapshot = (variant: DesignVariant, layer: DesignLayer) => {
+  const creative = variant.creative;
+  return JSON.stringify([variant.id, variant.canvas, creative ? [creative.masterId, creative.creativeId, creative.product, creative.scale] : null, layer]);
+};
+/** Keep an already pending request from the previous client recoverable, without weakening its original checks. */
+export const matchesLayerEditSnapshot = (snapshot: string, variant: DesignVariant, layer: DesignLayer) =>
+  snapshot === layerEditSnapshot(variant, layer) || snapshot === JSON.stringify([variant.id, variant.revision, variant.creative, layer]);
 /** Konva rotates about the top-left. Keep the visible centre fixed when replacing a trimmed, expanded silhouette. */
 export function editedLayerGeometry(layer: DesignLayer, g: LayerEditCandidate['geometry']) {
   const width = layer.width * g.width, height = layer.height * g.height;

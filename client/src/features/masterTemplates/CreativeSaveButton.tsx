@@ -13,6 +13,7 @@ import { masterApi } from './api';
 import { creativeFromEditor, isCreativeVariant } from './creativeDocument';
 import { saveProductVariant } from '../productTemplates/productEditor';
 import { productApi } from '../productTemplates/api';
+import { LAYER_PREVIEW_NOTICE, useLayerEditPreview } from '../layers/LayerEditPreview';
 
 /** Pictures already uploaded in this session (editor asset id → creative asset), so a second save does not send them again. */
 const uploaded = new Map<string, { asset: Awaited<ReturnType<typeof masterApi.uploadAsset>>['asset'] }>();
@@ -39,10 +40,12 @@ export async function saveVariantToCreative(variant: Parameters<typeof creativeF
 }
 
 export function CreativeSaveButton() {
+  const { preview } = useLayerEditPreview();
   const variant = useAppSelector(selectActiveVariant), designId = useAppSelector(state => state.editor.document.id), dispatch = useAppDispatch();
   const [state, setState] = useState<{ busy: boolean; message: string; error: boolean }>({ busy: false, message: '', error: false });
   if (!isCreativeVariant(variant)) return null;
   const save = async (master = false) => {
+    if (preview) return;
     setState({ busy: true, message: '', error: false });
     let savedRevision: number | undefined;
     try {
@@ -60,10 +63,10 @@ export function CreativeSaveButton() {
     } catch (e) { setState({ busy: false, message: `${master && savedRevision ? `Creative revision ${savedRevision} was saved, but the master was not changed. ` : ''}${e instanceof Error ? e.message : 'Could not save the creative.'}`, error: true }); }
   };
   return <div className="creative-save">
-    <button className="button" disabled={state.busy} aria-busy={state.busy} title="Save this version's text, objects, logos and shapes as a creative revision." onClick={() => void save()}>
+    <button className="button" disabled={state.busy || !!preview} aria-busy={state.busy} title={preview ? LAYER_PREVIEW_NOTICE : "Save this version's text, objects, logos and shapes as a creative revision."} onClick={() => void save()}>
       <CloudUpload size={15} aria-hidden="true" />{state.busy ? 'Saving…' : 'Save creative'}
     </button>
-    {variant.creative.product && variant.creative.masterEditing && <button className="button" disabled={state.busy} onClick={() => void save(true)}>Save Master Template</button>}
+    {variant.creative.product && variant.creative.masterEditing && <button className="button" disabled={state.busy || !!preview} title={preview ? LAYER_PREVIEW_NOTICE : undefined} onClick={() => void save(true)}>Save Master Template</button>}
     {state.message && <span className={state.error ? 'creative-save-error' : 'creative-save-ok'} role={state.error ? 'alert' : 'status'}>{state.message}</span>}
   </div>;
 }

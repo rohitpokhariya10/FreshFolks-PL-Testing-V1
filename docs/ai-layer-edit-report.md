@@ -1,6 +1,6 @@
 # FrameFlow AI Layer Editing — completion report
 
-Verified on 1 November 2026. Implementation complete; offline verification complete. No real paid image-edit request was made. Real model fidelity, identity preservation and edge quality remain unverified.
+Verified on 1 November 2026. Implementation complete; offline verification complete. No real paid image-edit request was made by the agent. A subsequent user live attempt returned HTTP 400 (`invalid_value`); see the compatibility correction below. Real model fidelity, identity preservation and edge quality remain unverified.
 
 ## Git and recovery
 
@@ -21,7 +21,7 @@ The server resolves the image from the saved creative/object/revision or curated
 
 The actual selected image is cropped to its visible alpha bounds and placed with expansion room in a 1024 × 1024 reference canvas. The shared OpenAI `images.edit` adapter sends this reference, the user's instruction and generic identity-preservation instructions. The prompt asks to keep recognizable design, branding, color, texture, face/clothes, style, lighting and perspective except where the instruction changes them. No entire poster, text-only generation, FLUX repair, segmentation service or extra paid cleanup is used.
 
-Only this feature opts into `background: "transparent"`. Existing adapter callers omit the new optional field and retain their previous settings. PNG output is decoded and validated; native alpha is accepted, or the existing local plain-background cutout utility is used. Empty, corrupt, wrong-size, clipped, substantial detached-object and remaining-chroma outputs are rejected. Semantic identity and aesthetic quality still require human preview; these checks cannot prove that the model drew the correct object.
+The edit omits `background` and asks for the object on a flat colour selected to differ from the source object. The existing local plain-background cutout utility produces the transparent PNG without another provider call. Native alpha is still accepted if returned. Existing adapter callers retain their previous settings. Empty, corrupt, wrong-size, clipped, substantial detached-object and remaining-chroma outputs are rejected. Semantic identity and aesthetic quality still require human preview; these checks cannot prove that the model drew the correct object.
 
 The full candidate silhouette is retained. Its dimensions follow reference pixel scale and can grow beyond the original cutout. The visible centre remains the anchor; the existing Konva top-left rotation convention determines the new origin. Apply preserves rotation, opacity, layer ID and stacking order. It does not fit the result back into the original silhouette. Expanded content can overlap neighbours or extend beyond the canvas; use the existing position/size controls after review.
 
@@ -30,6 +30,63 @@ Generate produces a Before/After candidate without changing the document or crea
 The UI prevents duplicate clicks and requires fresh approval for regeneration. Durable operation IDs prevent repeat submission after reconnect/restart. Check request status reads the existing result without calling AI. Timeouts/network interruptions are marked uncertain and never automatically retried. Switching selection discards late results; changed geometry, assets or creative state disable stale Apply. Storage failure preserves the original and lets Apply be retried without generation.
 
 Discard removes the pending image without creating a creative revision. Abandoned previews expire after one day; applied server reference copies expire after seven days. Small operation records remain for idempotency. The browser image and saved creative revisions use the existing persistence system; save an applied edit before relying on it long term.
+
+## Live Before/After canvas comparison
+
+Once the candidate has been decoded and checked, **After — AI Edited** is selected automatically. Both thumbnails are keyboard-accessible buttons with a selected border and checkmark. Selecting **Before — Original** restores the original bitmap and geometry; selecting After replaces that one Konva node's bitmap and uses the same expanded bounds and rotated centre anchor as Apply. It never adds an overlapping duplicate layer. Other layers keep their render order, pixels and geometry.
+
+`LayerEditPreviewProvider` holds only temporary React state and a decoded image. No preview action enters the Redux document, undo history, localStorage or IndexedDB. Each candidate is decoded once; toggling is local and makes no API calls. Failed decoding keeps the original canvas and disables Apply. Native image transparency is retained by the renderer; this enhancement does not change the provider or background-removal code.
+
+Apply is enabled only when After is selected and the source is still current. It reuses the existing single undoable image-and-bounds commit. Discard immediately selects Before, then releases the candidate after the existing discard request completes. Save creative, Save Master Template and Export PNG are disabled during comparison, with an explanation beside the canvas. Apply or Discard restores those actions; exports always use accepted document data.
+
+Dragging and transform handles for the compared object are disabled during preview. Inspector changes, other document edits, Undo or Redo end the canvas override and invalidate the candidate; undoing back to the earlier geometry does not reactivate a stale preview. Selection changes/deselection clear the override and discard the abandoned request. Switching designs unmounts the preview provider. Reload starts with committed pixels only; request recovery remains a deliberate status check and never applies automatically. Zoom and comparison toggles do not change the document.
+
+Two defects found during browser verification were corrected: the canvas notice now overlays the heading so it cannot resize the viewport or trigger automatic zoom; unmount cleanup waits one microtask to distinguish React development StrictMode's simulated unmount from leaving the selected layer. A real unmount still discards an abandoned operation, while reloading and explicitly checking status can recover the saved candidate. An active layer comparison also takes precedence over a retained whole-design AI preview.
+
+### Exact files for this canvas-preview continuation
+
+| File | Change |
+| --- | --- |
+| `client/src/features/layers/LayerEditPreview.tsx` (new) | Temporary React context, source/version guard and render-only geometry override. |
+| `client/src/features/layers/LayerEditPreview.test.ts` (new) | Preview isolation, geometry, restoration, selection and source-version tests. |
+| `client/src/features/layers/LayerEditPanel.tsx` | Selectable Before/After, decoded-image validation/cancellation, current-source Apply and StrictMode-safe recovery cleanup. |
+| `client/src/features/layers/layerEdit.css` | Selected thumbnail states and canvas notice without viewport resizing. |
+| `client/src/features/canvas/CanvasWorkspace.tsx` | Connect the override to both existing layer render paths and display the comparison notice. |
+| `client/src/features/canvas/DesignLayerNode.tsx` | Replace the bitmap in the same Konva image node; preserve stack, opacity, rotation and anchor. |
+| `client/src/features/editor/EditorShell.tsx` | Scope the preview provider to the open editor/document. |
+| `client/src/features/export/ExportButton.tsx` | Block unresolved comparison export with Apply/Discard guidance. |
+| `client/src/features/masterTemplates/CreativeSaveButton.tsx` | Apply the same guard to creative/master saving. |
+| `tests/e2e-image-templates/ai-layer-edit.spec.ts` | Real Konva pixel tests, persistence/export/navigation, double Apply, failed/missing/late decoding and optional dev-client verification. |
+| `docs/ai-layer-edit-report.md` | Current implementation, exact files, evidence and usage. |
+
+The seven other dirty files are the preserved compatibility fix and were **not changed by this continuation**: `client/src/features/layers/layerEditApi.ts`, `server/src/decomposition/layerEdit.ts`, `server/src/decomposition/layerEditImage.ts`, `server/src/decomposition/layerEdit.test.ts`, `server/src/decomposition/layerEditProvider.test.ts`, `server/src/decomposition/layerEditRoutes.test.ts`, and `tests/fixtures/imageTemplateOfflineServer.ts`. Their SHA-256 hashes match the pre-preview manifest. The earlier changes in the three shared panel/test/report files remain present too.
+
+### Final canvas-preview verification — 1 November 2026
+
+| Check | Confirmed result |
+| --- | --- |
+| Focused preview/editor/geometry/export unit tests, 6 files | **46 passed, 0 failed** |
+| API, trusted source, decomposition import and browser-persistence regression tests, 7 files | **56 passed, 0 failed** |
+| Production desktop browser suite, including existing layers and Refine Cutout | **13 passed, 0 failed** |
+| Development StrictMode: canvas comparison, navigation/reload/status recovery, late decoding | **3 passed, 0 failed** |
+| Laptop: wider rotated refrigerator and taller character | **2 passed, 0 failed** |
+| TypeScript, ESLint, production build, `git diff --check` | **Passed**; Vite emits only its bundle-size advisory |
+
+There are **102 distinct unit/API tests** and **18 passing browser executions covering 13 distinct scenarios** in these final runs. Earlier failing runs exposed the viewport-zoom and development recovery issues described above; the corrected runs have no failures. The reload test also waits for the existing debounced autosave before recording its baseline.
+
+The browser checks inspect the real Konva nodes and pixel data, verify exactly one image per object, compare all unrelated layers, check expanded transparent geometry and rotation/opacity/anchor, and compare exported PNG pixels. They verify repeated keyboard toggles make no API requests or history/persistence changes; Before disables Apply; duplicate Apply clicks produce one undo step; Discard restores exact pixels; Undo/Redo, second editing, save/reload/export, deletion, selection, navigation and stale source checks work. Corrupt, empty and delayed image results leave the committed image intact. Before/After screenshots were visually inspected. Test image content is synthetic; no claim about new real-model output quality is made.
+
+Evidence logs: `/private/tmp/frameflow-canvas-preview-{unit,api,browser,dev,laptop,typecheck,lint,build}.log`. Browser artifacts are under `test-results/ai-canvas-preview-{desktop,dev,laptop}/`, including `before-on-canvas.png`, `after-on-canvas.png`, and original/discarded exports. No paid API calls were made. Before/After switching costs **$0**.
+
+Reproduce the main browser run after `npm run build`:
+
+```sh
+env OPENAI_API_KEY= FAL_KEY= GEMINI_API_KEY= CLOUDFLARE_API_TOKEN= FRAMEFLOW_OFFLINE_E2E_PORT=3351 npx playwright test -c playwright.offline.config.ts tests/e2e-image-templates/ai-layer-edit.spec.ts tests/e2e/layers.spec.ts tests/e2e-image-templates/refine-cutout.spec.ts --project=desktop --workers=1 --output=test-results/ai-canvas-preview-desktop
+```
+
+For StrictMode verification, an isolated Vite client was started with `FRAMEFLOW_CLIENT_PORT=3353 FRAMEFLOW_API_URL=http://127.0.0.1:3352 npm run dev -w @frameflow/client`. The same tests ran with `FRAMEFLOW_OFFLINE_E2E_PORT=3352 FRAMEFLOW_E2E_DEV_CLIENT=http://127.0.0.1:3353` and `--grep 'Before/After replace|selection, deselection|late candidate'`. Only client assets came from Vite; all API traffic stayed on the fake server. The isolated client was stopped afterward. The laptop run used port 3354, `--project=laptop --grep 'Before/After replace|character pose'`.
+
+Final Git state: `feat/ai-object-edit`, HEAD `6c0a271f2c73d308a21b038a77d27bcc9182f0bb`, **16 modified tracked files and 2 new untracked files**, all uncommitted and unstaged. No commit, push, merge, reset, branch switch or worktree creation occurred in this continuation. `main`, `feat/flux-fill-repair` and the recovery stash `0b4d3a3da345e8361cea9c2e963241d787ac10a8` remain unchanged. Environment files, saved creatives/candidates and generated images were not changed by this work.
 
 ## API
 
@@ -47,7 +104,7 @@ Prompts are limited to 1,000 characters; JSON requests are bounded; reference im
 
 ## Pricing and provider support
 
-Default live model: **OpenAI GPT Image 2**, 1024 × 1024, high quality, one output PNG, native transparency requested. The dated `gpt-image-2-2026-04-21` ID is also recognized. Other live model configurations are disabled for this feature until their pricing is verified.
+Default live model: **OpenAI GPT Image 2**, 1024 × 1024, high quality, one output PNG, with local background removal. The dated `gpt-image-2-2026-04-21` ID is also recognized. Other live model configurations are disabled for this feature until their pricing is verified.
 
 The displayed estimate reuses the project's helper:
 
@@ -58,11 +115,17 @@ The displayed estimate reuses the project's helper:
 
 This is an estimate, not a billing cap or guaranteed charge. Actual token usage can differ; usage-derived cost is shown when returned by the provider. The UI names the model, asks explicit approval for each generation, and explains that failed or discarded results can still be billed. Apply, Discard, movement, resize, Save and Export do not call AI. FLUX repair pricing is not used by this feature.
 
-Official references checked during implementation: [image output costs and input fidelity](https://developers.openai.com/api/docs/guides/image-generation), [token pricing](https://developers.openai.com/api/docs/pricing), and [image edits parameters](https://developers.openai.com/api/reference/resources/images/methods/edit). The API reference describes GPT Image 2 transparency support as **preview**. If a real request rejects that option or produces an unsuitable image, the feature reports the failure; it does not submit a paid fallback automatically.
+Official references checked during implementation: [image output costs and input fidelity](https://developers.openai.com/api/docs/guides/image-generation), [token pricing](https://developers.openai.com/api/docs/pricing), and [image edits parameters](https://developers.openai.com/api/reference/resources/images/methods/edit). The API reference describes GPT Image 2 transparency support as **preview**. The feature no longer depends on that option. A failed generation or unsuitable image is reported without an automatic retry or a second paid cleanup call.
+
+### HTTP 400 compatibility correction
+
+The user's saved live operation was marked failed with `HTTP 400 (invalid_value)`. Its original record did not retain the rejected parameter or raw provider response, so the exact cause cannot be recovered from that record. The compatibility correction removes the preview transparency request and explicitly asks for the already-supported local cutout background. Future failures retain only allowlisted status, code, parameter and request ID; raw provider messages, request bodies and credentials are excluded. The duplicate retry warning is removed, and a confirmed failed response directs the user to Discard before starting a separately approved attempt. The original operation record is preserved. No live generation was made to test this correction.
+
+Correction verification: 23 distinct focused unit/API tests passed (the adapter test was rerun after fixing its fixture ID); all four desktop browser cases passed, including plain-background output through Save/reload/export and a simulated HTTP 400 through status/Discard. Typecheck, lint and production build passed. These changes remain uncommitted on `feat/ai-object-edit`; the feature commit and recovery stash are unchanged.
 
 **Paid calls during implementation and verification: zero.** All generation seen in tests/screenshots came from injected offline fixtures.
 
-## Verification
+## Original AI editing verification (before the canvas-preview continuation)
 
 - Selected unit/API regression run: **98 passed, 0 failed**, across 13 files.
 - Final exact-provider-request and endpoint review checks: **3 passed, 0 failed** across two files. One route test repeats the regression run; there are **100 distinct unit/API tests** across the two runs.
@@ -120,7 +183,7 @@ Provider keys were explicitly cleared for test commands; the offline browser fix
 4. Select the **Refrigerator** object from the Layers list. Show/unlock it first. If the saved creative still marks it hidden/locked, save that change before requesting an edit.
 5. In **AI Edit Layer**, enter **“Open both refrigerator doors.”** Click **Generate Edit** to review the estimate; this step makes no AI call.
 6. Check the cost approval box and click **Approve and generate**. This is the paid action, approximately $0.27 under the assumptions above.
-7. Compare **Before** and **After** on the checkerboard. Check branding, color, doors, interior, edges and identity. Choose **Apply edit** or **Discard**. **Regenerate · new approval** requires another explicit approval before another request.
+7. Click **Before — Original** and **After — AI Edited** in the right-side panel to compare the actual advertisement canvas. Switching reuses the candidate and costs $0. Check branding, color, doors, interior, edges and identity. Select After and choose **Apply edit**, or choose **Discard** to keep the original. Save/export are protected until that decision. **Regenerate · new approval** requires another explicit approval before another request. If a candidate was already generated before reloading, select the same object and use **Check request status** to retrieve it without generating again.
 8. Adjust position/size/rotation using the existing controls, then **Save creative**. Reload to check persistence and click **Export PNG**. These actions do not generate another image charge.
 
 The previous partial work can be recovered later by switching to `feat/ai-layer-edit`, locating the named stash with `git stash list`, and applying it there. Keep the stash until you have verified the restoration. Switching to the FLUX branch restores its committed repair implementation.

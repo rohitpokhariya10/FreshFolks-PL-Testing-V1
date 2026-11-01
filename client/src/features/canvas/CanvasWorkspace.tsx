@@ -14,6 +14,7 @@ import { BackgroundArtwork } from './BackgroundArtwork';
 import { VariantComparison } from '../variants/VariantComparison';
 import { formatLabel, variantLabel } from '../variants/variantLabel';
 import { useDesigns } from '../editor/designs';
+import { LAYER_PREVIEW_NOTICE, useLayerEditPreview } from '../layers/LayerEditPreview';
 
 const versionCount = (count: number) => `${count} version${count === 1 ? '' : 's'}`;
 
@@ -27,9 +28,12 @@ export function CanvasWorkspace() {
   const [others] = useState(() => library?.designs() ?? []);
   const [designError, setDesignError] = useState('');
   const current = useAppSelector(selectActiveVariant);
-  const preview = useAppSelector((state) => state.ui.activeLeftTab === 'ai' ? state.ai.preview : null);
+  const { preview: layerPreview } = useLayerEditPreview();
+  const designPreview = useAppSelector((state) => state.ui.activeLeftTab === 'ai' ? state.ai.preview : null);
+  // The active layer comparison must paint its own document, even if the AI tab retains a design preview.
+  const preview = layerPreview ? null : designPreview;
   const relative = current.sourceVariantId ? variants.find((item) => item.id === current.sourceVariantId) : variants.find((item) => item.sourceVariantId === current.id);
-  const pair = preview?.adaptation ? { source: preview.adaptation.source, target: preview.variant }
+  const pair = layerPreview ? null : preview?.adaptation ? { source: preview.adaptation.source, target: preview.variant }
     : compare && !preview && relative ? current.sourceVariantId ? { source: relative, target: current } : { source: current, target: relative } : null;
   const comparing = Boolean(pair);
   const { canvas, elements, id, background, layers } = preview?.variant ?? current;
@@ -64,6 +68,7 @@ export function CanvasWorkspace() {
       }}><option value={documentId}>{documentName} · {versionCount(variants.length)}</option>{others.map((entry) => <option key={entry.id} value={entry.id}>{entry.name} · {versionCount(entry.versions)}</option>)}</select></label>}
         {variants.length > 1 && <label>Version<select aria-label="Active version" value={current.id} onChange={(event) => { dispatch(variantSelected(event.target.value)); setCompare(false); }}>{variants.map((variant, index) => <option key={variant.id} value={variant.id}>{variantLabel(variant, index)}</option>)}</select></label>}{variants.length > 1 && relative && !preview && <button className="button" aria-pressed={compare} onClick={() => setCompare(!compare)}>{compare ? 'Back to editing' : 'Compare versions'}</button>}</div>}
       {designError && <div className="artwork-error" role="alert">{designError}</div>}
+      {layerPreview && <div className="ai-layer-canvas-notice" role="status"><strong>{layerPreview.mode === 'after' ? 'After — AI Edited' : 'Before — Original'}</strong><span>Canvas preview only. {LAYER_PREVIEW_NOTICE}</span></div>}
       {background && artworkError && <div className="artwork-error" role="alert">{artworkError}</div>}
       {pair ? <VariantComparison source={pair.source} target={pair.target} /> : <div className="canvas-viewport" ref={viewportRef} data-testid="canvas-viewport" onMouseDown={(event) => { if (event.target === event.currentTarget) { actions.select(null); focusCanvas(); } }}>
         <div className="canvas-scroll-content" onMouseDown={(event) => { if (event.target === event.currentTarget) { actions.select(null); focusCanvas(); } }}>
@@ -79,11 +84,11 @@ export function CanvasWorkspace() {
                 {!preview && interleaved
                   // Elements that carry a zIndex (a design opened from a template) are drawn in that one order, text and layers interleaved.
                   ? <Layer clipWidth={canvas.width} clipHeight={canvas.height}>{paintOrder(current).map((item) => item.kind === 'layer'
-                    ? <DesignLayerNode key={item.layer.id} layer={item.layer} selected={selectedElementId === item.layer.id} variantId={id} raiseHandles />
+                    ? <DesignLayerNode key={item.layer.id} layer={item.layer} selected={selectedElementId === item.layer.id} variantId={id} preview={layerPreview?.layerId === item.layer.id ? layerPreview : undefined} raiseHandles />
                     : <TextElementNode key={item.element.id} element={item.element} selected={selectedElementId === item.element.id} canvas={canvas} variantId={id} zoom={zoom} raiseHandles />)}</Layer>
                   // Every other design: its layers, then all its text, exactly as before.
                   : <>
-                    {!preview && layers?.length ? <Layer clipWidth={canvas.width} clipHeight={canvas.height}>{layers.map((layer) => <DesignLayerNode key={layer.id} layer={layer} selected={selectedElementId === layer.id} variantId={id} />)}</Layer> : null}
+                    {!preview && layers?.length ? <Layer clipWidth={canvas.width} clipHeight={canvas.height}>{layers.map((layer) => <DesignLayerNode key={layer.id} layer={layer} selected={selectedElementId === layer.id} variantId={id} preview={layerPreview?.layerId === layer.id ? layerPreview : undefined} />)}</Layer> : null}
                     <Layer>{elements.map((element) => preview
                       ? <StaticText key={element.id} name="preview-text" element={element} />
                       : <TextElementNode key={element.id} element={element} selected={selectedElementId === element.id} canvas={canvas} variantId={id} zoom={zoom} />)}</Layer>

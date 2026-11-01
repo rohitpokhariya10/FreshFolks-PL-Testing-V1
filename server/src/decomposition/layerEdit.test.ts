@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
+import OpenAI from 'openai';
 import { describe, expect, it, vi } from 'vitest';
-import type { LayerEditSource } from '@frameflow/shared';
+import type { LayerEditSource, LayerEditTarget } from '@frameflow/shared';
+import { RunError } from './layerizeExperiment.js';
 import type { RatioRegenerator } from './protectedTemplates/product/ratioRegeneration.js';
 import { createLayerEdits } from './layerEdit.js';
 import { layerEditPrompt, prepareLayerEdit, validateLayerEdit } from './layerEditImage.js';
@@ -24,6 +26,82 @@ async function setup(output = opened) {
   return { bytes, dir, regenerate, source, resolve, service, request };
 }
 describe('single-object image editing, fully offline', () => {
+  it('chains three trusted applied references using each exact latest image, without saving the older creative over it', async () => {
+    const s = await setup();
+    const outputs = [await opened(), await png('<rect x="390" y="210" width="244" height="600" fill="#94a3b8"/>'), await png('<rect x="390" y="210" width="244" height="600" rx="20" fill="#2563eb"/>')];
+    let bytes = s.bytes, source = s.source;
+    for (let i = 0; i < outputs.length; i++) {
+      s.regenerate.mockResolvedValueOnce({ image: outputs[i], requestId: `req_${i}` });
+      const candidate = await s.service.generate({ ...s.request, ...source, operationId: randomUUID(), prompt: ['Open doors', 'Close doors', 'Change color'][i] });
+      expect(s.regenerate.mock.calls[i][0].image).toEqual((await prepareLayerEdit(bytes)).image);
+      expect(candidate.sourceSha256).toBe(sha256(bytes));
+      await s.service.apply(candidate.operationId);
+      bytes = Buffer.from(candidate.image.base64, 'base64');
+      source = { ...s.source, sourceSha256: candidate.image.sha256, sourceCandidateId: candidate.operationId };
+      expect((await s.service.estimate(source)).sourceSha256).toBe(candidate.image.sha256);
+    }
+    expect(s.regenerate).toHaveBeenCalledTimes(3);
+    await expect(s.service.estimate({ ...source, target: { ...s.source.target, layerId: 'another-layer' } })).rejects.toThrow('Save this edited layer');
+  });
+  it('a creative save during generation does not block Apply, status or the next chained edit; a changed layer still fails', async () => {
+    const s = await setup(), name = 'Brown refrigerator';
+    // A real creative store: only its current revision resolves, holding whichever layer bytes were last saved.
+    let revision = 1, saved = s.bytes;
+    const resolve = vi.fn(async (t: LayerEditTarget) => {
+      if (t.kind === 'creative' && t.revision !== revision) throw new RunError('STALE_REVISION', 'This creative changed. Reopen its latest saved revision.');
+      return { bytes: saved, name };
+    });
+    const service = createLayerEdits({ dir: s.dir, resolve, provider: () => ({ model: 'gpt-image-2', offline: false, regenerate: s.regenerate }) });
+    const first = await service.generate(s.request); await service.apply(first.operationId);
+    const firstBytes = Buffer.from(first.image.base64, 'base64');
+    // The editor saves the creative (now holding the applied image) while the second edit is generating.
+    s.regenerate.mockImplementationOnce(async () => { revision = 2; saved = firstBytes; return { image: await png('<rect x="390" y="210" width="244" height="600" fill="#94a3b8"/>'), requestId: 'req_close' }; });
+    const second = await service.generate({ ...s.request, operationId: randomUUID(), prompt: 'Close the doors.', sourceSha256: first.image.sha256, sourceCandidateId: first.operationId });
+    await expect(service.apply(second.operationId)).rejects.toThrow('This creative changed'); // The previous false failure.
+    await expect(service.status(second.operationId)).rejects.toThrow('This creative changed');
+    expect((await service.status(second.operationId, 2)).status).toBe('candidate');
+    expect((await service.apply(second.operationId, 2)).status).toBe('applied');
+    expect(JSON.parse(readFileSync(join(s.dir, `${second.operationId}.json`), 'utf8')).source.target).toEqual({ ...s.source.target, revision: 2 });
+    // A third edit chains from the second at the saved revision, using exactly the second image.
+    const third = { ...s.source, target: { ...s.source.target, revision: 2 }, sourceSha256: second.image.sha256, sourceCandidateId: second.operationId };
+    expect((await service.estimate(third)).sourceSha256).toBe(second.image.sha256);
+    const red = await service.generate({ ...s.request, ...third, operationId: randomUUID(), prompt: 'Make it red.' });
+    expect(s.regenerate.mock.calls[2][0].image).toEqual((await prepareLayerEdit(Buffer.from(second.image.base64, 'base64'))).image);
+    // A save that changed this layer's image is still rejected, even at the newer revision.
+    revision = 3; saved = await png('<rect x="10" y="10" width="150" height="300" fill="#16a34a"/>', 200, 400);
+    await expect(service.apply(red.operationId, 3)).rejects.toThrow(/local image differs|Save this edited layer/);
+    expect(JSON.parse(readFileSync(join(s.dir, `${red.operationId}.json`), 'utf8')).status).toBe('candidate');
+    // Only the revision can move forward; an older revision keeps the recorded one.
+    await expect(service.apply(red.operationId, 1)).rejects.toThrow('This creative changed');
+    // A later save that kept this layer's (second) image is accepted.
+    revision = 4; saved = Buffer.from(second.image.base64, 'base64');
+    expect((await service.apply(red.operationId, 4)).status).toBe('applied');
+    expect(s.regenerate).toHaveBeenCalledTimes(3);
+  });
+  it('leaves no folder among the runs until the first edit request is recorded', async () => {
+    const s = await setup(), dir = join(s.dir, 'not-yet-created');
+    const service = createLayerEdits({ dir, resolve: s.resolve, provider: () => ({ model: 'gpt-image-2', offline: false, regenerate: s.regenerate }) });
+    await service.estimate(s.source); await expect(service.status(randomUUID())).rejects.toThrow('not found');
+    expect(existsSync(dir)).toBe(false);
+    const c = await service.generate(s.request);
+    expect(existsSync(join(dir, `${c.operationId}.json`))).toBe(true);
+  });
+  it('a source change while queued for a provider slot fails without a provider request or an uncertain-billing warning', async () => {
+    const s = await setup();
+    s.resolve.mockResolvedValueOnce({ bytes: s.bytes, name: 'Brown refrigerator' }).mockRejectedValueOnce(new RunError('STALE_REVISION', 'This creative changed. Reopen its latest saved revision.'));
+    await expect(s.service.generate(s.request)).rejects.toThrow('not sent to the AI provider');
+    const status = await s.service.status(s.request.operationId);
+    expect(status.status).toBe('failed'); expect(status.message).not.toMatch(/billing|charge may/i);
+    expect(s.regenerate).not.toHaveBeenCalled();
+  });
+  it('reports an exhausted provider balance once, as a definite failure, without retrying', async () => {
+    const s = await setup();
+    s.regenerate.mockRejectedValue(OpenAI.APIError.generate(429, { error: { message: 'private-provider-body', code: 'insufficient_quota' } }, '', new Headers({ 'x-request-id': 'req_quota' })));
+    await expect(s.service.generate(s.request)).rejects.toThrow('no credit left');
+    const status = await s.service.status(s.request.operationId);
+    expect(status.status).toBe('failed'); expect(JSON.stringify(status)).not.toContain('private-provider-body');
+    expect(s.regenerate).toHaveBeenCalledTimes(1);
+  });
   it('uses the exact selected reference, retains expanded doors, and only marks applied on confirmation', async () => {
     const s = await setup(), before = sha256(s.bytes), estimate = await s.service.estimate(s.source);
     expect(estimate.estimateUsd).toBe(0.27); expect(s.regenerate).not.toHaveBeenCalled();
@@ -87,6 +165,26 @@ describe('single-object image editing, fully offline', () => {
     const state = await s.service.status(s.request.operationId);
     expect(state.status).toBe('uncertain'); expect(JSON.stringify(state)).not.toContain('secret-key');
     expect(s.regenerate).toHaveBeenCalledTimes(1);
+  });
+  it('records a rejected parameter and request ID without raw provider data, duplicate warnings, or a second attempt', async () => {
+    const s = await setup();
+    s.regenerate.mockRejectedValue(OpenAI.APIError.generate(400, { error: { message: 'private-provider-body', code: 'invalid_value', param: 'background' } }, '', new Headers({ 'x-request-id': 'req_layer_rejected' })));
+    await expect(s.service.generate(s.request)).rejects.toThrow('Rejected parameter: background');
+    const status = await s.service.status(s.request.operationId);
+    expect(status.status).toBe('failed'); expect(status.candidate).toBeUndefined();
+    expect(status.message?.match(/No automatic retry was made\./g)).toHaveLength(1);
+    const record = JSON.parse(readFileSync(join(s.dir, `${s.request.operationId}.json`), 'utf8'));
+    expect(record.failure).toEqual({ status: 400, code: 'invalid_value', parameter: 'background', requestId: 'req_layer_rejected' });
+    expect(JSON.stringify(record)).not.toContain('private-provider-body');
+    await expect(s.service.generate(s.request)).rejects.toThrow('already submitted');
+    await s.service.discard(s.request.operationId);
+    expect(s.regenerate).toHaveBeenCalledTimes(1);
+  });
+  it('does not persist unrecognized parameter text', async () => {
+    const s = await setup();
+    s.regenerate.mockRejectedValue(Object.assign(new Error('private-provider-body'), { status: 400, code: 'invalid_value', param: 'private-provider-body' }));
+    await expect(s.service.generate(s.request)).rejects.toThrow('HTTP 400');
+    expect(readFileSync(join(s.dir, `${s.request.operationId}.json`), 'utf8')).not.toContain('private-provider-body');
   });
   it('times out injected providers and preserves uncertainty after restart', async () => {
     const s = await setup();

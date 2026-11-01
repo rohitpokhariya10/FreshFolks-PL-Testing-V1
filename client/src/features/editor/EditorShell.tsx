@@ -13,8 +13,13 @@ import { CreativeSaveButton } from '../masterTemplates/CreativeSaveButton';
 import { LayerInspector, LayersList } from '../layers/LayerInspector';
 import { DetectedLayersTray } from '../decomposition/DetectedLayersTray';
 import { LEGACY_IMAGE_TO_LAYERS } from '../../lib/featureFlags';
+import { LayerEditPreviewProvider } from '../layers/LayerEditPreview';
 
 export function EditorShell({ onNewDesign }: { onNewDesign: () => void }) {
+  return <LayerEditPreviewProvider><EditorContent onNewDesign={onNewDesign} /></LayerEditPreviewProvider>;
+}
+
+function EditorContent({ onNewDesign }: { onNewDesign: () => void }) {
   const variant = useAppSelector(selectActiveVariant);
   const { canvas, id: variantId } = variant;
   const selectedId = useAppSelector((state) => state.ui.selectedElementId);

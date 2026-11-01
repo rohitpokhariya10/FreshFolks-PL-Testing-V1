@@ -12,7 +12,7 @@ export const layerEditPrompt = (name: string, instruction: string, ground: strin
   'Preserve visible brand-like details, door and handle styles, face, clothing and character identity where present. Do not invent logos, model numbers or text.',
   'Change only what the user requests. For pose or articulation edits, keep the unchanged parts recognizably the same. Do not replace the object with a different model or person.',
   'Show the whole edited object, including any opened or raised parts, with space around it. Keep the unchanged body at its reference scale and centered; use the surrounding space for changed parts. Do not clip it, add unrelated objects, a scene, a floor, a cast shadow or a poster.',
-  `Return one isolated object with real transparent surroundings and transparent gaps, no checkerboard. If native alpha is unavailable, use a completely flat ${ground} background instead, no gradients or texture.`,
+  `Return one isolated object on a completely flat ${ground} background, including any visible gaps around or through the object. Use this exact solid background colour with no gradients, texture, checkerboard or shadows. The background will be removed locally to produce a transparent PNG.`,
   `Requested edit: ${instruction}`,
 ].join(' ');
 
