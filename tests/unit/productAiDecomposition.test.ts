@@ -98,7 +98,8 @@ describe('AI decomposition core: OpenAI planner → Seedream Layerize (live code
       let v = await s.detected(made.body.template.id);
       const id = v.template.id, stored = () => JSON.parse(readFileSync(join(s.protectedDir, id, 'template.json'), 'utf8'));
       v = (await s.send<View>('PUT', `/${id}/review`, { expectedRevision: v.template.revision, objects: v.product.objects.map(o => ({ ...o, accepted: true })), texts: [], logos: [], dismissMissingText: true })).body;
-      // The person keeps the ACME brand logo in the picture: it stays in the background, and is still never sent.
+      // The person asks to keep the ACME brand logo in the picture. That is a legacy choice: every saved logo is now
+      // restored as its own layer (service.ts), so ACME is taken out like the others, never sent, and comes back as a layer.
       const acme = v.logos.find(l => /ACME/i.test(l.label))!;
       expect(acme).toBeTruthy();
       v = (await s.send<View>('PUT', `/${id}/selection`, { expectedRevision: v.template.revision, objects: v.product.objects.map(o => ({ id: o.id, decompose: o.kind === 'product' || o.kind === 'character' })), logos: [{ slotId: acme.id, separate: false }] })).body;
@@ -138,7 +139,7 @@ describe('AI decomposition core: OpenAI planner → Seedream Layerize (live code
       for (const b of logoBoxes) expect(inkLeft(src, sent.data, px(b)), JSON.stringify(b)).toBeLessThan(0.2);
       expect(inkLeft(src, sent.data, acme.box)).toBeLessThan(0.2);
       // (The check before sending saw every word and logo gone.)
-      expect(JSON.parse(readFileSync(join(s.protectedDir, id, 'prepare-ai-input-check.json'), 'utf8'))).toMatchObject({ stillVisible: [], logosKeptInPicture: ['ACME logo'] });
+      expect(JSON.parse(readFileSync(join(s.protectedDir, id, 'prepare-ai-input-check.json'), 'utf8'))).toMatchObject({ stillVisible: [], logosKeptInPicture: [] });
 
       // Seedream's layers became the elements' masks; its background is behind them (marked as an AI estimate).
       const p = v.product.prepared!;
@@ -155,13 +156,14 @@ describe('AI decomposition core: OpenAI planner → Seedream Layerize (live code
       const after = stored().textAnalysis as { words: DetectedWord[]; logoSlots: LogoSlot[] };
       expect(after.words.map(w => ({ id: w.id, text: w.text, box: w.box, style: w.style }))).toEqual(before.words.map(w => ({ id: w.id, text: w.text, box: w.box, style: w.style })));
       expect(after.logoSlots.map(l => ({ id: l.id, box: l.box, original: l.original }))).toEqual(before.logoSlots.map(l => ({ id: l.id, box: l.box, original: l.original })));
-      // Not in the background, not in any decomposed layer: the layers without the text and logos show none of them
-      // (the brand logo kept in the picture is the background's, as chosen).
+      // Not in the background, not in any decomposed layer: the layers without the text and logos show none of them,
+      // the ACME logo included.
       const recombinedClean = await (await file(p.previews.recombinedClean)).removeAlpha().raw().toBuffer();
-      const overlayLogoBoxes = before.logoSlots.filter(l => l.review.status !== 'rejected' && l.id !== acme.id).map(l => l.box as Box);
+      const overlayLogoBoxes = before.logoSlots.filter(l => l.review.status !== 'rejected').map(l => l.box as Box);
+      expect(before.logoSlots.find(l => l.id === acme.id)!.review.status).not.toBe('rejected'); // ACME is among them.
       for (const w of liveWords) expect(inkLeft(src, recombinedClean, px(w.box), 3, w.style.color), w.text).toBeLessThan(0.1);
       for (const b of overlayLogoBoxes) expect(inkLeft(src, recombinedClean, px(b)), JSON.stringify(b)).toBeLessThan(0.2);
-      expect(inkLeft(src, base, acme.box)).toBeGreaterThan(0.8);
+      expect(inkLeft(src, base, acme.box)).toBeLessThan(0.2);
 
       // Saved as the master; a creative of it opened for the editor: every word a text of its own at its place and style,
       // every overlay logo a picture layer of its own at its place, above the decomposed layers.
@@ -184,10 +186,20 @@ describe('AI decomposition core: OpenAI planner → Seedream Layerize (live code
       }
       const logoLayers = (run.creative.layers as { kind: string; elementIds: string[] }[]).filter(l => l.kind === 'image');
       const images = ((await s.call<{ images: { id: string; slotId: string | null; box: Box; asset: { kind: string } }[] }>(`/${id}/creatives/${creative.id}`)).body).images;
-      const overlaySlots = before.logoSlots.filter(l => l.review.status !== 'rejected' && l.id !== acme.id);
+      const overlaySlots = before.logoSlots.filter(l => l.review.status !== 'rejected');
+      expect(overlaySlots.map(l => l.id)).toContain(acme.id);
       expect(logoLayers.map(l => images.find(i => i.id === l.elementIds[0])!.slotId).sort()).toEqual(overlaySlots.map(l => l.id).sort());
-      // (Each at its slot's place and size, its own picture: the template's logo, not a crop of a decomposed layer.)
-      for (const slot of overlaySlots) { const i = images.find(x => x.slotId === slot.id)!; expect(i.asset.kind, slot.label).toBe('master'); for (const k of ['x', 'y', 'width', 'height'] as const) expect(i.box[k]).toBeCloseTo(slot.box[k], 0); }
+      // (Each at its slot's place and size, its own picture: the template's logo, not a crop of a decomposed layer. The
+      // published slot is the whole logo (wholeLogoSlots, 1db5a56): a reviewed box ending inside the logo's artwork is cut
+      // again around all of it, so it always contains the reviewed box.)
+      for (const slot of overlaySlots) {
+        const i = images.find(x => x.slotId === slot.id)!, published = snapshot.logoSlots.find(l => l.id === slot.id)!.box;
+        expect(i.asset.kind, slot.label).toBe('master');
+        for (const k of ['x', 'y', 'width', 'height'] as const) expect(i.box[k], `${slot.label} ${k}`).toBeCloseTo(published[k], 0);
+        expect(published.x, slot.label).toBeLessThanOrEqual(slot.box.x); expect(published.y, slot.label).toBeLessThanOrEqual(slot.box.y);
+        expect(published.x + published.width, slot.label).toBeGreaterThanOrEqual(slot.box.x + slot.box.width);
+        expect(published.y + published.height, slot.label).toBeGreaterThanOrEqual(slot.box.y + slot.box.height);
+      }
       const objectLayers = (run.creative.layers as { kind: string; z: number }[]).filter(l => l.kind === 'object');
       expect(objectLayers).toHaveLength(4);
       expect(Math.min(...logoLayers.map(l => (l as unknown as { z: number }).z))).toBeGreaterThan(Math.max(...objectLayers.map(l => l.z)));

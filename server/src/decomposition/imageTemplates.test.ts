@@ -145,7 +145,9 @@ async function server(options: { images?: ReturnType<typeof imageFake>; writer?:
   return { app, url, get, post, patch, upload, uploaded, draft, generate, generated, template, settled, decomposed, wait, images, writer, create, runsDir, dir, uploads, submitted, mostAtOnce: () => mostAtOnce };
 }
 
-describe('Reference creatives', () => {
+// Real image work (sharp) in many tests: 1–2.5 s each alone, but past the 5 s default when the whole suite runs in
+// parallel on every core (2 November 2026: three of these timed out at 5,0xx ms; alone all pass on main and HEAD).
+describe('Reference creatives', { timeout: 30_000 }, () => {
   it.each([3344, 4002])('%i-character structured response persists a usable prompt after exactly one analysis; regenerate is explicit', async length => {
     const fake = writerFake(), response = verboseImageAnalysis(length);
     const create = vi.fn(async () => ({ status: 'completed', output: [], output_text: JSON.stringify(response) }));

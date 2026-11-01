@@ -55,10 +55,15 @@ describe("estimates", () => {
 
   it("keeps a 6-product high-quality poster within the $1 job limit", () => {
     const w = estimatePoster(env, { subjects: 6 });
+    // The limit holds for the worst case, which counts every possible repair and retry ("only if …").
     expect(w.withinCap).toBe(true);
-    // The image call dominates; text roles stay small.
+    const contingencies = w.calls.filter((c) => /\(only if /.test(c.stage));
+    expect(contingencies.length).toBeGreaterThan(0);
+    expect(w.totalMicroUsd).toBe(w.calls.reduce((s, c) => s + c.estimate.microUsd, 0));
+    // The image call dominates; text roles stay small (among the calls every poster makes).
     const image = w.calls.find((c) => c.stage.startsWith("Scene image"))!.estimate.microUsd;
-    expect(image / w.totalMicroUsd).toBeGreaterThan(0.9);
+    const alwaysRun = w.calls.filter((c) => !contingencies.includes(c)).reduce((s, c) => s + c.estimate.microUsd, 0);
+    expect(image / alwaysRun).toBeGreaterThan(0.9);
   });
 
   it("formats rupees at the configured rate", () => {

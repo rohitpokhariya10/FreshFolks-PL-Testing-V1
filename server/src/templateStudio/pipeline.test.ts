@@ -204,7 +204,8 @@ describe('generation modes', () => {
     expect(prompt).toContain('STYLE AND SCENE REFERENCE');
     expect(prompt).toContain('KEEP FROM THE STYLE REFERENCE');
     expect(prompt).toContain('Blue studio backdrop');
-    expect(prompt).toContain('Its backdrop, supports, props, surface, camera and lighting are to be KEPT');
+    // The style reference's scene is kept: backdrop, supports, props, surface, camera, lighting (and palette).
+    expect(prompt).toContain('the same background, backdrop shape, podiums, pedestals and props, floor or surface, camera angle, lighting and palette');
     // Nothing tells the image model to disregard the reference's design.
     for (const loose of ['look and feel only', 'recompose freely', 'loose inspiration', 'STYLE REFERENCE ONLY']) expect(prompt).not.toContain(loose);
     expect(reviewCall().system).toContain('made in "match" mode');
@@ -219,7 +220,8 @@ describe('generation modes', () => {
     await runNext();
     const adapt = imageCalls()[0].prompt!;
     expect(adapt).toContain('recompose freely');
-    expect(adapt).toContain('the style reference is for look and feel only');
+    // The style reference is for look and feel only (no scene to keep).
+    expect(adapt).toContain('STYLE REFERENCE ONLY. Match its visual language.');
     expect(adapt).not.toContain('KEEP FROM THE STYLE REFERENCE');
     expect(reviewCall().system).toContain('expected to use a different environment');
 

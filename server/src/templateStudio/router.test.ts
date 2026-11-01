@@ -71,7 +71,9 @@ describe('template studio routes', () => {
 
     const product = await upload(await productPhotoPng(), 'subject', 'Mixer');
     const estimate = await post('/costs/estimate', { templateId: template.id, formatId: 'portrait-4-5', products: [{ assetId: product.body.asset.id, name: 'Mixer' }] });
-    expect(estimate.body.lines.map((l: { stage: string }) => l.stage)).toEqual(['Reference / template analysis', 'Product analysis', 'AI composition planning', 'Image generation (high, 1024x1280)', 'Image review', 'Structure repair (only if needed)']);
+    expect(estimate.body.lines.map((l: { stage: string }) => l.stage)).toEqual(['Reference / template analysis', 'Product analysis', 'AI composition planning', 'Image generation (high, 1024x1280)', 'Image review',
+      // Each possible repair and retry is itemised, so the estimate is an upper bound.
+      'Planner structure repair (only if needed)', 'Review structure repair (only if needed)', 'Review retry (only if interrupted output)']);
     expect(estimate.body.lines[0]).toMatchObject({ cached: true });
     expect(estimate.body.withinCap).toBe(true);
 
@@ -79,7 +81,7 @@ describe('template studio routes', () => {
     expect(started.status).toBe(202);
     const job = await settle(started.body.jobId);
     expect(job.state).toBe('complete');
-    expect(job.stages.map((s: { label: string }) => s.label)).toEqual(['Looking at your products', 'Art direction', 'Generating the image', 'Adding text and logo', 'Quality review']);
+    expect(job.stages.map((s: { label: string }) => s.label)).toEqual(['Checking budget and reference choices', 'Checking local reference reuse', 'Preserving primary products', 'Looking at your products', 'Art direction', 'Generating the image', 'Adding text and logo', 'Quality review']);
     const posterId = job.result.posterId as string;
     const { body: { poster } } = await json(`/posters/${posterId}`);
     expect(poster).toMatchObject({ fidelityMode: 'match', reviewStatus: 'ok', copy: { headline: 'Mix it up', offer: 'Flat ₹500 off' } });
