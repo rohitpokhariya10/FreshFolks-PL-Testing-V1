@@ -1,3 +1,4 @@
+import { LayerEditPanel } from './LayerEditPanel';
 import { useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Copy, Eye, EyeOff, GripVertical, ImageUp, Lock, ShieldCheck, Trash2, Type, Unlock } from 'lucide-react';
 import { clamp, hasExplicitOrder, PROTECTED_KIND_LABELS, TEXT_LIMITS, type DesignLayer, type DesignVariant, type TextElement } from '@frameflow/shared';
@@ -101,6 +102,7 @@ export function LayerInspector({ variant, layer }: { variant: DesignVariant; lay
     <div className="panel-heading"><h2>Layer</h2><span className="subtle-label">{kindLabel(layer)}</span></div>
     {layer.protectedSlot && <p className="inspector-hint protected-slot-note" data-testid="protected-slot"><ShieldCheck size={13} aria-hidden="true" /> Protected {PROTECTED_KIND_LABELS[layer.protectedSlot.kind].toLowerCase()} slot{layer.protectedSlot.representation === 'raster' ? ': the original pixels of the creative (a visual copy, not editable text)' : layer.protectedSlot.representation === 'source-asset' ? ': an image file' : ''}. Replace image keeps its place and box{layer.type === 'image' && layer.fit === 'contain' ? ', fitted without distortion' : ''}.{layer.locked ? ' Locked on the canvas.' : ''}</p>}
     <label className="layer-field layer-name-field">Name<input aria-label="Layer name" maxLength={200} value={layer.name} onFocus={() => { session.current = crypto.randomUUID(); }} onChange={e => change({ name: e.target.value }, session.current)} /></label>
+    <LayerEditPanel variant={variant} layer={layer} />
     <div className="layer-grid">{number('X', 'x')}{number('Y', 'y')}{number('Width', 'width', 1, 16384)}{number('Height', 'height', 1, 16384)}{number('Rotation', 'rotation', -180, 180)}</div>
     <label className="layer-field">Opacity {Math.round(layer.opacity * 100)}%<input type="range" aria-label="Opacity" min={0} max={100} value={Math.round(layer.opacity * 100)}
       onPointerDown={() => { session.current = crypto.randomUUID(); }} onChange={e => change({ opacity: Number(e.target.value) / 100 }, session.current || undefined)} /></label>

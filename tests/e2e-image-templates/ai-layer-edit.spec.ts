@@ -1,0 +1,130 @@
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import sharp from 'sharp';
+import type { DesignVariant, LayerEditCandidate, ProductCreative, ProjectDocument } from '@frameflow/shared';
+import type { ProductView } from '../../client/src/features/productTemplates/api';
+const API = '/api/layerize-experiment/product-templates';
+test.use({ extraHTTPHeaders: { origin: `http://127.0.0.1:${process.env.FRAMEFLOW_OFFLINE_E2E_PORT ?? 3317}` }, actionTimeout: 30000 });
+test.setTimeout(180000);
+async function openCreative(page: Page, request: APIRequestContext) {
+  await page.route(url => /^https?:$/.test(url.protocol) && url.hostname !== '127.0.0.1', r => r.abort());
+  const name = `AI layers ${Date.now()}`, poster = await (await request.get('/__test__/product-poster.png')).body();
+  let v = await (await request.post(API, { multipart: { name, useAi: 'true', image: { name: 'poster.png', mimeType: 'image/png', buffer: poster } } })).json() as ProductView;
+  const id = v.template.id;
+  await expect.poll(async () => { v = await (await request.get(`${API}/${id}`)).json(); return v.stage; }, { timeout: 60000 }).toBe('review');
+  v = await (await request.put(`${API}/${id}/review`, { data: { expectedRevision: v.template.revision, objects: v.product.objects.map(o => ({ id: o.id, kind: o.kind, label: o.label, box: o.box, accepted: true })), texts: [], logos: [], dismissMissingText: true } })).json();
+  await request.post(`${API}/${id}/prepare`, { data: { expectedRevision: v.template.revision } });
+  await expect.poll(async () => { v = await (await request.get(`${API}/${id}`)).json(); return v.stage; }, { timeout: 60000 }).toBe('prepared');
+  v = await (await request.post(`${API}/${id}/approve`, { data: { expectedRevision: v.template.revision, acknowledge: v.product.prepared!.quality.issues.map(i => i.id) } })).json();
+  await request.post(`${API}/${id}/publish`, { data: { expectedRevision: v.template.revision } });
+  await page.goto('/'); await page.getByRole('button', { name: 'OpenAI + Seedream test' }).click();
+  const modal = page.getByRole('dialog', { name: 'OpenAI + Seedream test' });
+  await modal.getByRole('tab', { name: 'Offer Templates', exact: true }).click();
+  await modal.getByRole('article', { name: `Product template ${name}` }).getByRole('button', { name: 'Use template', exact: true }).click();
+  await modal.getByRole('button', { name: 'New creative' }).click();
+  await modal.getByRole('button', { name: 'Open in editor', exact: true }).click();
+  await expect(modal).toBeHidden();
+  const stored = async () => page.evaluate(id => (JSON.parse(localStorage.getItem('frameflow:project:v1')!) as ProjectDocument).variants.find(v => v.creative?.masterId === id)!, id);
+  await expect.poll(async () => !!(await stored())?.creative).toBe(true);
+  return { id, stored, original: await stored() };
+}
+const panel = (page: Page) => page.getByRole('region', { name: 'AI Edit Layer', exact: true });
+const select = (page: Page, name: string) => page.locator('.layer-select').filter({ hasText: name }).first().click();
+async function generate(page: Page, prompt: string) {
+  const p = panel(page); await p.getByLabel('Layer edit prompt').fill(prompt); await p.getByRole('button', { name: 'Generate Edit', exact: true }).click();
+  await expect(p.getByRole('button', { name: 'Approve and generate' })).toBeDisabled();
+  await p.getByRole('checkbox').check();
+  const response = page.waitForResponse(r => r.url().endsWith('/layer-edits') && r.request().method() === 'POST');
+  await p.getByRole('button', { name: 'Approve and generate' }).click();
+  const result = await (await response).json() as LayerEditCandidate;
+  await expect(p.getByRole('img', { name: 'AI edited candidate' })).toBeVisible();
+  return result;
+}
+const layerNamed = (v: DesignVariant, name: string) => v.layers!.find(l => l.name === name)!;
+
+test('object prompt → approval → preview → expanded Apply → second edit → undo → save/reload/export', async ({ page, request }, info) => {
+  const { id, stored, original } = await openCreative(page, request), fridge = layerNamed(original, 'Refrigerator');
+  await select(page, 'Refrigerator'); const p = panel(page);
+  await expect(p).toContainText('Editing: Refrigerator');
+  const prompt = `Open both refrigerator doors. ${id}`, count = async () => (await (await request.get('/__test__/image-calls', { params: { contains: prompt } })).json()).count;
+  expect(await count()).toBe(0);
+  await p.getByLabel('Layer edit prompt').fill(prompt); await p.getByRole('button', { name: 'Generate Edit', exact: true }).click();
+  await expect(p).toContainText('offline-layer-editor'); expect(await count()).toBe(0);
+  await p.getByRole('checkbox').check(); await p.getByRole('button', { name: 'Approve and generate' }).click();
+  await expect(p.getByRole('img', { name: 'AI edited candidate' })).toBeVisible(); expect(await count()).toBe(1);
+  expect(await stored()).toEqual(original);
+  await p.getByRole('button', { name: 'Regenerate · new approval' }).click();
+  expect(await stored()).toEqual(original);
+  const candidate = await generate(page, prompt); expect(await count()).toBe(2);
+  await page.screenshot({ path: info.outputPath('layer-edit-preview.png') });
+  await p.getByRole('button', { name: 'Apply edit' }).click();
+  await expect.poll(async () => layerNamed(await stored(), 'Refrigerator').width).toBeGreaterThan(fridge.width);
+  const applied = await stored(), changed = layerNamed(applied, 'Refrigerator');
+  expect(applied.layers!.filter(l => l.id !== fridge.id)).toEqual(original.layers!.filter(l => l.id !== fridge.id));
+  expect(applied.elements).toEqual(original.elements);
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  await expect.poll(async () => layerNamed(await stored(), 'Refrigerator')).toEqual(fridge);
+  await page.getByRole('button', { name: 'Redo', exact: true }).click();
+  await expect.poll(async () => layerNamed(await stored(), 'Refrigerator')).toEqual(changed);
+  const nextRequest = page.waitForRequest(r => r.url().endsWith('/layer-edits') && r.method() === 'POST');
+  await generate(page, `Make the inside brighter. ${id}`);
+  expect((await nextRequest).postDataJSON().sourceSha256).toBe(candidate.image.sha256);
+  await p.getByRole('button', { name: 'Discard', exact: true }).click();
+  await page.getByLabel('X', { exact: true }).fill(String(Math.round(changed.x) + 14)); await page.getByLabel('X', { exact: true }).blur();
+  await page.getByLabel('Rotation', { exact: true }).fill('12'); await page.getByLabel('Rotation', { exact: true }).blur();
+  await page.getByRole('button', { name: 'Save creative', exact: true }).click();
+  await expect(page.getByText('Saved to creative · revision 2')).toBeVisible();
+  const c = await (await request.get(`${API}/${id}/creatives/${original.creative!.creativeId}`)).json() as ProductCreative;
+  const savedObject = c.objects.find(o => `object-${o.id}` === fridge.id)!;
+  expect(savedObject.asset.kind).toBe('upload'); expect('width' in savedObject.asset ? savedObject.asset.width : 0).toBe(candidate.image.width); expect(savedObject.box.rotation).toBe(12);
+  await expect.poll(async () => layerNamed(await stored(), 'Refrigerator').rotation).toBe(12);
+  await expect.poll(async () => (await stored()).creative!.syncedRevision).toBe(2);
+  const beforeReload = layerNamed(await stored(), 'Refrigerator');
+  await page.reload(); await expect.poll(async () => layerNamed(await stored(), 'Refrigerator')).toEqual(beforeReload);
+  const download = page.waitForEvent('download'); await page.getByRole('button', { name: 'Export PNG', exact: true }).click();
+  const path = info.outputPath('edited-creative.png'); await (await download).saveAs(path);
+  const { data, info: pixels } = await sharp(path).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  expect([pixels.width, pixels.height]).toEqual([original.canvas.width, original.canvas.height]);
+  // The fixture's dark new interior is present in the exported composition, not just the DOM preview.
+  let interior = 0; for (let i = 0; i < data.length; i += 4) if (Math.abs(data[i] - 51) < 3 && Math.abs(data[i + 1] - 65) < 3 && Math.abs(data[i + 2] - 85) < 3) interior++;
+  expect(interior).toBeGreaterThan(100);
+  await select(page, 'Refrigerator'); await page.screenshot({ path: info.outputPath('layer-edit-saved.png') });
+});
+
+test('character pose, locked/background exclusions, stale placement, and switching selection during generation', async ({ page, request }) => {
+  const { stored, original } = await openCreative(page, request);
+  await select(page, 'Background'); await expect(panel(page)).toContainText(/unlock|individual visual object/);
+  await select(page, 'Mascot');
+  await page.getByRole('button', { name: 'Lock Mascot', exact: true }).click(); await expect(panel(page)).toContainText('Show and unlock');
+  await page.getByRole('button', { name: 'Unlock Mascot', exact: true }).click();
+  const c = await generate(page, 'Raise the left arm.'); expect(c.geometry.width).toBeGreaterThan(1);
+  await page.getByLabel('X', { exact: true }).fill('245'); await page.getByLabel('X', { exact: true }).blur();
+  await expect(panel(page).getByRole('button', { name: 'Apply edit' })).toBeDisabled();
+  await expect(panel(page)).toContainText('The design changed'); await panel(page).getByRole('button', { name: 'Discard', exact: true }).click();
+  const pose = await generate(page, 'Raise the left arm.');
+  await panel(page).getByRole('button', { name: 'Apply edit' }).click();
+  await expect.poll(async () => { const l = layerNamed(await stored(), 'Mascot'); return l.type === 'image' ? l.assetId : ''; }).toBe(`ai-layer-${pose.operationId}`);
+  expect(layerNamed(await stored(), 'Refrigerator')).toEqual(layerNamed(original, 'Refrigerator'));
+  await select(page, 'Refrigerator');
+  const p = panel(page); await p.getByLabel('Layer edit prompt').fill('Open both doors. slow test'); await p.getByRole('button', { name: 'Generate Edit', exact: true }).click();
+  await p.getByRole('checkbox').check();
+  const finished = page.waitForResponse(r => r.url().endsWith('/layer-edits') && r.request().method() === 'POST');
+  await p.getByRole('button', { name: 'Approve and generate' }).click(); await select(page, 'Television'); await finished;
+  await expect(panel(page)).toContainText('Editing: Television'); await expect(panel(page).getByRole('button', { name: 'Apply edit' })).toHaveCount(0);
+  expect(layerNamed(await stored(), 'Refrigerator')).toEqual(layerNamed(original, 'Refrigerator'));
+});
+
+test('browser asset storage failure preserves the original and allows Apply again without another generation', async ({ page, request }) => {
+  const { stored, original } = await openCreative(page, request);
+  await select(page, 'Refrigerator'); await generate(page, 'Open the upper door. Storage test');
+  await page.evaluate(() => {
+    const put = IDBObjectStore.prototype.put;
+    (window as unknown as { restoreAssetPut: () => void }).restoreAssetPut = () => { IDBObjectStore.prototype.put = put; };
+    IDBObjectStore.prototype.put = function (value, key) { if (value?.id?.startsWith('ai-layer-')) throw new DOMException('Offline quota test', 'QuotaExceededError'); return key === undefined ? put.call(this, value) : put.call(this, value, key); };
+  });
+  await panel(page).getByRole('button', { name: 'Apply edit' }).click();
+  await expect(panel(page).getByRole('alert')).toContainText(/quota|storage|image|saved/i);
+  expect(await stored()).toEqual(original);
+  await page.evaluate(() => (window as unknown as { restoreAssetPut: () => void }).restoreAssetPut());
+  await panel(page).getByRole('button', { name: 'Apply edit' }).click();
+  await expect.poll(async () => layerNamed(await stored(), 'Refrigerator').width).toBeGreaterThan(layerNamed(original, 'Refrigerator').width);
+});

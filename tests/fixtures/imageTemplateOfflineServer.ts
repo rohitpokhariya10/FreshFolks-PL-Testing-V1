@@ -481,7 +481,14 @@ const router = createLayerizeRouter({
   },
   runsDir: join(root, 'runs'), imageTemplatesDir: join(root, 'templates'), protectedDir: join(root, 'protected'), wordRecognizer: () => variationRecognizer, masterRecognizer: () => masterRecognizer,
   // Product with Text templates: the fixture poster's words (no OCR), the fixture's vision answer and a fake cut-out service, each counted.
-  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, productRegenerator: () => ratioRegenerator, productArtwork: () => productArtwork,
+  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, layerEditor: () => ({ model: 'offline-layer-editor', offline: true, async regenerate({ image, prompt }) {
+    callCounts.openai++; events.push({ kind: 'generation', source: digest(image), inputs: [digest(image)], prompt, size: '1024x1024' });
+    if (prompt.includes('slow test')) await new Promise(resolve => setTimeout(resolve, 1500));
+    const person = prompt.includes('Raise'), body = person
+      ? '<circle cx="512" cy="280" r="60" fill="#a96848"/><path d="M440 340 H580 L770 125 L820 165 L610 440 V850 H430 V450 L300 540 L270 490 Z" fill="#3b82f6"/>'
+      : '<path d="M132 300 L392 232 H632 L892 300 V740 L632 792 H392 L132 740 Z" fill="#9e6847"/><rect x="410" y="270" width="204" height="490" fill="#334155"/>';
+    return { image: await svgPng(1024, 1024, body), costUsd: 0, requestId: 'offline-layer-edit' };
+  } }), productRegenerator: () => ratioRegenerator, productArtwork: () => productArtwork,
   templatesDir: join(root, 'creative-templates'), executionsDir: join(root, 'executions'),
   inspector: () => ({ model: 'gpt-5.6-luna', inspect: async (_bytes, _mime, save) => {
     callCounts.openai++;

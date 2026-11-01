@@ -5,6 +5,7 @@ import { CANVAS_LIMITS, validateCanvasSize, type RunDiagnostics, type DesignLaye
 export type Placement = { kind: 'base' | 'full-canvas' | 'bbox-crop' | 'bbox-scaled' | 'unresolved'; x: number; y: number; width: number; height: number; reason?: string };
 /** `rebuilt`: this layer's `file` was rebuilt locally (clean full-canvas outer background); `rawFile` is the untouched provider layer. */
 export type ExperimentLayer = { index: number; file: string; zIndex: number; name?: string; description?: string; pixelWidth: number; pixelHeight: number; opaquePercent: number; placement: Placement;
+  semantic?: { id: string; type: string; editableIndependently: boolean };
   rawFile?: string; rebuilt?: { method: string; from: string[]; foreground?: string[]; holePercent: number; texture: string; contaminationPercent?: number; residualPercent?: number };
   /** Output layers only: the semantic layer files this one was made from (its own file when not merged). */
   sources?: string[];
@@ -333,6 +334,7 @@ export async function experimentToVariant(run: Pick<ExperimentRun, 'id' | 'canva
       // Layers a residual pass found say so, for debugging the refinement.
       const pass = layer.provenance && layer.provenance.sourcePass > 0 ? ` · pass ${layer.provenance.sourcePass}` : '';
       layers.push({ id: `layer-${newId()}`, type: 'image', assetId, name: `${unresolved ? '⚠ unplaced: ' : ''}${label}${pass} (z${layer.zIndex})`.slice(0, 200),
+        source: { jobId: run.id, layerId: `${p.kind === 'base' ? 'base' : 'output'}-${layer.index}`, kind: /\b(?:text|headline|typography|logo|caption|cta)\b/i.test((layer.semantic?.type ?? layer.name ?? '').replace(/[_-]/g, ' ')) ? 'text' : 'image' },
         x: p.x * scale, y: p.y * scale, width: Math.max(1, p.width * k * scale), height: Math.max(1, p.height * k * scale), rotation: 0, opacity: 1, visible: !unresolved, locked: false });
     }
     return { id: `layerize-${newId()}`, name: `OpenAI + Seedream ${run.id.slice(0, 16)}`, revision: 0, canvas: { width, height, backgroundColor: '#FFFFFF', transparent: true }, elements: [], layers };

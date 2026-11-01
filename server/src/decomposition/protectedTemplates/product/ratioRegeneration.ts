@@ -113,13 +113,13 @@ export function variationPrompt(input: { shape: string; theme: AiVariationTheme;
 export interface RatioRegenerator {
   model: string; offline: boolean;
   /** One image edit of `image` into `size` (the ratio's own size); with `mask`, a masked edit (transparent = edit). Never retried here. */
-  regenerate(request: { image: Buffer; prompt: string; size: SourceSize; mask?: Buffer }, save: Save, operationId: string): Promise<{ image: Buffer; requestId?: string; costUsd?: number; usage?: object }>;
+  regenerate(request: { image: Buffer; prompt: string; size: SourceSize; mask?: Buffer; background?: 'transparent' }, save: Save, operationId: string): Promise<{ image: Buffer; requestId?: string; costUsd?: number; usage?: object }>;
 }
 /** The live regenerator: OpenAI images.edit (the configured image model, high quality). Sent only after the person approved its cost. */
 export function liveRatioRegenerator(): RatioRegenerator {
   const model = imageModel();
-  return { model, offline: false, async regenerate({ image, prompt, size, mask }, save, operationId) {
-    const request = { model, prompt, size: `${size.width}x${size.height}`, quality: 'high', n: 1, output_format: 'png' } as const;
+  return { model, offline: false, async regenerate({ image, prompt, size, mask, background }, save, operationId) {
+    const request = { model, prompt, size: `${size.width}x${size.height}`, quality: 'high', n: 1, output_format: 'png', ...(background ? { background } : {}) } as const;
     save('ratio-regeneration.openai-request.json', { method: 'images.edit', ...request, image: '<the creative, as sent>', ...(mask ? { mask: '<the edit mask, as sent>' } : {}), clientRequestId: operationId, maxRetries: 0 });
     try {
       const response = await createOpenAIClient(process.env.OPENAI_API_KEY, 300_000).images.edit({ ...request, image: await toFile(image, 'creative.png', { type: 'image/png' }), ...(mask ? { mask: await toFile(mask, 'mask.png', { type: 'image/png' }) } : {}) } as never, { maxRetries: 0, timeout: 300_000, headers: { 'X-Client-Request-Id': operationId } }) as unknown as
