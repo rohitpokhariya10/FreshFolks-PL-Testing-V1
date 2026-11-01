@@ -96,6 +96,35 @@ export function generateOutcome(error: unknown): GenerateOutcome {
   return { kind: 'interrupted' };
 }
 
+/**
+ * One stale-request rejection, recorded so a real conflict can be told apart from an internal synchronization problem.
+ * Identifiers, fingerprints and numeric geometry only: no image, prompt, name or other layer content.
+ */
+export interface LayerEditConflict {
+  at: string; operationId?: string; layerId: string;
+  /** Where it was detected: the panel while a request ran or showed, sending it, its result's arrival, a status check, or Apply. */
+  where: 'during-generation' | 'pending' | 'preview' | 'quote' | 'generate' | 'result' | 'recover' | 'apply';
+  side: 'client' | 'server'; code?: string;
+  /** Whether a completed provider result exists for this operation (it is kept unless someone discards it). */
+  resultArrived: boolean;
+  requested: { fingerprint: string; version: number };
+  current: { fingerprint?: string; version: number };
+  /** Whether the layer is still the selected element. */
+  selected: boolean;
+  /** The fields that differ now (numbers with before/after). Empty: they match again; only the change counter moved. */
+  changed: { field: string; before?: number; after?: number }[];
+  layerChanged: boolean;
+}
+export const CONFLICT_LOG_KEY = 'frameflow-layer-edit-conflicts';
+/** Logged to the console and kept (last 20) in this browser under CONFLICT_LOG_KEY. Never throws. */
+export function recordLayerEditConflict(storage: () => Storage, conflict: LayerEditConflict) {
+  console.warn('[FrameFlow] AI layer edit conflict', conflict);
+  try {
+    const previous = JSON.parse(storage().getItem(CONFLICT_LOG_KEY) ?? '[]') as unknown;
+    storage().setItem(CONFLICT_LOG_KEY, JSON.stringify([...(Array.isArray(previous) ? previous : []), conflict].slice(-20)));
+  } catch { /* Diagnostics are optional. */ }
+}
+
 export interface Feedback { tone: 'success' | 'info' | 'warning' | 'error'; title: string; detail?: string }
 /** A short message for people; the server's sanitized text goes into the expandable details only when it adds something. */
 export function failureFeedback(error: unknown, title: string): Feedback {

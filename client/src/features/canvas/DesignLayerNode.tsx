@@ -8,13 +8,13 @@ import 'konva/lib/shapes/Ellipse';
 import 'konva/lib/shapes/Image';
 import 'konva/lib/shapes/Rect';
 import 'konva/lib/shapes/Transformer';
-import { LAYER_LIMITS, type DesignLayer } from '@frameflow/shared';
+import type { DesignLayer } from '@frameflow/shared';
 import { useAppDispatch } from '../../store';
 import { layerUpdated } from '../../store/editorSlice';
 import { elementSelected } from '../../store/uiSlice';
 import { assets, decodeImage } from '../../lib/assets/runtimeAssets';
 import { focusCanvas } from '../text/useTextActions';
-import { cornerRadius, layerImageProps, shapeFillProps, strokeProps } from './layerGeometry';
+import { cornerRadius, layerImageProps, shapeFillProps, strokeProps, transformedLayer } from './layerGeometry';
 import { previewLayer, type LayerCanvasPreview } from '../layers/LayerEditPreview';
 
 /** Decoded layer bitmaps, shared by all nodes and export for the lifetime of the page. */
@@ -58,9 +58,9 @@ export function DesignLayerNode({ layer: originalLayer, selected, variantId, rai
       onDragEnd={(event) => { const node = event.target as KonvaGroup; commit({ x: node.x(), y: node.y() }); }}
       onTransformEnd={() => {
         const node = groupRef.current; if (!node) return;
-        const width = Math.max(LAYER_LIMITS.minSide, layer.width * node.scaleX()), height = Math.max(LAYER_LIMITS.minSide, layer.height * node.scaleY());
+        const changes = transformedLayer(layer, { x: node.x(), y: node.y(), scaleX: node.scaleX(), scaleY: node.scaleY(), rotation: node.rotation() });
         node.scale({ x: 1, y: 1 });
-        commit({ x: node.x(), y: node.y(), width, height, rotation: ((node.rotation() + 540) % 360) - 180 });
+        if (changes) commit(changes);
       }}>
       {layer.type === 'image'
         ? layer.assetId === undefined

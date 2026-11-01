@@ -188,6 +188,31 @@ Provider keys were explicitly cleared for test commands; the offline browser fix
 
 The previous partial work can be recovered later by switching to `feat/ai-layer-edit`, locating the named stash with `git stash list`, and applying it there. Keep the stash until you have verified the restoration. Switching to the FLUX branch restores its committed repair implementation.
 
+## False "The layer changed during generation" — 2 November 2026
+
+**Incident.** Ornate Golden Appliance Showcase (`pt-0dd04956555b`), creative `pc-9ef215`, layer `object-po-a996c422e6` (Freestanding dishwasher), prompt "open this". Operation `4a334bdd` (started 00:22:14 IST) was rejected; the immediate retry `7a2d07f3` (00:24:30) succeeded. Both records have the same target, revision 1 and source hash `2267c918105b…`. The failed record has a provider request ID (`req_bd14b7a9…`) and cost ($0.22), so the server sent it and received a result. It ended `discarded` with its candidate deleted at 00:23:38. The server never rejected it. The editor's own render-time check did: that title appears only in the panel's `stale` phase while generating. No Save happened (no `pcr-9ef215-r2.json`). No client or server source file changed during 00:22–00:24, so HMR or a server restart is ruled out. The exact client-side change in that browser session was not recorded and is still unproven.
+
+**Reproduced offline on the real saved template** (`tests/e2e-image-templates/ai-layer-edit-stale.spec.ts`, held fake provider, before the fix). Each action ran alone against its own held "open this" request:
+
+- No conflict: a click on the dishwasher, pressing a resize or rotate handle (rotation 0), zoom/Fit, window resize, hiding and showing another layer, Save creative.
+- False conflict:
+  - Reordering another layer past it, and reordering it back: `zIndex` renumbering.
+  - Changing the canvas fill, then Undo: `variant.canvas` was in the fingerprint.
+  - Pressing the handles of a rotated object: `onTransformEnd` re-normalised 12.3° to 12.299999999999955°.
+- A genuine 5 px slip-drag was rejected, as it should be, but the client then **deleted the completed paid result** (status `discarded`).
+
+**Changes (client only; no server, provider, prompt or pipeline change).**
+
+- `layerEdit.ts`: the source fingerprint leaves out `zIndex` and the canvas fill. It keeps the image, placement, eligibility fields, canvas size and creative identity. Snapshots in both earlier formats are still accepted for recovery. Adds `layerEditChanges` and `describeLayerEditChanges` for diagnostics.
+- `LayerEditPanel.tsx`:
+  - A result that arrives after a client-detected change is no longer discarded. It stays on the server and in the layer's recovery record.
+  - The conflict card names what changed, for example "Changed: position (x 688 → 692.5)".
+  - Once the layer matches the request again (for example after Undo), an explicit **Check request status** re-verifies it and collects the result. Undo alone never revives it, and only Discard deletes it.
+- `layerEditFlow.ts`: every stale rejection is logged to the console and kept, last 20, in `localStorage['frameflow-layer-edit-conflicts']`. Each entry holds the operation, layer, where it was detected (client or server), whether a result arrived, before/after fingerprints and versions, and the changed fields with numeric before/after values. It holds no image, prompt or name.
+- `layerGeometry.ts` / `DesignLayerNode.tsx`: a Transformer gesture that changed nothing commits nothing.
+
+**Still protected.** Moving, resizing, rotating, replacing, hiding, locking or deleting the selected layer, or resizing the canvas, still invalidates the request, including when the change is undone. The server still re-verifies the saved source bytes on status and Apply.
+
 ## Remaining practical limits
 
 - No real AI output has been assessed. Mock images prove integration and geometry, not photographic or brand fidelity. Exact identity, fine details and requested edits are not guaranteed by the model.
@@ -231,4 +256,6 @@ The previous partial work can be recovered later by switching to `feat/ai-layer-
 | `server/src/decomposition/layerEditProvider.test.ts` | Exact SDK request and unchanged default adapter settings. |
 | `shared/src/layerEdit.ts` | Source, request, cost, geometry, candidate and status types. |
 | `tests/e2e-image-templates/ai-layer-edit.spec.ts` | Full editor workflow, stale selection and storage-failure browser tests. |
+| `tests/e2e-image-templates/ai-layer-edit-stale.spec.ts` | Real saved templates: harmless activity during a held generation, genuine conflicts, kept results. |
+| `client/src/features/layers/layerEditStale.test.ts` | Fingerprint, change-then-Undo, diagnostics and no-op Transformer tests. |
 | `docs/ai-layer-edit-report.md` | This report and launch instructions. |

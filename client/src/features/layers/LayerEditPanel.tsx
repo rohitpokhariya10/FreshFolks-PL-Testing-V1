@@ -5,10 +5,10 @@ import { LAYER_EDIT_LIMITS, type DesignLayer, type DesignVariant, type LayerEdit
 import { type RootState, selectActiveVariant, useAppSelector } from '../../store';
 import { layerEditApplied } from '../../store/editorSlice';
 import { assets, decodeImage } from '../../lib/assets/runtimeAssets';
-import { editableLayer, editedLayerGeometry, layerEditSnapshot, matchesLayerEditSnapshot } from './layerEdit';
+import { describeLayerEditChanges, editableLayer, editedLayerGeometry, layerEditChanges, layerEditSnapshot, matchesLayerEditSnapshot, snapshotFingerprint } from './layerEdit';
 import { imageHash, LayerEditApiError, layerEditApi } from './layerEditApi';
 import { useLayerEditPreview } from './LayerEditPreview';
-import { createSingleFlight, failureFeedback, formatElapsed, generateOutcome, layerEditPhase, layerEditRecovery, type Feedback, type LayerEditBusy, type PendingStatus } from './layerEditFlow';
+import { createSingleFlight, failureFeedback, formatElapsed, generateOutcome, layerEditPhase, layerEditRecovery, recordLayerEditConflict, type Feedback, type LayerEditBusy, type LayerEditConflict, type PendingStatus } from './layerEditFlow';
 import { LayerThumbnail } from './LayerThumbnail';
 import './layerEdit.css';
 
@@ -18,7 +18,7 @@ type Pending = { id: string; snapshot: string; version: number; prompt?: string;
 type Work = Exclude<LayerEditBusy, ''>;
 /** The server stops waiting for the provider after 310 s. Past this, the response is treated as lost and checked — never resent. */
 const GENERATE_TIMEOUT_MS = 330_000;
-const session = () => sessionStorage;
+const session = () => sessionStorage, browser = () => localStorage;
 const Spinner = () => <span className="ai-spinner" aria-hidden="true" />;
 
 const PENDING_TEXT: Record<PendingStatus, { title: string; body: string; tone: 'info' | 'warning' | 'error' }> = {
@@ -67,6 +67,18 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
   /** Saving the creative changes only its revision. Requests always name the revision the editor holds now. */
   const currentTarget = () => { const { v, l } = latest(); return l ? editableLayer(v, l).target : undefined; };
   const savedRevision = () => { const t = currentTarget(); return t?.kind === 'creative' ? t.revision : undefined; };
+  /** Diagnostics for every stale rejection: what changed, where it was seen, and whether a paid result exists (layerEditFlow). */
+  const conflict = (where: LayerEditConflict['where'], request: { snapshot: string; version: number }, info: { operationId?: string; resultArrived: boolean; code?: string }) => {
+    const { s, v, l } = latest(), changed = layerEditChanges(request.snapshot, v, l);
+    recordLayerEditConflict(browser, { at: new Date().toISOString(), layerId: layer.id, where, side: info.code ? 'server' : 'client', ...(info.code ? { code: info.code } : {}),
+      ...(info.operationId ? { operationId: info.operationId } : {}), resultArrived: info.resultArrived,
+      requested: { fingerprint: snapshotFingerprint(request.snapshot), version: request.version },
+      current: { ...(l ? { fingerprint: snapshotFingerprint(layerEditSnapshot(v, l)) } : {}), version: getSourceVersion() },
+      selected: s.ui.selectedElementId === layer.id, changed, layerChanged: changed.length > 0 });
+  };
+  const staleOnServer = (where: LayerEditConflict['where'], e: unknown, request: { snapshot: string; version: number }, operationId?: string, resultArrived = false) => {
+    if (e instanceof LayerEditApiError && e.code === 'STALE_REVISION') conflict(where, request, { operationId, resultArrived, code: e.code });
+  };
 
   useEffect(() => {
     mounted.current = true;
@@ -112,6 +124,16 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
   const readyImage = previewImage?.id === candidate?.operationId ? previewImage : undefined;
   const phase = layerEditPhase({ eligible: !eligibility.reason, busy, stale, quote: !!quote, candidate: !!candidate, imageReady: !!readyImage, imageFailed: !!candidate && imageFailed === candidate.operationId, pending: !!pending });
   const comparing = phase === 'compare' || phase === 'applying';
+  // The request the stale check compares with: a loaded preview's quote, else the request still pending, else the quote.
+  const request = candidate ? quote : pending ?? quote;
+  const reported = useRef('');
+  useEffect(() => {
+    if (phase !== 'stale' || !request) return;
+    const key = `${operation.current}|${request.snapshot.length}|${request.version}`;
+    if (reported.current === key) return;
+    reported.current = key;
+    conflict(busy === 'generate' ? 'during-generation' : candidate ? 'preview' : pending ? 'pending' : 'quote', request, { ...(operation.current ? { operationId: operation.current } : {}), resultArrived: !!candidate });
+  });
   const activeMode = comparing ? mode : 'before';
   useLayoutEffect(() => {
     if (!candidate || !quote || !readyImage || stale) return;
@@ -146,7 +168,7 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       if (!live(token)) return;
       if (!current(snapshot, version)) throw new Error('The layer changed while the cost was being checked. Try again.');
       setQuote({ estimate: result, source, snapshot, version, before: URL.createObjectURL(asset.blob) }); setApproved(false);
-    } catch (e) { if (live(token)) setFeedback(failureFeedback(e, 'Couldn’t check the cost of this edit. Nothing was charged.')); }
+    } catch (e) { staleOnServer('quote', e, { snapshot, version }); if (live(token)) setFeedback(failureFeedback(e, 'Couldn’t check the cost of this edit. Nothing was charged.')); }
     finally { end(token); }
   };
   const generate = async () => {
@@ -166,14 +188,18 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       // Discarded meanwhile, or the panel closed: nothing here changes, and an unseen result stays recoverable.
       if (!live(token)) return;
       if (!current(from.snapshot, from.version)) {
-        await layerEditApi.discard(id).catch(() => undefined);
-        if (live(token)) { reset(); setFeedback({ tone: 'warning', title: 'The layer changed while this edit was generating, so its result was discarded.', detail: 'The original layer is unchanged. Start a new edit when you’re ready.' }); }
+        // A completed, paid result is never deleted by this client-side check. It stays on the server and in this layer's
+        // recovery record (outcomeKnown stays false): Discard removes it, and once the layer is exactly as requested again
+        // (e.g. after Undo), an explicit, server-verified status check can collect it. It is never applied or shown here.
+        conflict('result', from, { operationId: id, resultArrived: true });
+        setPending({ id, ...from, prompt: text, status: 'unchecked' });
         return;
       }
       outcomeKnown.current = true;
       setPending(undefined); setPreviewImage(undefined); setImageFailed(''); setMode('after'); setCandidate(result);
     } catch (e) {
       if (!live(token)) return;
+      staleOnServer('generate', e, from, recorded ? id : undefined);
       const outcome = recorded ? generateOutcome(e).kind : 'not-sent';
       if (outcome === 'not-sent') { forget(); setPending(undefined); setFeedback(failureFeedback(e, 'The edit wasn’t started. Nothing was charged.')); }
       else if (outcome === 'discarded') { reset(); setFeedback({ tone: 'info', title: 'This edit was discarded. No layer was changed.' }); }
@@ -183,17 +209,17 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       }
     } finally { end(token); }
   };
-  const recover = async () => {
-    if (!pending || stale) return;
+  /** request: the pending request, or (from the stale card) the same request once the layer matches it again. */
+  const recover = async (request = pending) => {
+    if (!request || (request === pending && stale)) return;
     const token = begin('status'); if (!token) return;
-    const request = pending;
     try {
       const status = await layerEditApi.status(request.id, savedRevision());
       if (!live(token)) return;
       if (status.candidate && (status.status === 'candidate' || status.status === 'applied')) {
         const { asset, source } = await loadSource();
         if (!live(token)) return;
-        if (!current(request.snapshot, request.version)) throw new Error('The layer changed while this request was being checked. Discard it and start again.');
+        if (!current(request.snapshot, request.version)) { conflict('recover', request, { operationId: request.id, resultArrived: true }); throw new Error('The layer changed while this request was being checked. Discard it and start again.'); }
         if (source.sourceSha256 !== status.candidate.sourceSha256) throw new Error('This result was made from a different image than the layer shows now. Discard it and start again.');
         outcomeKnown.current = true;
         setQuote({ estimate: status.candidate, source, snapshot, version, before: URL.createObjectURL(asset.blob) });
@@ -205,9 +231,19 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       }
     } catch (e) {
       if (!live(token)) return;
+      staleOnServer('recover', e, request, request.id);
       if (e instanceof LayerEditApiError && e.code === 'NOT_FOUND') { reset(); setFeedback({ tone: 'info', title: 'This request isn’t on the server, so there is nothing to collect.', detail: 'If it never reached the server, nothing was generated or charged. You can start a new edit.' }); }
       else setFeedback(failureFeedback(e, 'Unable to confirm request status. Nothing was resubmitted.'));
     } finally { end(token); }
+  };
+  /**
+   * The layer is exactly as the kept request was made from again (e.g. the change was undone). Nothing revives on its own:
+   * this explicit click checks the request's status, and recover() verifies the layer and the source image once more.
+   */
+  const recheck = () => {
+    if (!pending || busy || !matchesLayerEditSnapshot(pending.snapshot, variant, layer)) return;
+    const rebased = { ...pending, version };
+    setQuote(undefined); setPending(rebased); void recover(rebased);
   };
   /** again: discard a viewed result to try the same prompt again, which requires a new approval. */
   const discard = async (again = false) => {
@@ -235,7 +271,7 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       existed = await assets.hasAsset(assetId); await assets.putAsset(assetId, readyImage.blob); stored = true;
       // Revalidates the saved source on the server; no creative mutation or AI request.
       await layerEditApi.apply(candidate.operationId, savedRevision());
-      if (!current(quote.snapshot, quote.version)) throw new Error('The layer changed. This preview cannot be applied.');
+      if (!current(quote.snapshot, quote.version)) { conflict('apply', quote, { operationId: candidate.operationId, resultArrived: true }); throw new Error('The layer changed. This preview cannot be applied.'); }
       // Unrelated edits and save acknowledgements may have advanced the document while awaiting storage/API validation.
       const { v, l } = latest();
       store.dispatch(layerEditApplied({ variantId: v.id, id: l!.id, assetId, expectedRevision: v.revision, expectedLayer: JSON.stringify(l), geometry: editedLayerGeometry(l!, candidate.geometry), timestamp: new Date().toISOString() }));
@@ -245,6 +281,7 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       forget(); setCandidate(undefined); setPreviewImage(undefined); setQuote(undefined); setPrompt('');
       setFeedback({ tone: 'success', title: 'Edit applied', detail: 'Undo restores the previous image. Save creative to keep this version. You can describe another change now.' });
     } catch (e) {
+      staleOnServer('apply', e, quote, candidate.operationId, true);
       if (stored && !applied && !existed) await assets.deleteAsset(assetId).catch(() => undefined);
       if (live(token)) setFeedback(failureFeedback(e, 'The edit couldn’t be applied. The layer was not changed.'));
     } finally { end(token); }
@@ -327,13 +364,25 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
           </div>
         </>;
       }
-      case 'stale': return <>
-        <div className="ai-layer-card is-warning" role="alert">
-          <p className="ai-layer-card-title">{busy === 'generate' ? 'The layer changed during generation' : 'This edit no longer matches the layer'}</p>
-          <p>{candidate || pending ? 'The selected layer changed after this edit was requested, so its result can’t be applied.' : 'The selected layer changed after the cost was checked.'} The original layer is unchanged.</p>
-        </div>
-        <div className="ai-layer-actions"><button className="button" onClick={() => void discard()}>{candidate || pending ? 'Discard' : 'Start again'}</button></div>
-      </>;
+      case 'stale': {
+        const what = request ? describeLayerEditChanges(layerEditChanges(request.snapshot, variant, layer)) : '';
+        // A request whose result is not loaded: running, or arrived while the layer differed. Kept until someone discards it.
+        const kept = !!pending && !candidate, matchesAgain = kept && !busy && matchesLayerEditSnapshot(pending.snapshot, variant, layer);
+        return <>
+          <div className="ai-layer-card is-warning" role="alert">
+            <p className="ai-layer-card-title">{busy === 'generate' ? 'The layer changed during generation' : 'This edit no longer matches the layer'}</p>
+            <p>{candidate || pending ? 'The selected layer changed after this edit was requested, so its result can’t be applied.' : 'The selected layer changed after the cost was checked.'} The original layer is unchanged.</p>
+            <p className="ai-layer-meta">{what ? `Changed: ${what}.` : 'The layer was changed and then changed back.'}</p>
+            {kept && <p>{matchesAgain ? 'The layer matches this request again. Check its status to collect the result — free, and never generated again.'
+              : busy === 'generate' ? 'The request keeps running and its result will be kept, not deleted: undo the change to collect it, or discard it.'
+              : 'Its result is kept, not deleted: undo the change to collect it, or discard it.'}</p>}
+          </div>
+          <div className="ai-layer-actions">
+            {matchesAgain && <button className="button ai-layer-primary" onClick={recheck}>Check request status</button>}
+            <button className="button" onClick={() => void discard()}>{candidate || pending ? 'Discard' : 'Start again'}</button>
+          </div>
+        </>;
+      }
       case 'discarding': return <button className="button ai-layer-primary" disabled aria-busy="true"><Spinner />Discarding…</button>;
       default: return null;
     }

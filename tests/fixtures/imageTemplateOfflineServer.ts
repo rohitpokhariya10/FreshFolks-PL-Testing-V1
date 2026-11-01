@@ -99,7 +99,9 @@ const plannerUsage = { input_tokens: 3376, input_tokens_details: { cached_tokens
 const referenceUsage = { input_tokens: 2616, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1937 };
 const callCounts = { openai: 0, fal: 0, seedream: 0 };
 /** AI layer edits whose prompt contains "hold test" wait here until a test releases them by prompt text. */
-const heldLayerEdits: { prompt: string; release: () => void }[] = [];
+const heldLayerEdits: { prompt: string; operationId?: string; release: () => void }[] = [];
+/** AI layer edits held by their exact operation ID (registered by a test before the request reaches the server). */
+const heldOperations = new Set<string>();
 const generate = async (request: { size: string; prompt: string; image?: File | File[]; mask?: File }) => {
   callCounts.openai++;
   const images = request.image ? Array.isArray(request.image) ? request.image : [request.image] : [];
@@ -483,11 +485,12 @@ const router = createLayerizeRouter({
   },
   runsDir: join(root, 'runs'), imageTemplatesDir: join(root, 'templates'), protectedDir: join(root, 'protected'), wordRecognizer: () => variationRecognizer, masterRecognizer: () => masterRecognizer,
   // Product with Text templates: the fixture poster's words (no OCR), the fixture's vision answer and a fake cut-out service, each counted.
-  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, layerEditor: () => ({ model: 'offline-layer-editor', offline: true, async regenerate({ image, prompt }) {
+  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, layerEditor: () => ({ model: 'offline-layer-editor', offline: true, async regenerate({ image, prompt }, _save, operationId) {
     callCounts.openai++; events.push({ kind: 'generation', source: digest(image), inputs: [digest(image)], prompt, size: '1024x1024' });
     if (prompt.includes('invalid parameter test')) throw Object.assign(new Error('private provider response'), { status: 400, code: 'invalid_value', param: 'background', request_id: 'req_offline_rejection' });
     if (prompt.includes('slow test')) await new Promise(resolve => setTimeout(resolve, 1500));
     if (prompt.includes('hold test')) await new Promise<void>(release => heldLayerEdits.push({ prompt, release }));
+    if (heldOperations.delete(operationId)) await new Promise<void>(release => heldLayerEdits.push({ prompt, operationId, release }));
     if (prompt.includes('balance test')) throw Object.assign(new Error('private provider response'), { status: 429, code: 'insufficient_quota', request_id: 'req_offline_quota' });
     const edit = prompt.split('Requested edit: ').at(-1) ?? '', person = prompt.includes('Raise'), body = person
       ? '<circle cx="512" cy="280" r="60" fill="#a96848"/><path d="M440 340 H580 L770 125 L820 165 L610 440 V850 H430 V450 L300 540 L270 490 Z" fill="#3b82f6"/>'
@@ -624,9 +627,23 @@ app.get('/__test__/call-counts', (_req, res) => res.json(callCounts));
 // Image requests whose prompt carries a test's own token: an exact count even while other specs share this server.
 app.get('/__test__/image-calls', (req, res) => res.json({ count: events.filter(e => e.kind === 'generation' && e.prompt?.includes(String(req.query.contains ?? '\u0000'))).length }));
 // AI layer edits held by a "hold test" prompt: count them, or release them, by the test's own prompt text.
-app.get('/__test__/layer-edits-held', (req, res) => res.json({ count: heldLayerEdits.filter(h => h.prompt.includes(String(req.query.contains ?? '\u0000'))).length }));
+// `operation`: one exact operation ID instead of prompt text, so repeated or parallel tests never release each other's edit.
+const heldBy = (query: Record<string, unknown>) => (h: (typeof heldLayerEdits)[number]) => typeof query.operation === 'string' ? h.operationId === query.operation : h.prompt.includes(String(query.contains ?? '\u0000'));
+app.get('/__test__/layer-edits-held', (req, res) => res.json({ count: heldLayerEdits.filter(heldBy(req.query)).length }));
+app.post('/__test__/layer-edits-hold', (req, res) => {
+  const id = String(req.query.operation ?? '');
+  if (!/^[a-f0-9-]{36}$/.test(id)) { res.status(400).json({ error: 'operation required' }); return; }
+  heldOperations.add(id); res.json({ held: id });
+});
+// A saved product template from this machine's git-ignored artifacts, copied (never written back) for real-layout tests.
+app.post('/__test__/import-product-template', (req, res) => {
+  const id = String(req.query.id ?? ''), from = resolve('artifacts/decomposition/protected-templates', id);
+  if (!/^pt-[a-f0-9]{12}$/.test(id) || !existsSync(join(from, 'template.json'))) { res.status(404).json({ error: 'not available' }); return; }
+  if (!existsSync(join(root, 'protected', id))) cpSync(from, join(root, 'protected', id), { recursive: true });
+  res.json({ imported: id });
+});
 app.post('/__test__/layer-edits-release', (req, res) => {
-  const contains = String(req.query.contains ?? '\u0000'), released = heldLayerEdits.filter(h => h.prompt.includes(contains));
+  const released = heldLayerEdits.filter(heldBy(req.query));
   for (const h of released) { heldLayerEdits.splice(heldLayerEdits.indexOf(h), 1); h.release(); }
   res.json({ released: released.length });
 });
