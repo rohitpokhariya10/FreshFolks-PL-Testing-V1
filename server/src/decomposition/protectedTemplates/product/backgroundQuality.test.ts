@@ -17,7 +17,8 @@ describe('replacement background quality and provenance', () => {
     expect(result.quality.issues).toContainEqual(expect.objectContaining({ id: 'leftover-logo', blocking: true }));
   });
 
-  it('blocks residue for every selected product and retains the actual provider background for diagnosis', async () => {
+  // ~3 s of image work alone; past the 5 s default under the full parallel suite (timed out at 6.2 s on 2 November 2026).
+  it('blocks residue for every selected product and retains the actual provider background for diagnosis', { timeout: 30_000 }, async () => {
     const png = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="600" height="600"><rect width="600" height="600" fill="#e9e5dd"/><rect x="100" y="160" width="100" height="160" fill="#122438"/><rect x="350" y="160" width="130" height="160" fill="#652717"/></svg>')).png().toBuffer();
     const source = await decodeRgba(png), objects: ProductObject[] = [
       { id: 'po-purifier', label: 'Water purifier', box: { x: 90, y: 150, width: 120, height: 180 } },

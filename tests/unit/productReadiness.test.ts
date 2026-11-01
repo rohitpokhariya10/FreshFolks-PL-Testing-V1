@@ -13,7 +13,8 @@ describe.skipIf(!handmade)('Product analysis live-request readiness (mock transp
   const {create,analyzer}=fake({status:'completed',output:[],output_text:JSON.stringify(answer),usage}),saved=new Map<string,object>();
   const scene=await analyzer.analyze(await png(),'image/png',(f,v)=>saved.set(f,v));
   expect(create).toHaveBeenCalledTimes(1);
-  expect(create.mock.calls[0][0]).toMatchObject({model:'gpt-5.6-sol',store:false,max_output_tokens:PRODUCT_ANALYSIS_MAX_OUTPUT_TOKENS,reasoning:{effort:'medium'},text:{format:{strict:true,schema:PRODUCT_ANALYSIS_SCHEMA}}});
+  // Background mode (stored at OpenAI) so a request that outlives the wait can be collected later by its response ID.
+  expect(create.mock.calls[0][0]).toMatchObject({model:'gpt-5.6-sol',background:true,store:true,max_output_tokens:PRODUCT_ANALYSIS_MAX_OUTPUT_TOKENS,reasoning:{effort:'medium'},text:{format:{strict:true,schema:PRODUCT_ANALYSIS_SCHEMA}}});
   // 300 s since 2026-10-22: the approved live call took 106 s, and a full-size upload timed out at the former 120 s.
   expect(PRODUCT_ANALYSIS_TIMEOUT_MS).toBe(300000);
   expect(create.mock.calls[0][1]).toEqual({maxRetries:0,timeout:PRODUCT_ANALYSIS_TIMEOUT_MS});

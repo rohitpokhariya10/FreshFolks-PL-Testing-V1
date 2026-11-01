@@ -135,8 +135,10 @@ async function setup() {
     if (created) await vi.waitFor(() => expect(['generated', 'failed']).toContain(executions.get(execution.id).state), { timeout: 20_000 });
     return { execution: executions.get(execution.id), created };
   };
-  const settledSet = async (id: string): Promise<VariantSet> => { await vi.waitFor(() => expect(['ready', 'needs-cutout', 'failed']).toContain(smart.set(id).state), { timeout: 20_000 }); return smart.set(id); };
-  const settled = async (id: string): Promise<TemplateExecution> => { await vi.waitFor(() => expect(['done', 'failed']).toContain(executions.get(id).state), { timeout: 20_000 }); return executions.get(id); };
+  // Settling waits allow 60 s: a set takes ~6 s alone, but over 20 s when the whole suite runs in parallel on every core
+  // (2 November 2026, "one click" still 'generating' at 20,149 ms). Each describe's own timeout (60–90 s) still bounds them.
+  const settledSet = async (id: string): Promise<VariantSet> => { await vi.waitFor(() => expect(['ready', 'needs-cutout', 'failed']).toContain(smart.set(id).state), { timeout: 60_000 }); return smart.set(id); };
+  const settled = async (id: string): Promise<TemplateExecution> => { await vi.waitFor(() => expect(['done', 'failed']).toContain(executions.get(id).state), { timeout: 60_000 }); return executions.get(id); };
   return { root, templates, executions, scenes, variants, smart, service, source, version, upload, analyzed, generate, settledSet, settled, imageEdits, imageGenerations, analyze, resolve, verify, write, segment, decomposed, submitted, plannerCalls, fal,
     setScene: (value: unknown) => { sceneAnswer = value; }, setProposal: (value: ResolverProposal | Error) => { proposal = value; }, setVerdict: (value: typeof verdict) => { verdict = value; },
     setConcepts: (make: typeof concepts) => { concepts = make; }, setMask: (value: typeof maskBoxes) => { maskBoxes = value; } };

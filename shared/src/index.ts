@@ -232,3 +232,4 @@ export * from './offerFonts.js';
 export * from './masterTemplates.js';
 export * from './masterAi.js';
 export * from './productTemplates.js';
+export * from './layerEdit.js';

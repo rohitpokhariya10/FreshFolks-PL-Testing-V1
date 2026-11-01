@@ -1,3 +1,5 @@
+import { registerLayerEditRoutes } from './layerEditRoutes.js';
+import { resolveLayerEdit } from './layerEditSource.js';
 import { createProductLayerizer, liveDecompositionPlanner, type ProductLayerizer } from './protectedTemplates/product/aiDecompose.js';
 import { liveProductAnalyzer } from './protectedTemplates/product/analyzer.js';
 /**
@@ -143,6 +145,7 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
   productComposer?: () => ReuseComposer | undefined;
   /** The creative regenerated in a common ratio by the image model (both workflows); default: the live one when an OpenAI key is set. */
   productRegenerator?: () => RatioRegenerator | undefined;
+  layerEditor?: () => RatioRegenerator | undefined;
   /** The cut-out check after a decomposition (product/layerEvidence.ts, cutoutVerification.ts); default on, FRAMEFLOW_CUTOUT_VERIFICATION=0 turns it off. */
   productCutoutVerification?: () => boolean;
   /** Product with Text templates: the image model for new AI artwork of recomposed variations (used only with approval). */
@@ -222,7 +225,7 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
   // Text & Graphics master templates (protectedTemplates/master/): local scan and clean background, creatives from saved files.
   registerMasterTemplateRoutes(router, { masters: createMasterTemplates({ store: protectedStore, service: protectedService, runsDir, recognizer: options.masterRecognizer ?? options.wordRecognizer ?? localRecognizer }) });
   // Product with Text templates (protectedTemplates/product/): text and bank logos kept as overlays, each object on its own.
-  registerProductTemplateRoutes(router, { products: createProductTemplates({ store: protectedStore, service: protectedService, runsDir, recognizer: options.productRecognizer ?? options.masterRecognizer ?? options.wordRecognizer ?? localRecognizer,
+  const products = createProductTemplates({ store: protectedStore, service: protectedService, runsDir, recognizer: options.productRecognizer ?? options.masterRecognizer ?? options.wordRecognizer ?? localRecognizer,
     analyzer: options.productAnalyzer ?? (() => (process.env.OPENAI_API_KEY ? liveProductAnalyzer() : undefined)),
     segmenter: options.productSegmenter ?? (() => (process.env.FAL_KEY ? liveSegmenter('sam3', () => deps().transport()) : undefined)),
     layerizer: options.productLayerizer ?? (() => (process.env.OPENAI_API_KEY && process.env.FAL_KEY ? createProductLayerizer({ planner: liveDecompositionPlanner(), transport: () => deps().transport() }) : undefined)),
@@ -231,7 +234,10 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
     placement: options.productPlacement ?? (() => (process.env.OPENAI_API_KEY ? liveReusePlacementPlanner() : undefined)),
     composer: options.productComposer ?? (() => (process.env.OPENAI_API_KEY ? liveReuseComposer() : undefined)),
     regenerator: options.productRegenerator ?? (() => (process.env.OPENAI_API_KEY ? liveRatioRegenerator() : undefined)),
-    cutoutVerification: options.productCutoutVerification ?? (() => process.env.FRAMEFLOW_CUTOUT_VERIFICATION !== '0') }) });
+    cutoutVerification: options.productCutoutVerification ?? (() => process.env.FRAMEFLOW_CUTOUT_VERIFICATION !== '0') });
+  registerProductTemplateRoutes(router, { products });
+  registerLayerEditRoutes(router, { dir: join(runsDir, 'layer-edits'), resolve: resolveLayerEdit({ store: protectedStore, creatives: products.creatives, runsDir }),
+    provider: options.layerEditor ?? (() => process.env.OPENAI_API_KEY ? liveRatioRegenerator() : undefined) });
 
   router.get('/runs/:id/diagnostics', async (req, res, next) => {
     try {

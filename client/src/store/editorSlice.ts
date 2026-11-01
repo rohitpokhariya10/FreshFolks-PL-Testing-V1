@@ -307,6 +307,18 @@ export const editorSlice = createSlice({
       variant.revision += 1;
       state.document.updatedAt = timestamp;
     },
+    /** One undo step for the accepted asset and its expanded bounds; stale previews are a no-op. */
+    layerEditApplied(state, action: PayloadAction<LayerTarget & { assetId: string; expectedRevision: number; expectedLayer: string; geometry: { x: number; y: number; width: number; height: number } }>) {
+      const p = action.payload, variant = state.document.variants.find(v => v.id === p.variantId);
+      const index = variant?.layers?.findIndex(l => l.id === p.id) ?? -1;
+      const layer = index >= 0 ? variant!.layers![index] : undefined;
+      if (!variant?.layers || layer?.type !== 'image' || layer.locked || !layer.visible || variant.revision !== p.expectedRevision || JSON.stringify(layer) !== p.expectedLayer) return;
+      const { fit: _fit, focalPoint: _focal, radius: _radius, ...base } = layer; void _fit; void _focal; void _radius;
+      const next = { ...base, ...p.geometry, assetId: p.assetId };
+      if (!isDesignLayer(next)) return;
+      variant.layers[index] = next;
+      variant.revision++; state.document.updatedAt = p.timestamp;
+    },
     /** Swaps an image layer's picture, keeping its position, size, name and provenance. */
     layerImageReplaced(state, action: PayloadAction<LayerTarget & { assetId: string }>) {
       const { variantId, id, assetId, timestamp } = action.payload;
@@ -373,4 +385,4 @@ export const editorSlice = createSlice({
     },
   },
 });
-export const { creativeSynced, layerUpdated, layerDeleted, layerDuplicated, layerReordered, layerAdded, layerImageReplaced, canvasBackgroundChanged, decomposedDesignImported, layerConvertedToText, documentRenamed, canvasResized, textAdded, textUpdated, textMoved, textWidthResized, textDuplicated, textDeleted, textGroupUpdated, textGroupMoved, textPhraseEdited, textAutoLayoutApplied, generatedDesignApplied, adaptedDesignApplied } = editorSlice.actions;
+export const { layerEditApplied, creativeSynced, layerUpdated, layerDeleted, layerDuplicated, layerReordered, layerAdded, layerImageReplaced, canvasBackgroundChanged, decomposedDesignImported, layerConvertedToText, documentRenamed, canvasResized, textAdded, textUpdated, textMoved, textWidthResized, textDuplicated, textDeleted, textGroupUpdated, textGroupMoved, textPhraseEdited, textAutoLayoutApplied, generatedDesignApplied, adaptedDesignApplied } = editorSlice.actions;

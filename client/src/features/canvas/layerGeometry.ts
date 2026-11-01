@@ -1,4 +1,14 @@
-import { imageFit, type ImageLayerElement, type ShapeLayerElement } from '@frameflow/shared';
+import { imageFit, LAYER_LIMITS, type DesignLayer, type ImageLayerElement, type ShapeLayerElement } from '@frameflow/shared';
+
+/**
+ * A finished Transformer gesture as layer changes, or undefined when nothing moved: pressing a handle without dragging it
+ * still ends a transform, and re-normalising an unchanged rotation (12.3 → 12.299999999999955, 180 → -180) would record
+ * an edit nobody made.
+ */
+export function transformedLayer(layer: Pick<DesignLayer, 'x' | 'y' | 'width' | 'height' | 'rotation'>, node: { x: number; y: number; scaleX: number; scaleY: number; rotation: number }) {
+  if (node.scaleX === 1 && node.scaleY === 1 && node.rotation === layer.rotation && node.x === layer.x && node.y === layer.y) return undefined;
+  return { x: node.x, y: node.y, width: Math.max(LAYER_LIMITS.minSide, layer.width * node.scaleX), height: Math.max(LAYER_LIMITS.minSide, layer.height * node.scaleY), rotation: ((node.rotation + 540) % 360) - 180 };
+}
 
 /**
  * Where a layer's picture is drawn inside its box. Without a fit it is stretched to the box, as layers always were. With

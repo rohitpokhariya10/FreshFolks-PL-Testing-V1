@@ -11,7 +11,7 @@
  */
 import sharp from 'sharp';
 
-export interface UploadCutout { png: Buffer; width: number; height: number; background: 'transparent' | 'removed' | 'kept'; note?: string }
+export interface UploadCutout { png: Buffer; width: number; height: number; background: 'transparent' | 'removed' | 'kept'; note?: string; bounds: { left: number; top: number; width: number; height: number } }
 const MAX_SIDE = 2048;
 
 export async function cutOutUpload(bytes: Buffer): Promise<UploadCutout> {
@@ -55,5 +55,5 @@ async function trimmed(px: Buffer, w: number, h: number, background: UploadCutou
   if (x1 < 0) { x0 = 0; y0 = 0; x1 = w - 1; y1 = h - 1; }
   const width = x1 - x0 + 1, height = y1 - y0 + 1;
   const png = await sharp(px, { raw: { width: w, height: h, channels: 4 } }).extract({ left: x0, top: y0, width, height }).png().toBuffer();
-  return { png, width, height, background };
+  return { png, width, height, background, bounds: { left: x0, top: y0, width, height } };
 }

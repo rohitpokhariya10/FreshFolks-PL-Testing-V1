@@ -8,13 +8,14 @@ import 'konva/lib/shapes/Ellipse';
 import 'konva/lib/shapes/Image';
 import 'konva/lib/shapes/Rect';
 import 'konva/lib/shapes/Transformer';
-import { LAYER_LIMITS, type DesignLayer } from '@frameflow/shared';
+import type { DesignLayer } from '@frameflow/shared';
 import { useAppDispatch } from '../../store';
 import { layerUpdated } from '../../store/editorSlice';
 import { elementSelected } from '../../store/uiSlice';
 import { assets, decodeImage } from '../../lib/assets/runtimeAssets';
 import { focusCanvas } from '../text/useTextActions';
-import { cornerRadius, layerImageProps, shapeFillProps, strokeProps } from './layerGeometry';
+import { cornerRadius, layerImageProps, shapeFillProps, strokeProps, transformedLayer } from './layerGeometry';
+import { previewLayer, type LayerCanvasPreview } from '../layers/LayerEditPreview';
 
 /** Decoded layer bitmaps, shared by all nodes and export for the lifetime of the page. */
 const bitmaps = new Map<string, Promise<HTMLImageElement>>();
@@ -29,9 +30,10 @@ export function layerBitmap(assetId: string) {
 }
 
 /** raiseHandles: keep the selection handles above later elements, for designs that interleave text and layers. */
-interface Props { layer: DesignLayer; selected: boolean; variantId: string; raiseHandles?: boolean }
+interface Props { layer: DesignLayer; selected: boolean; variantId: string; raiseHandles?: boolean; preview?: LayerCanvasPreview }
 
-export function DesignLayerNode({ layer, selected, variantId, raiseHandles = false }: Props) {
+export function DesignLayerNode({ layer: originalLayer, selected, variantId, raiseHandles = false, preview }: Props) {
+  const layer = previewLayer(originalLayer, preview);
   const dispatch = useAppDispatch();
   const groupRef = useRef<KonvaGroup>(null);
   const transformerRef = useRef<KonvaTransformer>(null);
@@ -43,30 +45,31 @@ export function DesignLayerNode({ layer, selected, variantId, raiseHandles = fal
     void layerBitmap(assetId).then(bitmap => { if (!cancelled) setImage({ id: assetId, bitmap }); }).catch(() => undefined);
     return () => { cancelled = true; };
   }, [assetId]);
+  const bitmap = preview?.mode === 'after' ? preview.image : image && image.id === assetId ? image.bitmap : undefined;
   useLayoutEffect(() => {
     if (selected && groupRef.current && transformerRef.current) { transformerRef.current.nodes([groupRef.current]); if (raiseHandles) transformerRef.current.moveToTop(); transformerRef.current.forceUpdate(); }
-  }, [selected, layer.width, layer.height, layer.rotation, image, raiseHandles]);
+  }, [selected, layer.width, layer.height, layer.rotation, bitmap, preview, raiseHandles]);
   if (!layer.visible) return null;
   const select = () => { dispatch(elementSelected(layer.id)); focusCanvas(); };
-  const commit = (changes: Parameters<typeof layerUpdated>[0]['changes']) => dispatch(layerUpdated({ variantId, id: layer.id, changes, timestamp: new Date().toISOString() }));
+  const commit = (changes: Parameters<typeof layerUpdated>[0]['changes']) => { if (!preview) dispatch(layerUpdated({ variantId, id: layer.id, changes, timestamp: new Date().toISOString() })); };
   return <>
     <Group ref={groupRef} id={layer.id} name="design-layer" x={layer.x} y={layer.y} rotation={layer.rotation} opacity={layer.opacity}
-      draggable={!layer.locked} listening onMouseDown={select} onTouchStart={select} onClick={select} onTap={select} onDragStart={select}
+      draggable={!layer.locked && !preview} listening onMouseDown={select} onTouchStart={select} onClick={select} onTap={select} onDragStart={select}
       onDragEnd={(event) => { const node = event.target as KonvaGroup; commit({ x: node.x(), y: node.y() }); }}
       onTransformEnd={() => {
         const node = groupRef.current; if (!node) return;
-        const width = Math.max(LAYER_LIMITS.minSide, layer.width * node.scaleX()), height = Math.max(LAYER_LIMITS.minSide, layer.height * node.scaleY());
+        const changes = transformedLayer(layer, { x: node.x(), y: node.y(), scaleX: node.scaleX(), scaleY: node.scaleY(), rotation: node.rotation() });
         node.scale({ x: 1, y: 1 });
-        commit({ x: node.x(), y: node.y(), width, height, rotation: ((node.rotation() + 540) % 360) - 180 });
+        if (changes) commit(changes);
       }}>
       {layer.type === 'image'
         ? layer.assetId === undefined
           // An empty image slot: it keeps its place and size, and takes a picture with Replace image.
           ? <Rect name="layer-image-slot" width={layer.width} height={layer.height} fill="#EEF0EC" stroke="#9AA39D" strokeWidth={2} dash={[10, 8]} cornerRadius={Math.min(layer.radius ?? 0, layer.width / 2, layer.height / 2)} />
-          : image?.id === layer.assetId && <>
+          : bitmap && <>
             {/* A fitted picture may not fill its box: the whole box stays the layer's frame and hit area. */}
             {layer.fit && <Rect width={layer.width} height={layer.height} fill="transparent" />}
-            <KonvaImage name="layer-image" image={image.bitmap} {...layerImageProps(layer, image.bitmap)} />
+            <KonvaImage name="layer-image" image={bitmap} {...layerImageProps(layer, bitmap)} />
           </>
         : layer.shapeType === 'circle'
           ? <Circle name="layer-shape" x={layer.width / 2} y={layer.height / 2} radius={Math.min(layer.width, layer.height) / 2} {...shapeFillProps({ ...layer, width: Math.min(layer.width, layer.height), height: Math.min(layer.width, layer.height) }, 'center')} {...strokeProps(layer)} />
@@ -74,7 +77,7 @@ export function DesignLayerNode({ layer, selected, variantId, raiseHandles = fal
           ? <Ellipse name="layer-shape" x={layer.width / 2} y={layer.height / 2} radiusX={layer.width / 2} radiusY={layer.height / 2} {...shapeFillProps(layer, 'center')} {...strokeProps(layer)} />
           : <Rect name="layer-shape" width={layer.width} height={layer.height} cornerRadius={cornerRadius(layer)} {...shapeFillProps(layer)} {...strokeProps(layer)} />}
     </Group>
-    {selected && !layer.locked && <Transformer ref={transformerRef} name="layer-transformer" rotateEnabled keepRatio={layer.type === 'image' && !layer.fit} flipEnabled={false}
+    {selected && !layer.locked && <Transformer ref={transformerRef} name="layer-transformer" rotateEnabled={!preview} resizeEnabled={!preview} keepRatio={layer.type === 'image' && !layer.fit} flipEnabled={false}
       anchorSize={8} anchorCornerRadius={2} anchorFill="#FFFFFF" anchorStroke="#285443" anchorStrokeWidth={1} borderStroke="#285443" borderStrokeWidth={1}
       boundBoxFunc={(oldBox, nextBox) => Math.abs(nextBox.width) < 4 || Math.abs(nextBox.height) < 4 ? oldBox : nextBox} />}
   </>;

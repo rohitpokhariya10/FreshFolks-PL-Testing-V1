@@ -67,7 +67,11 @@ test('create a template, generate a Match Reference image, decompose it with Fra
   await panel.getByRole('textbox', { name: 'Offer / price', exact: true }).fill('No-cost EMI from ₹1,999/month');
   await expect(panel.getByText(/Estimated cost: up to ₹/)).toBeVisible();
   const breakdown = panel.getByRole('table').filter({ hasText: 'Estimated total' });
-  await expect(breakdown.getByRole('row')).toHaveCount(8);
+  // Header, the eight estimate lines and the total. Each possible repair and retry is its own line (an upper bound),
+  // shown as optional; the stages every image makes are not.
+  await expect(breakdown.getByRole('row')).toHaveCount(10);
+  await expect(breakdown.locator('tbody tr.is-optional').locator('th')).toHaveText([/^Planner structure repair \(only if needed\)/, /^Review structure repair \(only if needed\)/, /^Review retry \(only if interrupted output\)/]);
+  await expect(breakdown.locator('tbody tr:not(.is-optional)')).toHaveCount(5);
   await expect(breakdown.getByText('Reference / template analysis')).toBeVisible();
   await expect(breakdown.getByText('cached · no new call')).toBeVisible();
   await panel.getByRole('button', { name: 'Generate image', exact: true }).click();

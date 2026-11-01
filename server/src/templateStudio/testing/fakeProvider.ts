@@ -131,6 +131,8 @@ export class FakeProvider implements Provider {
           summary: 'Looks good.',
           scores: { styleConsistency: 4, subjectIdentity: 4, subjectCount: 5, focalHierarchy: 4, readability: 4, physicalPlausibility: 4, advertisingUsefulness: 4 },
           issues: [],
+          // Required by the review schema (contracts/ai.ts): the expected products, all present and recognisable.
+          productIntegrity: { observedCount: typeof data.expectedSubjectCount === 'number' ? data.expectedSubjectCount : null, missing: [], unexpected: [], identityProblems: [], uncertainties: [] },
           copiedReferenceContent: [],
           unwantedSceneText: this.sceneText,
           ...(data.fidelityMode === 'match' ? {

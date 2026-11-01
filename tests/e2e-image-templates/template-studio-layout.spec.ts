@@ -41,10 +41,15 @@ test('every Template Studio screen fits desktop and phone widths with saved data
   await seed(request);
   await page.route(url => /^https?:$/.test(url.protocol) && url.hostname !== '127.0.0.1', route => route.abort());
   for (const [width, height, label] of [[1440, 900, 'desktop'], [390, 844, 'mobile']] as const) {
-    await page.setViewportSize({ width, height });
+    // The developer launchers are hidden on phones by design (App.tsx, decomposition.css): the studio is opened at desktop
+    // width, then the window narrowed to the phone width with it open, as on a narrowed browser window.
+    await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto('/');
     await page.getByRole('button', { name: 'OpenAI + Seedream test' }).click();
+    await page.setViewportSize({ width, height });
+    if (width <= 640) await expect(page.getByRole('button', { name: 'OpenAI + Seedream test' })).toBeHidden();
     const panel = page.getByRole('dialog', { name: 'OpenAI + Seedream test' });
+    await expect(panel).toBeVisible();
     await panel.getByRole('tab', { name: 'Template Studio', exact: true }).click();
     const sections = [['Templates', 'Templates'], ['Create Template', 'What kind of template is it?'], ['Generate Image', 'Generate image'], ['Generation History', 'Generation history'], ['Assets', 'Assets'], ['Brand Kits', 'Brand kits'], ['Setup & Usage', 'Setup & usage']] as const;
     for (const [tab, heading] of sections) {

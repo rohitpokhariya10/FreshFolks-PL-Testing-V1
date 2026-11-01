@@ -116,13 +116,15 @@ export function createCampaign(db: Db, env: ServerEnv, given: CreateCampaignInpu
   try {
     const estimate = estimateReferencePoster(env, referencePolicy, { subjects: input.subjects.length, size: format.providerSize, quality });
     const total = estimate.totalMicroUsd;
-    preflightBudget(db, env, total);
+    // The poster's own limit first: preflightBudget checks the same per-job cap, so run after it this message (with what
+    // to change) could never be shown. preflightBudget still guards the remaining daily budget.
     if (!referencePolicy.localReuse && !estimate.withinCap) {
       throw new CampaignError(
         "over_budget",
         `This poster could cost up to ${formatUsd(estimate.totalMicroUsd)} (≈ ${formatInr(estimate.totalMicroUsd, env.USD_INR_RATE)}), above the ${formatUsd(estimate.capMicroUsd)} limit. Use fewer products, a lower quality, or raise STUDIO_MAX_JOB_BUDGET_USD.`,
       );
     }
+    preflightBudget(db, env, total);
   } catch (err) {
     if (err instanceof CostUnboundedError) throw new CampaignError("invalid", err.message);
     throw err;
