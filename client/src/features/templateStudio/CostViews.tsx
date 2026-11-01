@@ -16,7 +16,8 @@ export function EstimateTable({ estimate }: { estimate: StudioEstimate }) {
       <caption className="ts-sr">Estimated cost before generating</caption>
       <thead><tr><th scope="col">Stage</th><th scope="col">Model</th><th scope="col" className="ts-num">Up to</th></tr></thead>
       <tbody>
-        {estimate.lines.map(line => <tr key={line.stage} className={line.stage.startsWith('Structure repair') ? 'is-optional' : undefined}>
+        {/* A worst-case contingency ("… (only if needed)", "… (only if interrupted output)"), counted in the total but usually not made. */}
+        {estimate.lines.map(line => <tr key={line.stage} className={/\(only if /.test(line.stage) ? 'is-optional' : undefined}>
           <th scope="row">{line.stage}{line.cached && <Badge tone="ok">cached · no new call</Badge>}{line.note && <small>{line.note}</small>}</th>
           <td><code>{line.model}</code></td>
           <td className="ts-num">{line.cached && line.cost.microUsd === 0 ? <span className="ts-muted">₹0 new</span> : <Money value={line.cost} />}</td>
