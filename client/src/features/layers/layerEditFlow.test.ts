@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { LayerEditApiError } from './layerEditApi';
-import { createSingleFlight, failureFeedback, formatElapsed, generateOutcome, layerEditPhase, layerEditRecovery, type PhaseInput } from './layerEditFlow';
+import { applyBlocked, billingText, createSingleFlight, failureFeedback, formatElapsed, generateOutcome, identityNote, intentSummary, layerEditPhase, layerEditRecovery, POLL_BUDGET_MS, pollDelay, pollsAutomatically, type PhaseInput } from './layerEditFlow';
 
 const base: PhaseInput = { eligible: true, busy: '', stale: false, quote: false, candidate: false, imageReady: false, imageFailed: false, pending: false };
 const phase = (s: Partial<PhaseInput>) => layerEditPhase({ ...base, ...s });
@@ -115,5 +115,51 @@ describe('per-layer request recovery', () => {
     const r = layerEditRecovery(broken as unknown as () => Storage, 'doc', 'v1', 'object-fridge');
     expect(() => r.write({ id: 'a', snapshot: 's' })).toThrow();
     expect(r.read(() => true)).toBeUndefined(); expect(() => r.clear('a')).not.toThrow();
+  });
+});
+
+describe('identity gate in the panel', () => {
+  const validation = (identity: 'consistent' | 'review-required' | 'drift-suspected', limitation?: string) => ({ background: 'removed' as const, identity, ...(limitation ? { limitation } : {}) });
+  it('blocks Apply only for a result flagged as another product, until the person confirms it is the same product', () => {
+    expect(applyBlocked(validation('drift-suspected'), false)).toBe(true);
+    expect(applyBlocked(validation('drift-suspected'), true)).toBe(false);
+    expect(applyBlocked(validation('review-required'), false)).toBe(false);
+    expect(applyBlocked(validation('consistent'), false)).toBe(false);
+  });
+  it('explains each verdict without claiming more than pixel checks show; older results without checks still ask for review', () => {
+    expect(identityNote(validation('drift-suspected'))).toMatchObject({ tone: 'error', title: 'This may not be the same product' });
+    expect(identityNote(validation('consistent')).detail).toMatch(/cannot verify small logos or text/);
+    expect(identityNote(validation('review-required', 'Not checked automatically: layout and parts.')).detail).toBe('Not checked automatically: layout and parts.');
+    expect(identityNote(validation('review-required'))).toMatchObject({ tone: 'warning', detail: expect.stringMatching(/Compare identity/) });
+  });
+  it('names the edit type and whether identity is kept; an unclear instruction is never sent and never charged', () => {
+    expect(intentSummary({ operations: ['state', 'color'], preserveIdentity: true, expandsSilhouette: true })).toBe('Move or open parts + Change colour · keeps the product’s identity');
+    expect(intentSummary({ operations: ['replace'], preserveIdentity: false, expandsSilhouette: true })).toMatch(/identity may change/);
+    expect(generateOutcome(new LayerEditApiError('Clarify', 'CLARIFICATION_REQUIRED'))).toEqual({ kind: 'not-sent' });
+  });
+});
+
+describe('automatic status checks and billing wording', () => {
+  it('checks automatically only while a result may still arrive, at growing, bounded intervals', () => {
+    expect(['running', 'interrupted', 'unchecked'].every(s => pollsAutomatically(s as never))).toBe(true);
+    expect(pollsAutomatically('uncertain')).toBe(false); expect(pollsAutomatically('failed')).toBe(false);
+    const delays = Array.from({ length: 30 }, (_, i) => pollDelay(i));
+    expect(delays[0]).toBe(1500); expect(delays.every((d, i) => i === 0 || d >= delays[i - 1])).toBe(true); expect(Math.max(...delays)).toBe(15000);
+    // Within the budget there are a few dozen free checks at most, never an open-ended loop.
+    let t = 0, n = 0; while (t + pollDelay(n) <= POLL_BUDGET_MS) t += pollDelay(n++);
+    expect(n).toBeLessThan(40); expect(POLL_BUDGET_MS).toBeGreaterThan(330_000);
+  });
+  it('an automatic check keeps the pending card on screen; a person’s check shows its own state', () => {
+    expect(phase({ busy: 'poll', pending: true })).toBe('pending');
+    expect(phase({ busy: 'status', pending: true })).toBe('checking-status');
+  });
+  it('says nothing was charged only when the server knows it', () => {
+    expect(billingText('none')).toBe('Nothing was charged.');
+    expect(billingText('charged')).toBe('This request was charged.');
+    expect(billingText('possible')).toBe('A provider charge may apply.'); expect(billingText(undefined)).toBe('A provider charge may apply.');
+  });
+  it('a duplicate submission of a running operation is checked, never forgotten as unsent', () => {
+    expect(generateOutcome(new LayerEditApiError('Already submitted', 'IDEMPOTENCY_CONFLICT', 'running'))).toEqual({ kind: 'interrupted' });
+    expect(generateOutcome(new LayerEditApiError('Lost', 'LAYER_EDIT_FAILED', 'uncertain', 'possible'))).toEqual({ kind: 'uncertain' });
   });
 });

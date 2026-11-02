@@ -94,17 +94,17 @@ All paths are under `/api/layerize-experiment`:
 
 | Method and endpoint | Effect |
 | --- | --- |
-| `POST /layer-edits/estimate` | Resolve/validate the selected reference and return model, size and estimated cost; no AI call. |
-| `POST /layer-edits` | One approved reference-image generation. |
-| `GET /layer-edits/:id` | Read local request status/candidate; no resubmission. |
-| `POST /layer-edits/:id/apply` | Validate the source revision and retain the candidate as an applied reference; client updates its document. |
-| `POST /layer-edits/:id/discard` | Discard an unused pending candidate. |
+| `POST /layer-edits/estimate` | Resolve/validate the selected reference and return model, size, estimated cost, the edit type read from `prompt`, and the reference images (`references`); no AI call. Optional `prompt`, `region`, `useOriginalReference`. |
+| `POST /layer-edits` | One approved reference-image generation. `confirmAmbiguous: true` is required when the estimate asked for a clarification. |
+| `GET /layer-edits/:id` | Read local request status/candidate (with its identity verdict); no resubmission. |
+| `POST /layer-edits/:id/apply` | Validate the source revision and retain the candidate as an applied reference; client updates its document. A result flagged `drift-suspected` needs `acceptIdentityRisk: true` (HTTP 422 `IDENTITY_REVIEW_REQUIRED` otherwise). |
+| `POST /layer-edits/:id/discard` | Discard an unused pending candidate. `reason: "identity"` rejects it as another product: its image is kept on the server for review until the preview expires, never served or applied. |
 
 Prompts are limited to 1,000 characters; JSON requests are bounded; reference images are limited to 25 MB and 4,096² pixels. File/operation identifiers are validated. Unexpected endpoint errors are returned without raw storage paths or provider bodies. SDK retries are zero; the service also submits only once per operation ID.
 
 ## Pricing and provider support
 
-Default live model: **OpenAI GPT Image 2**, 1024 × 1024, high quality, one output PNG, with local background removal. The dated `gpt-image-2-2026-04-21` ID is also recognized. Other live model configurations are disabled for this feature until their pricing is verified.
+Default live model: **OpenAI GPT Image 2**, high quality, one output PNG, with local background removal. Edits that move parts (open, close, raise …), add a feature or replace the object use the square 1024 × 1024 frame; other edits use a frame shaped like the object within the same 1,048,576-pixel budget (for example 928 × 1120), so the estimate never exceeds the square one's. The dated `gpt-image-2-2026-04-21` ID is also recognized. Other live model configurations are disabled for this feature until their pricing is verified.
 
 The displayed estimate reuses the project's helper:
 
@@ -112,6 +112,7 @@ The displayed estimate reuses the project's helper:
 - Assumed 6,800 image-input tokens at $8 per million: $0.0544.
 - Assumed 1,500 text-input tokens at $5 per million: $0.0075.
 - Total $0.2729, displayed as **approximately $0.27 USD per candidate**.
+- When an earlier AI edit's original product is attached as a second input image (default for chained edits, can be left out in the approval card): **+$0.05** (the same 6,800 image tokens), shown before approval.
 
 This is an estimate, not a billing cap or guaranteed charge. Actual token usage can differ; usage-derived cost is shown when returned by the provider. The UI names the model, asks explicit approval for each generation, and explains that failed or discarded results can still be billed. Apply, Discard, movement, resize, Save and Export do not call AI. FLUX repair pricing is not used by this feature.
 
@@ -213,12 +214,111 @@ The previous partial work can be recovered later by switching to `feat/ai-layer-
 
 **Still protected.** Moving, resizing, rotating, replacing, hiding, locking or deleting the selected layer, or resizing the canvas, still invalidates the request, including when the change is undone. The server still re-verifies the saved source bytes on status and Apply.
 
+## Product identity drift — 2 November 2026
+
+**Incident.** Ornate Golden Appliance Showcase (`pt-0dd04956555b`), creative `pc-9ef215`, layer `object-po-26b435b116` (Multi-door refrigerator). Two applied edits:
+
+| Edit | Record / request | Reference sent | Result |
+| --- | --- | --- | --- |
+| open | `b4a8b638`, `req_981728fa…`, $0.22 | the original (`80b0c3…`, 191 × 355 px) | dark graphite became light silver; the asymmetric 40/60 door split became 50/50; bright `#00ff00` strips in the door seam (652 near-exact key pixels) |
+| close | `b875268c`, `req_d38739ae…`, $0.22 | **the AI "open" result** (`4b8214…`), not the original | kept every drift, including the green strips; feet added; about 10 % larger than the original |
+
+**Root causes (from the recorded requests and local reconstruction).**
+
+1. Chained edits sent only the previous AI result. Drift compounded and the original product was never seen again, although it is still resolvable through the creative object's template picture.
+2. A weak reference: the product (only 191 × 355 px in the 1254² creative) was upscaled to 301 × 560 inside a 1024² frame, about 16 % of the image, on a saturated chroma key. GPT Image 2 re-renders the whole image; the installed SDK (OpenAI 7.23.0) documents that `gpt-image-2` ignores `input_fidelity`.
+3. The prompt asked for the key colour in "visible gaps … through the object", and the cut-out removes only background reachable from the image edges. The leftover-key check looked only at the current key, with a 2 % limit, so the green strips passed and became "product" for the next edit.
+4. No identity check: `identity: 'review-required'` was hard-coded.
+
+Ruled out: chroma bleed from semi-transparent pixels (the original's seam is fully opaque; there are no interior semi-transparent pixels). No higher-resolution source of the refrigerator exists.
+
+**Changes.**
+
+- **Edit intent** (`layerEditIntent.ts`, local, no AI call): state change, colour, material, add, remove, repair, replace or general, read from the instruction. Negated and "keep …" clauses are ignored, and colour words without a change cue are descriptions. A contradictory instruction (the reported "open the door and close it out") or an empty, vague one returns a clarification. Generating it then needs an explicit "as written" confirmation, or nothing is sent (`CLARIFICATION_REQUIRED`).
+- **References** (`layerEdit.ts`): the image edited is always the current layer, so approved edits are kept. The original product (`creatives.originalPicture`, the same lookup Restore uses) is attached as image 2 only when applied edit records connect the current image to it by exact SHA-256 hashes. Saved layers keep their bytes, so the link survives Save, and a lineage summary survives preview expiry. An untraceable or uploaded image is never paired with the template product, and the estimate says why. The prompt names the earlier recorded instructions. Records now keep the instruction, the edit type, what was sent (without image bytes) and the lineage.
+- **Framing** (`layerEditImage.ts`): edits that keep the outline fill 80 % of a frame shaped like the object, within the square's pixel budget. The key colour is the one neither image uses. Measured main colours and proportions are stated in the prompt. The prompt keeps the key colour out of seams, gaps between doors and dark interiors.
+- **Area limit**: an optional rectangle drawn in the approval card. The request carries an `images.edit` mask for image 1. Every pixel outside the area is restored exactly from the reference after generation, and the geometry uses the real centre.
+- **Despill**: key-colour spill is removed from outline pixels only.
+- **Identity gate** (`layerEditIdentity.ts`, local pixel checks) on every new result:
+  - keying colour inside the object, compared with the original
+  - outline fringe
+  - size (one dimension kept for moving parts)
+  - colours and finish (CIELAB lightness distribution plus average colour shift)
+  - layout (coarse lightness and edge correlation)
+  - outline overlap
+  - for an area limit, how much the model changed outside it
+
+  Each check runs only where the edit type makes it meaningful. A pure reversal of the last recorded state change (close after open) is checked strictly against the image before that change, at the size the chain implies. Any failure, or two warnings about the product, means `drift-suspected`. Checks that cannot apply, such as layout after opening doors, are named, and the verdict is then `review-required`. `consistent` is still presented as pixel evidence, not a guarantee.
+- **Panel**:
+  - The approval card shows the edit type, output size, reference images, an attach/leave-out toggle for the original, the area picker and the clarification.
+  - The comparison shows the verdict with its checks.
+  - A flagged result needs "I compared Before and After: it is the same product" before Apply, or **Reject · not the same product**. Reject is free, the layer is unchanged and nothing is regenerated.
+
+**Calibration on the recorded images.** The same product re-scaled, blurred or tinted scores at least 0.99 layout similarity with a finish distance of 5 or less. The drifted "close" scores 0.53, is 10 lightness units lighter and 12 % / 10 % larger. A different product scores about 0.05 with a distance of 24. Both recorded results are `drift-suspected`: green inside the object, and for the "close", layout, finish and size as well.
+
+**Not verified.** No live request was made. Offline fakes show what is sent, kept and checked; they cannot show how faithfully GPT Image 2 now preserves a product. Multi-image and masked requests to `gpt-image-2` are accepted by the SDK types but have not been sent on this account. The thresholds are calibrated on one real product family plus drawn fixtures.
+
+## Interrupted requests and consecutive edits — 2 November 2026
+
+**Incident.** Template `pt-bf4a46747d65`, layer `object-po-106ae076c2`:
+
+| Time (IST) | Operation | Instruction | Images | Duration | Outcome |
+| --- | --- | --- | --- | --- | --- |
+| 16:33:05 | `337b337c` | open the door | 1 | 112 s | applied (`req_c23ac4e4…`, $0.221) |
+| 16:35:19 | `cb86816e` | close the door (chained) | 2 | 83 s | succeeded (`req_940b1e23…`, $0.23), then discarded |
+| 16:37:09 | `f35a5009` | open all doors (chained) | 2 | **56 s** | **uncertain**: transport closed, no HTTP status, no request ID |
+
+**Established:**
+- The failure happened inside the provider call, after the request was handed over. Stage B (OpenAI still processing) is most likely, since the other edits needed 83–112 s.
+- Not a timeout: the SDK, undici and server deadlines are all 300–310 s.
+- Not a server restart: the server process was unchanged, and a restart would have recorded a different message.
+- Not the attached reference image: an identical two-image request had succeeded two minutes earlier.
+
+**Unknown:**
+- The exact socket error. The service passed a no-op `save` and kept only the top-level error code.
+- Whether OpenAI completed and billed it. Check usage at 16:37–16:39 IST.
+
+**OpenAI 7.23.0 `images.edit`, verified in the installed SDK:**
+- **No** retrieval by ID, background mode, polling, cancellation, or download after a disconnect.
+- **No** idempotency: the client sets no `idempotencyHeader`, so `idempotencyKey` is ignored.
+- Streaming exists, but a streamed result is no more recoverable after a disconnect.
+
+A response lost on the connection therefore cannot be fetched again. It stays `uncertain`.
+
+**Lifecycle (`layerEdit.ts`).** The persisted record is the authority.
+- **Phases.** `running` records carry a phase, written before each step: `queued` (nothing sent), `submitting` (written just before the provider call) and `received`.
+- **Restart.** `queued` becomes a free failure, `submitting` becomes `uncertain`, and `received` is finished from the saved image (validation only, no provider call).
+- **Received images.** The provider's image is written to `<id>.output.png` before validation. If it is unusable, the edit is reported as charged and the image is kept for a day.
+- **Late responses.** A response that arrives after the server's own deadline is still turned into a candidate.
+- **Diagnostics.** Failures keep the allowlisted cause chain (codes, socket byte counts), the phase and the elapsed time.
+- **Unreachable provider.** DNS, refused and unreachable errors mean the request never left the server, so they are `failed` with nothing charged.
+- **Billing.** `failed`, `uncertain` and `discarded` statuses report `billing: none | possible | charged`. "None" is reported only with evidence.
+- **Repeated operation IDs.** A repeated ID returns the stored candidate, or the recorded state. A different request reusing the same ID is refused.
+- **One edit per layer.** The lock is keyed by the layer, not the creative revision, so a Save during generation no longer allows a second paid request.
+- **Discards.** A discard while queued sends nothing (previously the request was still sent). A discard while the provider works is no longer overwritten, and its cost is recorded.
+- **Setting aside.** An `uncertain` or `failed` edit that is discarded keeps its record and outcome (`abandoned`).
+- **Lookup.** `POST /layer-edits/open` finds the latest unfinished edit of a layer made from its current image, for a browser that lost its local record.
+
+**Panel:**
+- Automatic, bounded, free status checks for requests whose result is not loaded: running, lost response, or found after a reload. They are spaced 1.5–15 s apart and stop after 6 minutes. A failed check never becomes a failed edit.
+- A request this browser has no record of is found through the server lookup.
+- The pending card shows the request ID, when it was sent, how far it got and what was charged.
+- "Provider outcome unknown" offers **Set aside · start a new edit**, which states that a new edit is a separate paid request.
+- Discard and manual checks take priority over automatic ones.
+
+**Tests:**
+- `layerEditLifecycle.test.ts`: 10 tests over real record files, with a holdable, failing and delayable fake provider and restarts.
+- Updated server and client unit tests.
+- Browser:
+  - new: a provider connection lost after sending
+  - updated: lost-response, reselect and reload collection is now automatic
+
 ## Remaining practical limits
 
-- No real AI output has been assessed. Mock images prove integration and geometry, not photographic or brand fidelity. Exact identity, fine details and requested edits are not guaranteed by the model.
+- No real AI output from the identity-preserving request has been assessed. Mock images prove integration, geometry and the gate's decisions, not photographic or brand fidelity. Exact identity, fine details and requested edits are not guaranteed by the model. The identity gate compares pixels: it cannot read small logos or text, and it cannot judge the colours or layout of parts that an edit moves.
 - Some legitimate disconnected decorations can be refused by the conservative artifact check. Ambiguous identity or poor visual quality should be discarded.
 - Arbitrary local-only images and unsaved replacement images cannot bypass trusted server source resolution. Save/reopen supported creative objects before editing them. Older direct-run imports need reopening to obtain provenance.
-- Recovery uses the saved local operation/result. The synchronous Images API adapter does not supply a retrieval operation that can recover an unknown provider outcome; check provider usage before approving another request when billing is uncertain.
+- Recovery uses the server's saved operation and result. OpenAI's `images.edit` cannot retrieve a result whose response was lost (no retrieval, background mode or idempotency for this endpoint), so such an edit stays `uncertain`. Check provider usage, then set it aside. Streaming would show OpenAI's request ID earlier, but it has not been tried live.
 - The completed feature is preserved in the local feature commit. The original saved runtime data remains local and is excluded from Git; the historical Downloads backups preserve the pre-transfer source and verification evidence.
 
 ## Exact changed and added files
@@ -259,3 +359,34 @@ The previous partial work can be recovered later by switching to `feat/ai-layer-
 | `tests/e2e-image-templates/ai-layer-edit-stale.spec.ts` | Real saved templates: harmless activity during a held generation, genuine conflicts, kept results. |
 | `client/src/features/layers/layerEditStale.test.ts` | Fingerprint, change-then-Undo, diagnostics and no-op Transformer tests. |
 | `docs/ai-layer-edit-report.md` | This report and launch instructions. |
+
+### Identity preservation (2 November 2026)
+
+| File | Change |
+| --- | --- |
+| `shared/src/layerEdit.ts` | Edit options (prompt, area, original reference), intent, references, identity checks and verdicts; `LAYER_EDIT_REFERENCE_USD`. Older records stay valid. |
+| `server/src/decomposition/layerEditIntent.ts` (added) | Local edit-type reading, clarification and reversal detection. |
+| `server/src/decomposition/layerEditIdentity.ts` (added) | The identity gate. |
+| `server/src/decomposition/layerEditImage.ts` | Intent-aware framing, two-image key choice, area mask and exact compositing, measured palette, intent-specific prompt, outline despill, exact centre for area edits. |
+| `server/src/decomposition/layerEdit.ts` | Lineage tracing, original reference, quote = generation plan, gate, Apply confirmation, Reject, richer records. |
+| `server/src/decomposition/layerEditSource.ts` | Resolves the original product with the layer. |
+| `server/src/decomposition/layerEditRoutes.ts` | Passes `acceptIdentityRisk` and the reject reason. |
+| `server/src/decomposition/layerizeRouter.ts` | `CLARIFICATION_REQUIRED` and `IDENTITY_REVIEW_REQUIRED` → HTTP 422. |
+| `server/src/decomposition/protectedTemplates/product/creatives.ts` | `originalPicture` (read only), sharing Restore's lookup. |
+| `server/src/decomposition/protectedTemplates/product/ratioRegeneration.ts` | Optional extra reference images after the edited image; existing callers unchanged. |
+| `client/src/features/layers/LayerEditPanel.tsx`, `layerEditApi.ts`, `layerEditFlow.ts`, `layerEdit.css` | Approval details, reference toggle, clarification, area limit, verdict and checks, confirmation and Reject. |
+| `client/src/features/layers/LayerEditRegionPicker.tsx` (added) | Area selection on the layer image. |
+| `server/src/decomposition/layerEdit.fixture.ts` (added) | Drawn refrigerator and washing machines, and a fake model that edits the image it receives. |
+| `server/src/decomposition/layerEditIntent.test.ts`, `layerEditIdentity.test.ts` (added); `layerEdit.test.ts`, `layerEditProvider.test.ts`, `layerEditRoutes.test.ts`; `client/src/features/layers/layerEditFlow.test.ts` | Offline tests, including the recorded refrigerator edits when present locally. |
+| `tests/fixtures/imageTemplateOfflineServer.ts`, `tests/e2e-image-templates/ai-layer-edit.spec.ts` | Size-aware, image-derived offline editor; flagged-result browser test; instruction-only call counting. |
+
+### Interrupted requests (2 November 2026)
+
+| File | Change |
+| --- | --- |
+| `shared/src/layerEdit.ts` | `LayerEditPhase`; `phase`, `submittedAt`, `billing` on statuses (optional). |
+| `server/src/decomposition/layerEdit.ts` | Persisted phases, restart reconciliation, raw output first, late responses, transport diagnostics, undelivered classification, billing, operation replay, per-layer lock, discard races, `open` lookup. |
+| `server/src/decomposition/layerEditRoutes.ts` | `POST /layer-edits/open`. |
+| `client/src/features/layers/LayerEditPanel.tsx`, `layerEditFlow.ts`, `layerEditApi.ts` | Automatic bounded status checks, server lookup, pending details, set aside, billing text. |
+| `server/src/decomposition/layerEditLifecycle.test.ts` (added); `layerEdit.test.ts`, `layerEditRoutes.test.ts`; `client/src/features/layers/layerEditFlow.test.ts` | Lifecycle tests; repeated operations now return the stored result. |
+| `tests/fixtures/imageTemplateOfflineServer.ts`, `tests/e2e-image-templates/ai-layer-edit.spec.ts` | `connection lost test` trigger; automatic collection; set-aside browser test. |

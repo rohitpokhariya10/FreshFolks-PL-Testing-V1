@@ -302,7 +302,9 @@ export function createLayerizeRouter(options: { runsDir?: string; deps?: () => R
     const conflict = ['BUSY', 'RUN_ACTIVE_OR_AMBIGUOUS', 'IDEMPOTENCY_CONFLICT', 'PLAN_DECISION_REQUIRED', 'REVIEW_REQUIRED', 'NOT_RETRYABLE', 'STALE_RESOLUTION', 'RESOLUTION_NEEDS_INPUT', 'ANALYSIS_NOT_READY', 'CUTOUT_REQUIRED', 'NOT_NEEDED', 'REPEAT_REQUIRES_CONFIRMATION',
       'STALE_REVISION', 'REPEAT_REQUIRES_CHANGE', 'RESUME_AVAILABLE', 'CONFLICT'];
     // Protected templates: a step whose preconditions are not met (nothing was changed or sent).
-    const unprocessable = ['PREFLIGHT_FAILED', 'REGIONS_INVALID', 'REGIONS_NOT_CONFIRMED', 'NO_PROTECTED_ELEMENTS', 'NOT_READY', 'BASE_NOT_READY', 'BASE_ASPECT_MISMATCH', 'ACKNOWLEDGEMENT_REQUIRED', 'NO_TEXT_ANALYSIS', 'NOT_REPLACEABLE', 'FILE_CHANGED', 'NOT_BACKGROUND_ONLY'];
+    const unprocessable = ['PREFLIGHT_FAILED', 'REGIONS_INVALID', 'REGIONS_NOT_CONFIRMED', 'NO_PROTECTED_ELEMENTS', 'NOT_READY', 'BASE_NOT_READY', 'BASE_ASPECT_MISMATCH', 'ACKNOWLEDGEMENT_REQUIRED', 'NO_TEXT_ANALYSIS', 'NOT_REPLACEABLE', 'FILE_CHANGED', 'NOT_BACKGROUND_ONLY',
+      // AI layer edits: an ambiguous instruction, or a result flagged as a different product (nothing was sent or applied).
+      'CLARIFICATION_REQUIRED', 'IDENTITY_REVIEW_REQUIRED'];
     const status = code === 'NOT_FOUND' || code === 'TEMPLATE_NOT_FOUND' || code === 'FILE_MISSING' ? 404 : conflict.includes(code) ? 409 : unprocessable.includes(code) ? 422 : code === 'UPLOAD_TOO_LARGE' ? 413
       : code === 'SMART_EDIT_UNAVAILABLE' || code === 'VARIANTS_UNAVAILABLE' || code === 'NOT_CONFIGURED' ? 503 : error instanceof RunError ? 400 : 500;
     res.status(status).json({ error: { code, message: error instanceof Error ? error.message : 'Unexpected error.', ...(error instanceof RunError ? error.details : {}) } });

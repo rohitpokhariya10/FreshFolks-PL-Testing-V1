@@ -130,13 +130,23 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
     const at = nowIso(), saved = write(id, next(old, { objects }, { at, action: 'replaced', detail: `${o.label}: ${input.filename?.slice(0, 80) ?? 'a new picture'} (${cut.background === 'kept' ? 'background kept' : cut.background === 'removed' ? 'background removed' : 'transparent'}).` }));
     return { creative: saved, cutout: { background: cut.background, ...(cut.note ? { note: cut.note } : {}) } };
   });
+  /** The template's own picture for one of a creative's objects (what Restore puts back), if the template has one. */
+  const templatePicture = (id: string, c: ProductCreative, o: ProductCreativeObject) => {
+    const snapshot = deps.snapshot(id, c.templateRevision), template = snapshot.objects.find(x => x.id === o.objectId);
+    const edited = snapshot.editorCreative?.objects.find(x => (x.objectId && x.objectId === o.objectId) || x.id === o.id);
+    return edited ? { box: edited.box, file: edited.asset.file } : template?.cutout ? { box: template.cutout.placement, file: template.cutout.file } : undefined;
+  };
+  /** Read only: the picture an object had in its template (the imported product), for AI layer edits' identity reference. */
+  const originalPicture = (id: string, cid: string, objectId: string) => {
+    const c = read(id, cid), o = c.objects.find(x => x.id === objectId);
+    const picture = o && templatePicture(id, c, o);
+    return picture && store.has(id, picture.file) ? { file: picture.file, bytes: store.read(id, picture.file) } : undefined;
+  };
   /** The template's own picture back in an object's slot, at its place. */
   const restore = (id: string, cid: string, objectId: string, input: { expectedRevision?: unknown }) => locked(`${id}:${cid}`, async () => {
     const old = read(id, cid); expect(old, input.expectedRevision);
     const o = old.objects.find(x => x.id === objectId) ?? fail('NOT_FOUND', 'That element is not in this creative.');
-    const snapshot = deps.snapshot(id, old.templateRevision), template = snapshot.objects.find(x => x.id === o.objectId);
-    const edited = snapshot.editorCreative?.objects.find(x => (x.objectId && x.objectId === o.objectId) || x.id === o.id);
-    const original = edited ? { box: edited.box, file: edited.asset.file } : template?.cutout ? { box: template.cutout.placement, file: template.cutout.file } : fail('NOT_REPLACEABLE', 'This element has no picture in the template to go back to.');
+    const original = templatePicture(id, old, o) ?? fail('NOT_REPLACEABLE', 'This element has no picture in the template to go back to.');
     const objects = old.objects.map(x => x.id === objectId ? { ...x, box: { ...original.box }, asset: { kind: 'template' as const, file: original.file } } : x);
     return write(id, next(old, { objects }, { at: nowIso(), action: 'restored', detail: o.label }));
   });
@@ -318,7 +328,7 @@ export function createProductCreatives(deps: ProductCreativeDeps) {
       ...(background ? { background: { ...background, sha256: sha256(store.read(id, background.file)) } } : {}), ...(c.absoluteZOrder ? { absoluteZOrder: true as const } : {}) };
   }
 
-  return { list, read, create, add, replaceWith, save, replace, restore, refineLocal, refineEstimate, refineWithAi, applyRefinement, duplicate, uploadAsset, open, revisionsOf };
+  return { list, read, create, add, replaceWith, save, replace, restore, originalPicture, refineLocal, refineEstimate, refineWithAi, applyRefinement, duplicate, uploadAsset, open, revisionsOf };
 }
 export type ProductCreatives = ReturnType<typeof createProductCreatives>;
 

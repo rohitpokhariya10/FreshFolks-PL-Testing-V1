@@ -80,3 +80,17 @@
 .canvas-workspace { position: relative; }
 /* Overlay the heading, without shrinking the viewport and triggering automatic fit/zoom. */
 .ai-layer-canvas-notice { position: absolute; top: 6px; left: 16px; right: 16px; z-index: 2; pointer-events: none; display: flex; align-items: baseline; flex-wrap: wrap; gap: 3px 12px; padding: 6px 12px; border: 1px solid #c4d7cd; border-radius: 8px; background: #edf5f0; color: #285443; font-size: 12px; }
+
+/* Reference choice, area limit and the identity verdict */
+.ai-layer-reference { display: flex; flex-direction: column; gap: 3px; }
+.ai-layer-region { display: flex; flex-direction: column; gap: 4px; }
+.ai-layer-region-frame { position: relative; align-self: center; max-width: 100%; line-height: 0; border: 1px solid var(--color-line, #e0e4de); border-radius: 6px; cursor: crosshair; touch-action: none; user-select: none;
+  background: repeating-conic-gradient(#eef0ec 0% 25%, #ffffff 0% 50%) 50% / 12px 12px; }
+.ai-layer-region-frame img { display: block; max-width: 100%; max-height: 180px; pointer-events: none; }
+.ai-layer-region-box { position: absolute; border: 2px solid var(--color-primary, #285443); background: rgba(40, 84, 67, 0.18); box-shadow: 0 0 0 9999px rgba(255, 255, 255, 0.35); pointer-events: none; }
+.ai-layer-checks { display: grid; gap: 5px; margin: 6px 0 0; padding: 0; list-style: none; font-size: 11px; color: var(--color-ink, #1f2925); }
+.ai-layer-checks li { padding-left: 8px; border-left: 3px solid #cfd6d0; }
+.ai-layer-checks li.is-pass { border-left-color: #8cc2a1; }
+.ai-layer-checks li.is-warn { border-left-color: var(--ai-warn-line); }
+.ai-layer-checks li.is-fail { border-left-color: var(--color-error, #b42318); }
+.ai-layer-checks strong { font-weight: 600; }

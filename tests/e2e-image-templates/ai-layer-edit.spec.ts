@@ -121,6 +121,34 @@ test('object prompt → approval → preview → expanded Apply → second edit 
   await select(page, 'Refrigerator'); await page.screenshot({ path: info.outputPath('layer-edit-saved.png') });
 });
 
+test('a result flagged as another product: warned, Apply blocked, Reject keeps the layer, confirming applies it', async ({ page, request }, info) => {
+  const { stored, original, id } = await openCreative(page, request), fridge = layerNamed(original, 'Refrigerator');
+  await select(page, 'Refrigerator'); const p = panel(page);
+  // An edit that keeps the outline: quoted for a frame shaped like the fridge, with its edit type shown before approval.
+  await p.getByLabel('Layer edit prompt').fill(`Remove the logo. drift test ${id}`); await p.getByRole('button', { name: 'Generate Edit', exact: true }).click();
+  await expect(p).toContainText('Remove a feature · keeps the product’s identity'); await expect(p).not.toContainText('1024 × 1024');
+  await p.getByRole('checkbox').check();
+  const response = page.waitForResponse(r => r.url().endsWith('/layer-edits') && r.request().method() === 'POST');
+  await p.getByRole('button', { name: 'Approve and generate' }).click();
+  const flagged = await (await response).json() as LayerEditCandidate;
+  expect(flagged.validation.identity).toBe('drift-suspected');
+  const verdict = p.getByRole('alert', { name: 'Product identity' });
+  await expect(verdict).toContainText('This may not be the same product'); await expect(verdict).toContainText('Layout and parts');
+  await expect(p.getByRole('button', { name: 'Apply edit' })).toBeDisabled();
+  await p.screenshot({ path: info.outputPath('identity-flagged-panel.png') });
+  await p.getByRole('button', { name: 'Reject · not the same product' }).click();
+  await expect(p).toContainText('Result rejected as a different product. The layer is unchanged.');
+  expect(layerNamed(await stored(), 'Refrigerator')).toEqual(fridge);
+  const status = await (await request.get(`/api/layerize-experiment/layer-edits/${flagged.operationId}`)).json();
+  expect(status.status).toBe('discarded'); expect(status.candidate).toBeUndefined();
+  // The same result, confirmed after comparing, can be applied: the confirmation is the person's decision.
+  const second = await generate(page, `Remove the logo. drift test again ${id}`);
+  expect(second.validation.identity).toBe('drift-suspected');
+  await p.getByRole('checkbox', { name: 'I compared Before and After: it is the same product.' }).check();
+  await p.getByRole('button', { name: 'Apply edit' }).click();
+  await expect.poll(async () => { const l = layerNamed(await stored(), 'Refrigerator'); return l.type === 'image' ? l.assetId : ''; }).toBe(`ai-layer-${second.operationId}`);
+});
+
 test('character pose, locked/background exclusions, stale placement, and switching selection during generation', async ({ page, request }) => {
   const { id, stored, original } = await openCreative(page, request), slow = `Open both doors. slow test ${id}`;
   await select(page, 'Background'); await expect(panel(page)).toContainText(/unlock|individual visual object/);
@@ -147,10 +175,9 @@ test('character pose, locked/background exclusions, stale placement, and switchi
   expect(layerNamed(await stored(), 'Refrigerator')).toEqual(layerNamed(original, 'Refrigerator'));
   // The paid result was never seen, so it was kept: returning to the layer collects it without generating again.
   await select(page, 'Refrigerator');
-  await expect(panel(page).getByRole('status').filter({ hasText: 'waiting to be collected' })).toBeVisible();
   await expect(panel(page).getByLabel('Layer edit prompt')).toHaveValue(slow);
-  await panel(page).getByRole('button', { name: 'Check request status' }).click();
-  await expect(panel(page).getByRole('button', { name: 'After — AI Edited' })).toHaveAttribute('aria-pressed', 'true');
+  // Collected by the automatic status check (free), shown for comparison only.
+  await expect(panel(page).getByRole('button', { name: 'After — AI Edited' })).toHaveAttribute('aria-pressed', 'true', { timeout: 20000 });
   expect((await (await request.get('/__test__/image-calls', { params: { contains: slow } })).json()).count).toBe(1);
   await panel(page).getByRole('button', { name: 'Discard', exact: true }).click();
   expect(layerNamed(await stored(), 'Refrigerator')).toEqual(layerNamed(original, 'Refrigerator'));
@@ -295,10 +322,9 @@ test('selection, deselection, source changes, undo/redo and reload never keep or
   await generate(page, 'Open both doors. Reload test'); await page.reload();
   await expect(page.locator('.layer-select')).not.toHaveCount(0);
   await expect(page.locator('.ai-layer-canvas-notice')).toHaveCount(0); expect(await stored()).toEqual(committed);
-  await select(page, 'Refrigerator'); await expect(panel(page).getByRole('button', { name: 'Apply edit' })).toHaveCount(0);
-  await expect.poll(async () => (await canvasLayers(page)).find(l => l.id === fridge.id)?.width).toBeCloseTo(fridge.width);
-  await panel(page).getByRole('button', { name: 'Check request status' }).click();
-  await expect(panel(page).getByRole('button', { name: 'After — AI Edited' })).toHaveAttribute('aria-pressed', 'true');
+  // After the reload the request is found again and collected automatically, for comparison only: nothing is applied.
+  await select(page, 'Refrigerator');
+  await expect(panel(page).getByRole('button', { name: 'After — AI Edited' })).toHaveAttribute('aria-pressed', 'true', { timeout: 20000 });
   expect(await stored()).toEqual(committed);
   await panel(page).getByRole('button', { name: 'Discard', exact: true }).click();
   await generate(page, 'Open both doors. Switch design test');
@@ -368,7 +394,7 @@ async function layerColour(page: Page, id: string, rgb: [number, number, number]
   }, [id, rgb] as const);
 }
 const held = async (request: APIRequestContext, contains: string) => (await (await request.get('/__test__/layer-edits-held', { params: { contains } })).json()).count as number;
-const calls = async (request: APIRequestContext, contains: string) => (await (await request.get('/__test__/image-calls', { params: { contains } })).json()).count as number;
+const calls = async (request: APIRequestContext, contains: string) => (await (await request.get('/__test__/image-calls', { params: { contains, requested: '1' } })).json()).count as number;
 /** Prompt → Generate Edit (free quote) → explicit approval. Returns the generate request once it is sent. */
 async function approve(page: Page, prompt: string) {
   const p = panel(page);
@@ -389,7 +415,8 @@ test('consecutive edits: open → Apply → close → Apply → red → Apply, e
   page.on('request', r => { if (r.url().endsWith('/layer-edits') && r.method() === 'POST') posts.push(r.postDataJSON()); });
   const steps: { prompt: string; colour: [number, number, number]; saveDuring: boolean }[] = [
     { prompt: `Open both refrigerator doors. hold test ${id} first`, colour: [158, 104, 71], saveDuring: false },
-    { prompt: `Close the refrigerator door. hold test ${id} second`, colour: [148, 163, 184], saveDuring: true },
+    // Closed again: the fixture's own dark refrigerator (the original is attached as the identity reference).
+    { prompt: `Close the refrigerator door. hold test ${id} second`, colour: [55, 65, 81], saveDuring: true },
     { prompt: `Change refrigerator color to red. hold test ${id} third`, colour: [220, 38, 38], saveDuring: true },
   ];
   let previous: LayerEditCandidate | undefined, synced = original.creative!.syncedRevision, shownBefore = initial;
@@ -427,6 +454,9 @@ test('consecutive edits: open → Apply → close → Apply → red → Apply, e
     expect(posts[i].sourceCandidateId).toBe(previous?.operationId);
     expect(posts[i].sourceSha256).toBe(previous ? previous.image.sha256 : candidate.sourceSha256);
     expect(candidate.sourceSha256).toBe(posts[i].sourceSha256);
+    // From the second edit on, the original product is attached; closing again is checked strictly against it.
+    expect(candidate.references?.original?.attached ?? false).toBe(i > 0);
+    expect(candidate.validation.identity).toBe(i === 0 ? 'review-required' : 'consistent');
     // The real canvas: the After object is painted in place of the current one; no other layer changes.
     const shown = await canvasLayers(page), shownFridge = shown.find(l => l.id === fridge.id)!;
     expect(others(shown)).toEqual(others(initial)); expect(shownFridge.images).toBe(1); expect(shownFridge.transparent).toBeGreaterThan(0);
@@ -448,12 +478,12 @@ test('consecutive edits: open → Apply → close → Apply → red → Apply, e
   // The request named the revision the editor held when it was sent; Apply succeeded after each later save.
   expect(posts.map(r => r.target.revision)).toEqual([1, 1, 2]);
   expect(widths[0]).toBeGreaterThan(fridge.width); expect(widths[1]).toBeLessThan(widths[0]);
-  expect(await layerColour(page, fridge.id, [158, 104, 71])).toBe(0); expect(await layerColour(page, fridge.id, [148, 163, 184])).toBe(0);
+  expect(await layerColour(page, fridge.id, [158, 104, 71])).toBe(0); expect(await layerColour(page, fridge.id, [55, 65, 81])).toBe(0);
   await page.screenshot({ path: info.outputPath('applied-red.png') });
-  // Undo returns the closed grey object; Redo brings red back. (Keyboard: after a save, the existing topbar's centred
+  // Undo returns the closed original-coloured object; Redo brings red back. (Keyboard: after a save, the existing topbar's centred
   // size label overlaps the Undo icon at this width — a pre-existing layout issue outside this feature.)
   await page.locator('#canvas-interaction').focus(); await page.keyboard.press('ControlOrMeta+z');
-  await expect.poll(() => layerColour(page, fridge.id, [148, 163, 184])).toBeGreaterThan(1000);
+  await expect.poll(() => layerColour(page, fridge.id, [55, 65, 81])).toBeGreaterThan(1000);
   await page.keyboard.press('ControlOrMeta+Shift+z');
   await expect.poll(() => layerColour(page, fridge.id, [220, 38, 38])).toBeGreaterThan(1000);
   // Save → server revision holds the red image → reload → export.
@@ -479,7 +509,8 @@ test('a request survives leaving its layer; a layer change during generation end
   await select(page, 'Television'); await expect(p).toContainText('Editing: Television');
   await page.locator('#canvas-interaction').focus(); await page.keyboard.press('Escape');
   await select(page, 'Refrigerator');
-  await expect(p.getByRole('status').filter({ hasText: 'waiting to be collected' })).toBeVisible();
+  // Found again on reselection; FrameFlow then checks it automatically (free).
+  await expect(p.getByRole('status').filter({ hasText: /waiting to be collected|Still processing/ })).toBeVisible();
   await expect(p.getByLabel('Layer edit prompt')).toHaveValue(leave); await expect(p.getByLabel('Layer edit prompt')).toBeDisabled();
   await expect(p.getByRole('button', { name: 'Generate Edit', exact: true })).toHaveCount(0);
   await p.getByRole('button', { name: 'Check request status' }).click();
@@ -487,8 +518,8 @@ test('a request survives leaving its layer; a layer change during generation end
   expect(await calls(request, leave)).toBe(1);
   await request.post('/__test__/layer-edits-release', { params: { contains: leave } });
   await expect.poll(async () => (await (await request.get(`/api/layerize-experiment/layer-edits/${sent.operationId}`)).json()).status).toBe('candidate');
-  await p.getByRole('button', { name: 'Check request status' }).click();
-  await expect(p.getByRole('button', { name: 'After — AI Edited', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  // Collected by the automatic status checks: no click, and never a second generation.
+  await expect(p.getByRole('button', { name: 'After — AI Edited', exact: true })).toHaveAttribute('aria-pressed', 'true', { timeout: 20000 });
   expect(await calls(request, leave)).toBe(1);
   await p.getByRole('button', { name: 'Discard', exact: true }).click();
   await expect(p.getByRole('status').filter({ hasText: 'Edit discarded' })).toBeVisible();
@@ -519,19 +550,17 @@ test('a lost response is collected without resubmitting; a request that never ar
   const lost = `Open both doors. lost response ${id}`;
   await page.route('**/layer-edits', async route => { await route.fetch(); await route.abort('connectionreset'); }, { times: 1 });
   await approve(page, lost);
-  await expect(p.getByRole('status').filter({ hasText: 'Unable to confirm request status' })).toContainText('never submits another generation');
-  await expect(p.locator('.ai-spinner')).toHaveCount(0); expect(await calls(request, lost)).toBe(1);
-  await p.getByRole('button', { name: 'Check request status' }).click();
-  await expect(p.getByRole('button', { name: 'After — AI Edited', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  // The response was lost after the server stored the result: the automatic status check collects it, without resubmitting.
+  await expect(p.getByRole('button', { name: 'After — AI Edited', exact: true })).toHaveAttribute('aria-pressed', 'true', { timeout: 20000 });
+  await expect(p.locator('.ai-spinner')).toHaveCount(0);
   expect(await calls(request, lost)).toBe(1);
   await p.getByRole('button', { name: 'Discard', exact: true }).click();
 
   const never = `Open both doors. never arrived ${id}`;
   await page.route('**/layer-edits', route => route.abort('timedout'), { times: 1 });
   await approve(page, never);
-  await expect(p.getByRole('status').filter({ hasText: 'Unable to confirm request status' })).toBeVisible();
-  await p.getByRole('button', { name: 'Check request status' }).click();
-  await expect(p.getByRole('status').filter({ hasText: 'isn’t on the server' })).toContainText('nothing was generated or charged');
+  // The request never reached the server: the automatic check finds nothing to collect and frees the panel.
+  await expect(p.getByRole('status').filter({ hasText: 'isn’t on the server' })).toContainText('nothing was generated or charged', { timeout: 20000 });
   await expect(p.getByRole('button', { name: 'Generate Edit', exact: true })).toBeVisible();
   expect(await calls(request, never)).toBe(0);
 
@@ -545,6 +574,28 @@ test('a lost response is collected without resubmitting; a request that never ar
   await p.getByRole('button', { name: 'Discard', exact: true }).click();
   await expect(p.getByRole('button', { name: 'Generate Edit', exact: true })).toBeVisible(); await expect(p.getByRole('alert')).toHaveCount(0);
   expect(await calls(request, balance)).toBe(1); expect(await stored()).toEqual(original);
+});
+
+test('a provider connection lost after sending: outcome unknown, identifiable, set aside, and the next edit works', async ({ page, request }) => {
+  const { id, stored, original } = await openCreative(page, request);
+  await select(page, 'Refrigerator'); const p = panel(page);
+  const lost = `Open all doors. connection lost test ${id}`;
+  const sent = await approve(page, lost);
+  const card = p.getByRole('status').filter({ hasText: 'Provider outcome unknown' });
+  await expect(card).toContainText(`Request ${sent.operationId}`); await expect(card).toContainText('A provider charge may apply.');
+  await card.getByText('Details').click(); await expect(card).toContainText('before OpenAI returned any response or request ID');
+  await expect(card).not.toContainText('nothing was charged');
+  await expect(p.locator('.ai-spinner')).toHaveCount(0); expect(await stored()).toEqual(original);
+  // Checking again is free and never resubmits; the outcome stays unknown.
+  await p.getByRole('button', { name: 'Check request status' }).click(); await expect(card).toBeVisible();
+  await p.getByRole('button', { name: 'Set aside · start a new edit' }).click();
+  await expect(p.getByRole('status').filter({ hasText: 'Request set aside' })).toContainText(sent.operationId);
+  expect((await (await request.get(`/api/layerize-experiment/layer-edits/${sent.operationId}`)).json())).toMatchObject({ status: 'discarded', billing: 'possible' });
+  // Not blocked: the next edit of the same layer is generated and applied normally.
+  const next = await generate(page, `Open both doors. after a lost connection ${id}`);
+  await p.getByRole('button', { name: 'Apply edit' }).click();
+  await expect.poll(async () => { const l = layerNamed(await stored(), 'Refrigerator'); return l.type === 'image' ? l.assetId : ''; }).toBe(`ai-layer-${next.operationId}`);
+  expect(await calls(request, lost)).toBe(1); expect(await calls(request, `after a lost connection ${id}`)).toBe(1);
 });
 
 test('the AI panel fits a narrow inspector with a long prompt, through approval, generation and comparison', async ({ page, request }, info) => {

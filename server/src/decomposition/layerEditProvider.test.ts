@@ -45,3 +45,20 @@ it('does not resubmit when the image API fails or returns no image', async () =>
   await expect(provider.regenerate(input, () => {}, 'offline-empty')).rejects.toThrow('no image');
   expect(edit).toHaveBeenCalledTimes(2);
 });
+it('sends the layer first and the original product second, with the area mask applying to the layer, at a fitted size', async () => {
+  vi.stubEnv('OPENAI_IMAGE_MODEL', 'gpt-image-2');
+  const svg = (w: number, h: number, body: string) => sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">${body}</svg>`)).png().toBuffer();
+  const layer = await svg(200, 400, '<rect x="30" y="20" width="140" height="360" fill="#9e6847"/>'), original = await svg(200, 400, '<rect x="30" y="20" width="140" height="360" fill="#7b4f35"/>');
+  const p = await prepareLayerEdit(layer, { intent: { operations: ['remove'], preserveIdentity: true, expandsSilhouette: false }, region: { x: 0.4, y: 0.4, width: 0.3, height: 0.2 }, identity: original });
+  edit.mockResolvedValue({ data: [{ b64_json: p.image.toString('base64') }], _request_id: 'offline-request' });
+  const save = vi.fn();
+  await liveRatioRegenerator().regenerate({ image: p.image, references: p.references, mask: p.mask, size: p.size, prompt: 'Remove the sticker' }, save, 'offline-masked');
+  const [request] = edit.mock.calls[0];
+  expect(request.size).toBe(`${p.size.width}x${p.size.height}`); expect(p.size.width).not.toBe(p.size.height);
+  expect(request.image).toHaveLength(2);
+  expect(Buffer.from(await request.image[0].arrayBuffer())).toEqual(p.image); expect(Buffer.from(await request.image[1].arrayBuffer())).toEqual(p.references[0]);
+  expect(Buffer.from(await request.mask.arrayBuffer())).toEqual(p.mask);
+  expect(request.input_fidelity).toBeUndefined(); expect(request).not.toHaveProperty('background');
+  expect(save.mock.calls[0][1]).toMatchObject({ image: ['<the creative, as sent>', '<reference 2, as sent>'], mask: '<the edit mask, as sent>' });
+  expect(edit).toHaveBeenCalledTimes(1);
+});
