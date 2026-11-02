@@ -75,6 +75,43 @@ const BACKDROP = '<rect width="1000" height="1000" fill="#ede4f7"/><circle cx="1
 const PHONE = '<rect x="345" y="190" width="310" height="570" rx="45" fill="#514661"/><rect x="357" y="202" width="286" height="546" rx="37" fill="#b294d2"/><rect x="375" y="222" width="105" height="130" rx="28" fill="#9a7aba"/><circle cx="405" cy="255" r="20" fill="#292431"/><circle cx="447" cy="305" r="20" fill="#292431"/><circle cx="505" cy="495" r="40" fill="#cbb4e2"/>';
 /** A different product where the phone stood: a dark cylindrical speaker, another silhouette. */
 const SPEAKER = '<rect x="410" y="330" width="180" height="440" rx="85" fill="#1d1d1f"/><circle cx="500" cy="450" r="50" fill="#4a4a4f"/><circle cx="500" cy="630" r="70" fill="#4a4a4f"/><rect x="470" y="345" width="60" height="12" rx="6" fill="#6b6b70"/>';
+/**
+ * The offline layer editor's edit of the image it was sent: brighter or recoloured object pixels (the background colour
+ * untouched), or for "drift test" another product drawn in the object's place (an identity change for the gate to flag).
+ */
+async function offlineLayerEdit(image: Buffer, size: { width: number; height: number }, ground: string, edit: string) {
+  const { data, info } = await sharp(image).resize(size.width, size.height, { fit: 'fill' }).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  const key = ground.slice(1).match(/../g)!.map(v => parseInt(v, 16)), isGround = (i: number) => Math.max(...key.map((v, c) => Math.abs(v - data[i + c]))) < 40;
+  const lum = (i: number) => data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+  let x0 = info.width, y0 = info.height, x1 = -1, y1 = -1, sum = 0, count = 0;
+  for (let i = 0; i < data.length; i += 3) if (!isGround(i)) { sum += lum(i); count++; }
+  // Red around #dc2626: the object's typical lightness becomes exactly that red; lighter and darker details stay so.
+  const typical = count ? sum / count : 128;
+  for (let y = 0; y < info.height; y++) for (let x = 0; x < info.width; x++) {
+    const i = (y * info.width + x) * 3; if (isGround(i)) continue;
+    x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+    if (/red/i.test(edit)) { const k = lum(i) / Math.max(1, typical); data[i] = Math.min(255, Math.round(220 * k)); data[i + 1] = Math.min(255, Math.round(38 * k)); data[i + 2] = Math.min(255, Math.round(38 * k)); }
+    else if (/bright|light/i.test(edit)) for (let c = 0; c < 3; c++) data[i + c] = Math.min(255, data[i + c] + 30);
+  }
+  const out = await sharp(data, { raw: { width: info.width, height: info.height, channels: 3 } }).png().toBuffer();
+  if (!/drift test/.test(edit) || x1 < 0) return out;
+  const other = await sharp(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="240"><rect width="200" height="240" rx="10" fill="#e8e9eb"/><circle cx="100" cy="140" r="64" fill="#b8bcc2"/><circle cx="100" cy="140" r="50" fill="#3a4250"/><rect x="18" y="14" width="90" height="16" fill="#2f3237"/></svg>'))
+    .resize(x1 - x0 + 1, y1 - y0 + 1, { fit: 'fill' }).png().toBuffer();
+  return sharp({ create: { width: info.width, height: info.height, channels: 3, background: ground } }).composite([{ input: other, left: x0, top: y0 }]).png().toBuffer();
+}
+/** The object of `original` (image 2) drawn at the height and centre of the object in `image` (image 1), on the background colour. */
+async function offlineClosed(image: Buffer, original: Buffer, ground: string) {
+  const key = ground.slice(1).match(/../g)!.map(v => parseInt(v, 16));
+  const boxOf = async (png: Buffer) => {
+    const { data, info } = await sharp(png).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    let x0 = info.width, y0 = info.height, x1 = -1, y1 = -1;
+    for (let y = 0; y < info.height; y++) for (let x = 0; x < info.width; x++) { const i = (y * info.width + x) * 3; if (Math.max(...key.map((v, c) => Math.abs(v - data[i + c]))) >= 40) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); } }
+    return { left: x0, top: y0, width: x1 - x0 + 1, height: y1 - y0 + 1, size: { width: info.width, height: info.height } };
+  };
+  const [now, was] = await Promise.all([boxOf(image), boxOf(original)]), width = Math.round(was.width * now.height / was.height);
+  const object = await sharp(original).extract({ left: was.left, top: was.top, width: was.width, height: was.height }).resize(width, now.height, { fit: 'fill' }).png().toBuffer();
+  return sharp({ create: { ...now.size, channels: 3, background: ground } }).composite([{ input: object, left: Math.round(now.left + now.width / 2 - width / 2), top: now.top }]).png().toBuffer();
+}
 const svgPng = (width: number, height: number, body: string) => sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 1000 1000" preserveAspectRatio="none">${body}</svg>`)).png().toBuffer();
 /**
  * A person presenting in front of a rounded orange panel on a white canvas (as live run 2026-10-08T06-08 was): Seedream
@@ -485,19 +522,24 @@ const router = createLayerizeRouter({
   },
   runsDir: join(root, 'runs'), imageTemplatesDir: join(root, 'templates'), protectedDir: join(root, 'protected'), wordRecognizer: () => variationRecognizer, masterRecognizer: () => masterRecognizer,
   // Product with Text templates: the fixture poster's words (no OCR), the fixture's vision answer and a fake cut-out service, each counted.
-  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, layerEditor: () => ({ model: 'offline-layer-editor', offline: true, async regenerate({ image, prompt }, _save, operationId) {
-    callCounts.openai++; events.push({ kind: 'generation', source: digest(image), inputs: [digest(image)], prompt, size: '1024x1024' });
+  productRecognizer: () => productRecognizer, productAnalyzer: () => productAnalyzer, productSegmenter: () => productSegmenter, productLayerizer: () => productLayerizer, productPlacement: () => reusePlacement, productComposer: () => reuseComposer, layerEditor: () => ({ model: 'offline-layer-editor', offline: true, async regenerate({ image, prompt, size, references = [] }, _save, operationId) {
+    callCounts.openai++; events.push({ kind: 'generation', source: digest(image), inputs: [digest(image), ...references.map(digest)], prompt, size: `${size.width}x${size.height}` });
     if (prompt.includes('invalid parameter test')) throw Object.assign(new Error('private provider response'), { status: 400, code: 'invalid_value', param: 'background', request_id: 'req_offline_rejection' });
     if (prompt.includes('slow test')) await new Promise(resolve => setTimeout(resolve, 1500));
     if (prompt.includes('hold test')) await new Promise<void>(release => heldLayerEdits.push({ prompt, release }));
     if (heldOperations.delete(operationId)) await new Promise<void>(release => heldLayerEdits.push({ prompt, operationId, release }));
     if (prompt.includes('balance test')) throw Object.assign(new Error('private provider response'), { status: 429, code: 'insufficient_quota', request_id: 'req_offline_quota' });
-    const edit = prompt.split('Requested edit: ').at(-1) ?? '', person = prompt.includes('Raise'), body = person
+    // The connection to the provider closes after the request was sent, before any response (as undici reports it).
+    if (prompt.includes('connection lost test')) throw Object.assign(new TypeError('terminated'), { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) });
+    const edit = prompt.split('Requested edit: ').at(-1) ?? '', person = prompt.includes('Raise'), ground = prompt.match(/completely flat (#[0-9a-f]{6}) background/)?.[1];
+    // Edits that keep the outline come back at the requested (fitted) size, made from the image sent, as a faithful edit would.
+    if (!/open|close|raise/i.test(edit) || /drift test/.test(edit)) return { image: await offlineLayerEdit(image, size, ground ?? '#00ff00', edit), costUsd: 0, requestId: 'offline-layer-edit' };
+    // Closing with the original product attached (image 2): that product at the edited image's height, as a faithful edit.
+    if (/close/i.test(edit) && references[0] && ground) return { image: await offlineClosed(image, references[0], ground), costUsd: 0, requestId: 'offline-layer-edit' };
+    const body = person
       ? '<circle cx="512" cy="280" r="60" fill="#a96848"/><path d="M440 340 H580 L770 125 L820 165 L610 440 V850 H430 V450 L300 540 L270 490 Z" fill="#3b82f6"/>'
       : /close.*door/i.test(edit) ? '<rect x="390" y="210" width="244" height="600" rx="16" fill="#94a3b8"/><path d="M512 230 V790 M410 500 H614" stroke="#334155" stroke-width="12"/>'
-      : /change.*colou?r/i.test(edit) ? '<rect x="390" y="210" width="244" height="600" rx="28" fill="#dc2626"/><path d="M512 230 V790 M410 500 H614" stroke="#0f172a" stroke-width="12"/>'
       : '<path d="M132 300 L392 232 H632 L892 300 V740 L632 792 H392 L132 740 Z" fill="#9e6847"/><rect x="410" y="270" width="204" height="490" fill="#334155"/>';
-    const ground = prompt.match(/completely flat (#[0-9a-f]{6}) background/)?.[1];
     return { image: await svgPng(1024, 1024, `${ground ? `<rect width="1000" height="1000" fill="${ground}"/>` : ''}${body}`), costUsd: 0, requestId: 'offline-layer-edit' };
   } }), productRegenerator: () => ratioRegenerator, productArtwork: () => productArtwork,
   templatesDir: join(root, 'creative-templates'), executionsDir: join(root, 'executions'),
@@ -625,7 +667,8 @@ app.get('/__test__/protected-logo-new.png', async (_req, res) => res.type('png')
 app.get('/__test__/extractions', (req, res) => res.json({ count: submitted.filter(s => s === String(req.query.image)).length }));
 app.get('/__test__/call-counts', (_req, res) => res.json(callCounts));
 // Image requests whose prompt carries a test's own token: an exact count even while other specs share this server.
-app.get('/__test__/image-calls', (req, res) => res.json({ count: events.filter(e => e.kind === 'generation' && e.prompt?.includes(String(req.query.contains ?? '\u0000'))).length }));
+// requested=1: match only a layer edit's own instruction (its prompt also quotes earlier recorded instructions).
+app.get('/__test__/image-calls', (req, res) => res.json({ count: events.filter(e => e.kind === 'generation' && (req.query.requested ? e.prompt?.split('Requested edit: ').at(-1) : e.prompt)?.includes(String(req.query.contains ?? '\u0000'))).length }));
 // AI layer edits held by a "hold test" prompt: count them, or release them, by the test's own prompt text.
 // `operation`: one exact operation ID instead of prompt text, so repeated or parallel tests never release each other's edit.
 const heldBy = (query: Record<string, unknown>) => (h: (typeof heldLayerEdits)[number]) => typeof query.operation === 'string' ? h.operationId === query.operation : h.prompt.includes(String(query.contains ?? '\u0000'));

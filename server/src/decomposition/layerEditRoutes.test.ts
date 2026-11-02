@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
 import sharp from 'sharp';
-import type { LayerEditCandidate, LayerEditRequest, ProductCreative } from '@frameflow/shared';
+import type { LayerEditCandidate, LayerEditEstimate, LayerEditRequest, ProductCreative } from '@frameflow/shared';
 import { setup, savedTemplate, sha } from './protectedTemplates/product/productServer.fixture.js';
 import { productPosterPng } from './protectedTemplates/product/productPoster.fixture.js';
 import type { RatioRegenerator } from './protectedTemplates/product/ratioRegeneration.js';
@@ -40,7 +40,9 @@ it('resolves a real creative object, enforces access/type/revision/hash, and nev
     const candidate = await response.json() as LayerEditCandidate;
     expect(regenerate.mock.calls[0][0]).toMatchObject({ prompt: expect.stringContaining('Refrigerator') });
     expect(regenerate.mock.calls[0][0]).not.toHaveProperty('background');
-    expect((await post('', input)).status).toBe(409); expect(regenerate).toHaveBeenCalledTimes(1);
+    // The same operation again: its stored result, not a second generation.
+    const repeated = await post('', input); expect(repeated.status).toBe(200);
+    expect(((await repeated.json()) as LayerEditCandidate).image.sha256).toBe(candidate.image.sha256); expect(regenerate).toHaveBeenCalledTimes(1);
     expect((await s.call<ProductCreative>(`/${id}/creatives/${c.id}`)).body).toEqual(c);
     expect((await post(`/${candidate.operationId}/apply`, {})).status).toBe(200);
     expect((await s.call<ProductCreative>(`/${id}/creatives/${c.id}`)).body).toEqual(c);
@@ -49,6 +51,31 @@ it('resolves a real creative object, enforces access/type/revision/hash, and nev
     expect(hidden.revision).toBe(2);
     expect((await post('/estimate', { ...input, target: { ...input.target, revision: 2 } })).status).toBe(400);
     expect((await post(`/${candidate.operationId}/apply`, {})).status).toBe(409);
+    expect(regenerate).toHaveBeenCalledTimes(1);
+  } finally { await s.close(); }
+}, 120000);
+it('after an applied AI edit is saved into the creative, the next edit still finds the template product as its original', async () => {
+  // A perfectly faithful fake edit: the image it was sent, unchanged.
+  const regenerate = vi.fn<RatioRegenerator['regenerate']>(async ({ image }) => ({ image }));
+  const s = await setup({ layerEditor: { model: 'gpt-image-2', offline: false, regenerate } });
+  try {
+    const v = await savedTemplate(s, await productPosterPng()), id = v.template.id;
+    const c = (await s.send<ProductCreative>('POST', `/${id}/creatives`, { revision: 1, name: 'Chained edit' })).body;
+    const object = c.objects.find(o => o.label === 'Refrigerator')!, layerId = `object-${object.id}`;
+    const templateBytes = readFileSync(join(s.protectedDir, id, object.asset.file));
+    const base = s.base.replace('/product-templates', '/layer-edits');
+    const post = async <T>(path: string, data: unknown) => { const r = await fetch(`${base}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }); return { status: r.status, body: await r.json() as T }; };
+    const first = (await post<LayerEditCandidate>('', { target: { kind: 'creative', templateId: id, creativeId: c.id, revision: 1, layerId }, sourceSha256: sha(templateBytes), prompt: 'Remove the logo', model: 'gpt-image-2', operationId: randomUUID(), approveUsd: 0.27 })).body;
+    expect(first.references).toMatchObject({ current: { aiEdits: 0 } }); expect(first.references?.original).toBeUndefined();
+    expect((await post(`/${first.operationId}/apply`, {})).status).toBe(200);
+    // Save creative: the editor uploads the applied image byte for byte and saves the object with it.
+    const edited = Buffer.from(first.image.base64, 'base64'), form = new FormData();
+    form.append('image', new Blob([new Uint8Array(edited)], { type: 'image/png' }), 'Refrigerator.png');
+    const asset = (await (await fetch(`${s.base}/${id}/creatives/${c.id}/assets`, { method: 'POST', body: form })).json() as { asset: { file: string; width: number; height: number } }).asset;
+    const saved = (await s.send<ProductCreative>('PUT', `/${id}/creatives/${c.id}`, { expectedRevision: c.revision, creative: { ...c, objects: c.objects.map(o => o.id === object.id ? { ...o, asset: { ...asset, kind: 'upload', background: 'transparent' } } : o) } })).body;
+    expect(saved.revision).toBe(2); expect(saved.objects.find(o => o.id === object.id)!.asset.kind).toBe('upload');
+    const quote = (await post<LayerEditEstimate>('/estimate', { target: { kind: 'creative', templateId: id, creativeId: c.id, revision: 2, layerId }, sourceSha256: sha(edited), prompt: 'Make the handle chrome' })).body;
+    expect(quote.references).toMatchObject({ current: { sha256: sha(edited), aiEdits: 1 }, original: { sha256: sha(templateBytes), attached: true, instructions: ['Remove the logo'] } });
     expect(regenerate).toHaveBeenCalledTimes(1);
   } finally { await s.close(); }
 }, 120000);

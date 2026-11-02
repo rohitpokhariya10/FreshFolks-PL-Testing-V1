@@ -2,9 +2,11 @@
  * The AI Edit Layer panel's interaction rules, kept free of React so they can be tested directly.
  * The panel still owns its state with useState/useRef; these helpers only decide what that state means.
  */
+import type { LayerEditCandidate, LayerEditIntent, LayerEditOperation } from '@frameflow/shared';
 import { LayerEditApiError } from './layerEditApi';
 
-export type LayerEditBusy = '' | 'estimate' | 'generate' | 'status' | 'apply' | 'discard';
+/** poll: an automatic, free status check. It keeps the pending card on screen and yields to any action the person takes. */
+export type LayerEditBusy = '' | 'estimate' | 'generate' | 'status' | 'poll' | 'apply' | 'discard';
 /** Exactly one phase is shown at a time, so loading, stale and error messages never appear together. */
 export type LayerEditPhase =
   | 'unavailable' | 'ready' | 'checking-cost' | 'approval' | 'generating' | 'processing' | 'preview-failed'
@@ -79,7 +81,7 @@ export function layerEditRecovery(storage: () => Storage, documentId: string, va
 
 /** Rejections that happen before the server records a request: no provider call was made and nothing can be charged. */
 // IDEMPOTENCY_CONFLICT is deliberately absent: it means this operation was already recorded, so it must be checked, not forgotten.
-const NOT_SENT = new Set(['INVALID_LAYER_EDIT', 'STALE_REVISION', 'APPROVAL_REQUIRED', 'NOT_CONFIGURED', 'NOT_FOUND', 'BUSY', 'ORIGIN_DENIED']);
+const NOT_SENT = new Set(['INVALID_LAYER_EDIT', 'STALE_REVISION', 'APPROVAL_REQUIRED', 'CLARIFICATION_REQUIRED', 'NOT_CONFIGURED', 'NOT_FOUND', 'BUSY', 'ORIGIN_DENIED']);
 export type GenerateOutcome =
   | { kind: 'not-sent' }   // Safe to forget: no request exists.
   | { kind: 'discarded' }  // The request was discarded while it ran; nothing to recover.
@@ -134,3 +136,30 @@ export function failureFeedback(error: unknown, title: string): Feedback {
 }
 
 export const formatElapsed = (ms: number) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+const OPERATION_NAMES: Record<LayerEditOperation, string> = { state: 'Move or open parts', color: 'Change colour', material: 'Change material', add: 'Add a feature', remove: 'Remove a feature', clean: 'Repair a defect', replace: 'Replace the object', general: 'General edit' };
+/** The edit type as read from the instruction, for the approval card. */
+export const intentSummary = (intent: LayerEditIntent) =>
+  `${intent.operations.map(o => OPERATION_NAMES[o]).join(' + ')} · ${intent.preserveIdentity ? 'keeps the product\u2019s identity' : 'identity may change (replacement)'}`;
+
+/** What the identity gate's verdict means for people. Results from before the gate have no checks and need review. */
+export function identityNote(validation: LayerEditCandidate['validation']): Feedback {
+  if (validation.identity === 'drift-suspected') return { tone: 'error', title: 'This may not be the same product', detail: 'Automated checks found differences the instruction did not ask for. Compare Before and After. Reject it, or confirm it is the same product before applying.' };
+  if (validation.identity === 'consistent') return { tone: 'success', title: 'Automated identity checks passed', detail: 'Pixel checks match the original. They cannot verify small logos or text, so give it a final look.' };
+  return { tone: 'warning', title: 'Check the product before applying', detail: validation.limitation ?? 'Compare identity, details and edges with Before. AI can change unintended details.' };
+}
+/** Apply needs the person's explicit confirmation when the gate suspected a different product. */
+export const applyBlocked = (validation: LayerEditCandidate['validation'], confirmed: boolean) => validation.identity === 'drift-suspected' && !confirmed;
+
+/**
+ * Automatic status checks for a request whose result is not loaded (still running, its response lost, or found again after a
+ * reload). Free and read-only: they never submit a generation. Bounded: they stop after POLL_BUDGET_MS (the server stops
+ * waiting for the provider after 310 s), after which the person can still check by hand.
+ */
+export const POLL_BUDGET_MS = 6 * 60_000;
+const POLL_DELAYS = [1500, 3000, 5000, 5000, 8000, 10000];
+export const pollDelay = (attempt: number) => POLL_DELAYS[Math.min(attempt, POLL_DELAYS.length - 1)] + (attempt >= POLL_DELAYS.length ? 5000 : 0);
+export const pollsAutomatically = (status: PendingStatus) => status === 'running' || status === 'interrupted' || status === 'unchecked';
+/** What the server recorded about cost, in words. "Nothing was charged" only when the server knows nothing was sent or accepted. */
+export const billingText = (billing: 'none' | 'possible' | 'charged' | undefined) =>
+  billing === 'none' ? 'Nothing was charged.' : billing === 'charged' ? 'This request was charged.' : 'A provider charge may apply.';

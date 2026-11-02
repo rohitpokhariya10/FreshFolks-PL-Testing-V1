@@ -1,32 +1,41 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useStore } from 'react-redux';
 import { AlertTriangle, Check, CheckCircle2, Clock3, Info, Sparkles } from 'lucide-react';
-import { LAYER_EDIT_LIMITS, type DesignLayer, type DesignVariant, type LayerEditCandidate, type LayerEditEstimate, type LayerEditSource } from '@frameflow/shared';
+import { LAYER_EDIT_LIMITS, LAYER_EDIT_REFERENCE_USD, type DesignLayer, type DesignVariant, type LayerEditCandidate, type LayerEditEstimate, type LayerEditPhase, type LayerEditRegion, type LayerEditSource, type LayerEditStatus } from '@frameflow/shared';
 import { type RootState, selectActiveVariant, useAppSelector } from '../../store';
 import { layerEditApplied } from '../../store/editorSlice';
 import { assets, decodeImage } from '../../lib/assets/runtimeAssets';
 import { describeLayerEditChanges, editableLayer, editedLayerGeometry, layerEditChanges, layerEditSnapshot, matchesLayerEditSnapshot, snapshotFingerprint } from './layerEdit';
 import { imageHash, LayerEditApiError, layerEditApi } from './layerEditApi';
 import { useLayerEditPreview } from './LayerEditPreview';
-import { createSingleFlight, failureFeedback, formatElapsed, generateOutcome, layerEditPhase, layerEditRecovery, recordLayerEditConflict, type Feedback, type LayerEditBusy, type LayerEditConflict, type PendingStatus } from './layerEditFlow';
+import { applyBlocked, billingText, createSingleFlight, failureFeedback, formatElapsed, generateOutcome, identityNote, intentSummary, layerEditPhase, layerEditRecovery, POLL_BUDGET_MS, pollDelay, pollsAutomatically, recordLayerEditConflict, type Feedback, type LayerEditBusy, type LayerEditConflict, type PendingStatus } from './layerEditFlow';
+import { LayerEditRegionPicker } from './LayerEditRegionPicker';
 import { LayerThumbnail } from './LayerThumbnail';
 import './layerEdit.css';
 
 type Quote = { estimate: LayerEditEstimate; source: LayerEditSource; snapshot: string; version: number; before: string };
+/** What a quote is made for besides the layer: an area limit, and whether a known original product is attached. */
+type QuoteOptions = { region?: LayerEditRegion; useOriginal: boolean };
 /** A request whose result is not loaded: running here, interrupted, or found again after reselecting/reloading. */
-type Pending = { id: string; snapshot: string; version: number; prompt?: string; status: PendingStatus; detail?: string };
+type Pending = { id: string; snapshot: string; version: number; prompt?: string; status: PendingStatus; detail?: string;
+  /** From the server's record: how far a running request got, when it was sent, and whether a charge is possible. */
+  phase?: LayerEditPhase; submittedAt?: number; billing?: LayerEditStatus['billing']; };
 type Work = Exclude<LayerEditBusy, ''>;
 /** The server stops waiting for the provider after 310 s. Past this, the response is treated as lost and checked — never resent. */
 const GENERATE_TIMEOUT_MS = 330_000;
 const session = () => sessionStorage, browser = () => localStorage;
 const Spinner = () => <span className="ai-spinner" aria-hidden="true" />;
+/** The elapsed-time clock's start. Read only in the Approve click handler; module level, so React's purity lint does not misread it as render work. */
+const timestamp = () => Date.now();
+/** Identity checks listed most serious first, so a differing check is never below the fold. */
+const SEVERITY = { fail: 0, warn: 1, skipped: 2, pass: 3 } as const;
 
 const PENDING_TEXT: Record<PendingStatus, { title: string; body: string; tone: 'info' | 'warning' | 'error' }> = {
-  unchecked: { tone: 'info', title: 'An AI edit is waiting to be collected', body: 'This layer has an AI edit that hasn’t been loaded yet. Check its status to see the result — checking is free and never starts another generation.' },
-  running: { tone: 'info', title: 'Still processing', body: 'Your AI edit is still processing. You can check its status again without starting another generation.' },
-  interrupted: { tone: 'warning', title: 'Unable to confirm request status', body: 'The connection was interrupted after the request was sent, so it may still finish. Check its status — this never submits another generation.' },
-  uncertain: { tone: 'warning', title: 'Unable to confirm request status', body: 'The server can’t tell whether the AI provider finished this request, and a charge may apply. Check provider usage, then discard it before approving another edit.' },
-  failed: { tone: 'error', title: 'Generation failed', body: 'Your edit couldn’t be completed. The original layer was not changed. A provider charge may still apply.' },
+  unchecked: { tone: 'info', title: 'An AI edit is waiting to be collected', body: 'This layer has an AI edit that hasn’t been loaded yet. FrameFlow checks its status automatically — checking is free and never starts another generation.' },
+  running: { tone: 'info', title: 'Still processing', body: 'Your AI edit is still processing. FrameFlow checks again automatically, without starting another generation.' },
+  interrupted: { tone: 'warning', title: 'Reconnecting to your edit', body: 'The connection to FrameFlow was interrupted after the request was sent, so it may still finish. FrameFlow checks its status automatically — this never submits another generation.' },
+  uncertain: { tone: 'warning', title: 'Provider outcome unknown', body: 'OpenAI didn’t return a result, and its image API can’t look a request up afterwards, so FrameFlow can’t tell whether it finished. Nothing was applied. Set it aside to start a new edit: that is a separate paid request.' },
+  failed: { tone: 'error', title: 'Generation failed', body: 'Your edit couldn’t be completed. The original layer was not changed.' },
 };
 
 function Note({ feedback }: { feedback: Feedback }) {
@@ -48,6 +57,10 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
   const [pending, setPending] = useState<Pending | undefined>(() => restored && { ...restored, version, status: 'unchecked' });
   const [prompt, setPrompt] = useState(restored?.prompt ?? '');
   const [quote, setQuote] = useState<Quote>(), [approved, setApproved] = useState(false);
+  // Kept across quotes of this layer: the area limit (fractions of the layer image) and the original-reference choice.
+  const [options, setOptions] = useState<QuoteOptions>({ useOriginal: true }), [picking, setPicking] = useState(false);
+  // Explicit choices: generate an instruction the server could not read safely; apply a result flagged as another product.
+  const [asWritten, setAsWritten] = useState(false), [sameProduct, setSameProduct] = useState(false);
   const [candidate, setCandidate] = useState<LayerEditCandidate>();
   const [previewImage, setPreviewImage] = useState<{ id: string; bitmap: HTMLImageElement; blob: Blob }>();
   const [imageFailed, setImageFailed] = useState(''); // The operation whose candidate could not be decoded or verified.
@@ -144,13 +157,13 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
 
   const begin = (kind: Work, preempt?: (running: Work) => boolean) => {
     const token = flight.begin(kind, preempt);
-    if (token) { setBusy(kind); setFeedback(undefined); }
+    if (token) { setBusy(kind); if (kind !== 'poll') setFeedback(undefined); }
     return token;
   };
   const live = (token: number) => mounted.current && flight.holds(token);
   const end = (token: number) => { if (flight.end(token) && mounted.current) setBusy(''); };
   const forget = () => { if (operation.current) recovery.clear(operation.current); operation.current = ''; outcomeKnown.current = false; };
-  const reset = () => { forget(); setPending(undefined); setCandidate(undefined); setPreviewImage(undefined); setImageFailed(''); setQuote(undefined); setApproved(false); setMode('after'); };
+  const reset = () => { forget(); setPending(undefined); setCandidate(undefined); setPreviewImage(undefined); setImageFailed(''); setQuote(undefined); setApproved(false); setMode('after'); setAsWritten(false); setSameProduct(false); };
   const loadSource = async () => {
     if (!eligibility.target || layer.type !== 'image' || !layer.assetId) throw new Error(eligibility.reason ?? 'Choose an object layer.');
     const asset = await assets.getAsset(layer.assetId);
@@ -160,11 +173,14 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
   };
 
   const validPrompt = prompt.trim().length > 0 && prompt.trim().length <= LAYER_EDIT_LIMITS.prompt;
-  const estimate = async () => {
+  /** Free. `next`: changed quote options (an area, the original reference); the quote is made again for them. */
+  const estimate = async (next = options) => {
     if (!validPrompt) return;
     const token = begin('estimate'); if (!token) return;
+    setOptions(next); setAsWritten(false);
     try {
-      const { asset, source } = await loadSource(), result = await layerEditApi.estimate(source);
+      const { asset, source } = await loadSource();
+      const result = await layerEditApi.estimate({ ...source, prompt: prompt.trim(), ...(next.region ? { region: next.region } : {}), useOriginalReference: next.useOriginal });
       if (!live(token)) return;
       if (!current(snapshot, version)) throw new Error('The layer changed while the cost was being checked. Try again.');
       setQuote({ estimate: result, source, snapshot, version, before: URL.createObjectURL(asset.blob) }); setApproved(false);
@@ -174,7 +190,7 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
   const generate = async () => {
     if (!quote || !approved || !validPrompt || stale) return;
     const token = begin('generate'); if (!token) return; // Repeated clicks: only the first reaches here.
-    setApproved(false); setClock({ start: Date.now(), now: Date.now() });
+    setApproved(false); const started = timestamp(); setClock({ start: started, now: started });
     const id = crypto.randomUUID(), text = prompt.trim(), from = { snapshot: quote.snapshot, version: quote.version };
     let recorded = false;
     try {
@@ -184,7 +200,9 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       catch { throw new Error('Request recovery storage is unavailable in this browser. No generation was submitted.'); }
       recorded = true; operation.current = id; outcomeKnown.current = false;
       setPending({ id, ...from, prompt: text, status: 'running' });
-      const result = await layerEditApi.generate({ ...quote.source, target: currentTarget() ?? quote.source.target, prompt: text, operationId: id, model: quote.estimate.model, approveUsd: quote.estimate.estimateUsd }, AbortSignal.timeout(GENERATE_TIMEOUT_MS));
+      const result = await layerEditApi.generate({ ...quote.source, target: currentTarget() ?? quote.source.target, prompt: text, operationId: id, model: quote.estimate.model, approveUsd: quote.estimate.estimateUsd,
+        ...(quote.estimate.region ? { region: quote.estimate.region } : {}), useOriginalReference: quote.estimate.references?.original?.attached ?? options.useOriginal,
+        ...(quote.estimate.intent?.clarification ? { confirmAmbiguous: asWritten } : {}) }, AbortSignal.timeout(GENERATE_TIMEOUT_MS));
       // Discarded meanwhile, or the panel closed: nothing here changes, and an unseen result stays recoverable.
       if (!live(token)) return;
       if (!current(from.snapshot, from.version)) {
@@ -196,7 +214,7 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
         return;
       }
       outcomeKnown.current = true;
-      setPending(undefined); setPreviewImage(undefined); setImageFailed(''); setMode('after'); setCandidate(result);
+      setPending(undefined); setPreviewImage(undefined); setImageFailed(''); setMode('after'); setSameProduct(false); setCandidate(result);
     } catch (e) {
       if (!live(token)) return;
       staleOnServer('generate', e, from, recorded ? id : undefined);
@@ -205,14 +223,18 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       else if (outcome === 'discarded') { reset(); setFeedback({ tone: 'info', title: 'This edit was discarded. No layer was changed.' }); }
       else {
         if (outcome === 'failed') outcomeKnown.current = true;
-        setPending({ id, ...from, prompt: text, status: outcome, ...(outcome !== 'interrupted' && e instanceof Error ? { detail: e.message } : {}) });
+        setPending({ id, ...from, prompt: text, status: outcome, ...(outcome !== 'interrupted' && e instanceof Error ? { detail: e.message } : {}), ...(e instanceof LayerEditApiError && e.billing ? { billing: e.billing } : {}) });
       }
     } finally { end(token); }
   };
-  /** request: the pending request, or (from the stale card) the same request once the layer matches it again. */
-  const recover = async (request = pending) => {
+  /**
+   * request: the pending request, or (from the stale card) the same request once the layer matches it again.
+   * quiet: an automatic check. It yields to anything the person does, and a failed check leaves the request as it was (the
+   * next automatic check, or the button, tries again): a status query that fails is never a failed edit.
+   */
+  const recover = async (request = pending, quiet = false) => {
     if (!request || (request === pending && stale)) return;
-    const token = begin('status'); if (!token) return;
+    const token = quiet ? begin('poll') : begin('status', running => running === 'poll'); if (!token) return;
     try {
       const status = await layerEditApi.status(request.id, savedRevision());
       if (!live(token)) return;
@@ -223,19 +245,52 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
         if (source.sourceSha256 !== status.candidate.sourceSha256) throw new Error('This result was made from a different image than the layer shows now. Discard it and start again.');
         outcomeKnown.current = true;
         setQuote({ estimate: status.candidate, source, snapshot, version, before: URL.createObjectURL(asset.blob) });
-        setPending(undefined); setPreviewImage(undefined); setImageFailed(''); setMode('after'); setCandidate(status.candidate);
+        setPending(undefined); setPreviewImage(undefined); setImageFailed(''); setMode('after'); setSameProduct(false); setCandidate(status.candidate);
       } else if (status.status === 'discarded') { reset(); setFeedback({ tone: 'info', title: 'This request was already discarded. No layer was changed.' }); }
       else {
         if (status.status === 'failed') outcomeKnown.current = true;
-        setPending({ ...request, status: status.status === 'running' ? 'running' : status.status === 'failed' ? 'failed' : 'uncertain', ...(status.message ? { detail: status.message } : {}) });
+        setPending({ ...request, status: status.status === 'running' ? 'running' : status.status === 'failed' ? 'failed' : 'uncertain', ...(status.message ? { detail: status.message } : {}),
+          ...(status.phase ? { phase: status.phase } : {}), ...(status.submittedAt ? { submittedAt: status.submittedAt } : {}), ...(status.billing ? { billing: status.billing } : {}) });
       }
     } catch (e) {
       if (!live(token)) return;
       staleOnServer('recover', e, request, request.id);
       if (e instanceof LayerEditApiError && e.code === 'NOT_FOUND') { reset(); setFeedback({ tone: 'info', title: 'This request isn’t on the server, so there is nothing to collect.', detail: 'If it never reached the server, nothing was generated or charged. You can start a new edit.' }); }
-      else setFeedback(failureFeedback(e, 'Unable to confirm request status. Nothing was resubmitted.'));
+      else if (!quiet) setFeedback(failureFeedback(e, 'Unable to confirm request status. Nothing was resubmitted.'));
     } finally { end(token); }
   };
+  // Automatic, bounded status checks while a request's result is not loaded: free, read only, never a new generation.
+  const polling = useRef({ id: '', started: 0, attempt: 0 }), [pollingStopped, setPollingStopped] = useState(false);
+  useEffect(() => {
+    if (!pending || stale || busy || !pollsAutomatically(pending.status)) return;
+    const p = polling.current;
+    if (p.id !== pending.id) { polling.current = { id: pending.id, started: timestamp(), attempt: 0 }; setPollingStopped(false); }
+    if (timestamp() - polling.current.started > POLL_BUDGET_MS) { setPollingStopped(true); return; }
+    const timer = setTimeout(() => { polling.current.attempt++; void recover(pending, true); }, pollDelay(polling.current.attempt));
+    return () => clearTimeout(timer);
+    // Rescheduled when the request, its staleness or the panel's work changes. recover() is given the request it checks,
+    // and rechecks staleness and the single-flight token itself, so an older closure cannot act on a newer request.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending, stale, busy]);
+  // A request this browser has no record of (closed browser, another tab), made from this layer's current image: found on
+  // the server once per panel, then collected like any other pending request. Free.
+  useEffect(() => {
+    if (restored || !eligibility.target || layer.type !== 'image' || !layer.assetId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { source } = await loadSource(), found = await layerEditApi.open(source);
+        if (cancelled || !mounted.current || !found.operationId || operation.current || flight.kind) return;
+        try { recovery.write({ id: found.operationId, snapshot, ...(found.prompt ? { prompt: found.prompt } : {}) }); } catch { /* Optional here: the server keeps the request. */ }
+        operation.current = found.operationId; outcomeKnown.current = false;
+        setPending({ id: found.operationId, snapshot, version, ...(found.prompt ? { prompt: found.prompt } : {}), status: 'unchecked' });
+        if (found.prompt) setPrompt(found.prompt);
+      } catch { /* Optional: without it, the panel starts as before. */ }
+    })();
+    return () => { cancelled = true; };
+    // Once per panel: the panel is keyed by layer and source version.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   /**
    * The layer is exactly as the kept request was made from again (e.g. the change was undone). Nothing revives on its own:
    * this explicit click checks the request's status, and recover() verifies the layer and the source image once more.
@@ -245,17 +300,19 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
     const rebased = { ...pending, version };
     setQuote(undefined); setPending(rebased); void recover(rebased);
   };
-  /** again: discard a viewed result to try the same prompt again, which requires a new approval. */
-  const discard = async (again = false) => {
+  /** again: discard a viewed result to try the same prompt again, which requires a new approval. identity: rejected as another product. */
+  const discard = async (again = false, identity = false) => {
     // A generation whose layer changed can be discarded while it still runs; its late response is then ignored.
-    const token = begin('discard', running => running === 'generate' && stale); if (!token) return;
+    const token = begin('discard', running => (running === 'generate' && stale) || running === 'poll' || running === 'status'); if (!token) return;
     setMode('before'); // Restore the original on the canvas at once.
-    const id = operation.current, had = !!candidate;
+    const id = operation.current, had = !!candidate, setAside = pending?.status === 'uncertain' ? pending : undefined;
     try {
-      if (id) await layerEditApi.discard(id).catch(e => { if (!(e instanceof LayerEditApiError && e.code === 'NOT_FOUND')) throw e; });
+      if (id) await layerEditApi.discard(id, identity ? 'identity' : undefined).catch(e => { if (!(e instanceof LayerEditApiError && e.code === 'NOT_FOUND')) throw e; });
       if (!live(token)) return;
       reset();
-      if (again) setFeedback({ tone: 'info', title: 'Ready for another attempt.', detail: 'Edit the prompt if you like, then Generate Edit. Each generation needs its own approval.' });
+      if (identity) setFeedback({ tone: 'info', title: 'Result rejected as a different product. The layer is unchanged.', detail: 'Nothing was regenerated. Rephrase the instruction or limit it to an area, then generate again with a new approval.' });
+      else if (setAside) setFeedback({ tone: 'warning', title: 'Request set aside. You can start a new edit.', detail: `Request ${setAside.id} stays recorded on the server; whether OpenAI finished and charged it is unknown — check OpenAI usage${setAside.submittedAt ? ` around ${new Date(setAside.submittedAt).toLocaleTimeString()}` : ''}. A new edit is a separate paid request with its own approval.` });
+      else if (again) setFeedback({ tone: 'info', title: 'Ready for another attempt.', detail: 'Edit the prompt if you like, then Generate Edit. Each generation needs its own approval.' });
       else if (id) setFeedback({ tone: 'info', title: had ? 'Edit discarded. The layer is unchanged.' : 'Request discarded. The layer is unchanged.' });
     } catch (e) { if (live(token)) setFeedback(failureFeedback(e, 'Couldn’t discard this request. Try again.')); }
     finally { end(token); }
@@ -270,7 +327,7 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       if (source.sourceSha256 !== quote.source.sourceSha256) throw new Error('The source image changed. Discard this preview.');
       existed = await assets.hasAsset(assetId); await assets.putAsset(assetId, readyImage.blob); stored = true;
       // Revalidates the saved source on the server; no creative mutation or AI request.
-      await layerEditApi.apply(candidate.operationId, savedRevision());
+      await layerEditApi.apply(candidate.operationId, savedRevision(), candidate.validation.identity === 'drift-suspected' && sameProduct);
       if (!current(quote.snapshot, quote.version)) { conflict('apply', quote, { operationId: candidate.operationId, resultArrived: true }); throw new Error('The layer changed. This preview cannot be applied.'); }
       // Unrelated edits and save acknowledgements may have advanced the document while awaiting storage/API validation.
       const { v, l } = latest();
@@ -278,7 +335,8 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       const next = latest().l;
       applied = next?.type === 'image' && next.assetId === assetId;
       if (!applied) throw new Error('The layer changed or the edited bounds are unsupported. Nothing was applied.');
-      forget(); setCandidate(undefined); setPreviewImage(undefined); setQuote(undefined); setPrompt('');
+      // The area limit belonged to the previous image of this layer.
+      forget(); setCandidate(undefined); setPreviewImage(undefined); setQuote(undefined); setPrompt(''); setOptions(o => ({ ...o, region: undefined })); setPicking(false); setSameProduct(false);
       setFeedback({ tone: 'success', title: 'Edit applied', detail: 'Undo restores the previous image. Save creative to keep this version. You can describe another change now.' });
     } catch (e) {
       staleOnServer('apply', e, quote, candidate.operationId, true);
@@ -288,6 +346,10 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
   };
 
   const offline = !!quote?.estimate.offline, price = quote ? `$${quote.estimate.estimateUsd.toFixed(2)}` : '';
+  const intent = quote?.estimate.intent, refs = quote?.estimate.references, clarify = intent?.clarification;
+  const edits = refs?.original ? refs.original.instructions.length + refs.original.unrecordedEdits : 0;
+  const referenceText = !refs?.original ? 'This layer' : `This layer${refs.original.attached ? ' + original product' : ' only'} (${edits} earlier AI edit${edits === 1 ? '' : 's'})`;
+  const extra = `$${LAYER_EDIT_REFERENCE_USD.toFixed(2)}`;
   const pendingText = pending && PENDING_TEXT[pending.status];
   const body = () => {
     switch (phase) {
@@ -301,16 +363,32 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
         <p className="ai-layer-card-title" id={`${ids}-approve`}>Approve this edit</p>
         <dl className="ai-layer-facts">
           <div><dt>Model</dt><dd>{quote!.estimate.model || 'Unavailable'}</dd></div>
-          <div><dt>Output</dt><dd>1024 × 1024 · High quality</dd></div>
+          {intent && <div><dt>Edit type</dt><dd>{intentSummary(intent)}</dd></div>}
+          <div><dt>Output</dt><dd>{quote!.estimate.size.width} × {quote!.estimate.size.height} · High quality</dd></div>
+          <div><dt>Reference</dt><dd>{referenceText}</dd></div>
           <div><dt>Estimate</dt><dd>{offline ? 'Offline test provider · $0.00' : `${price} per edit`}</dd></div>
         </dl>
+        {refs?.original && <div className="ai-layer-reference">
+          <p className="ai-layer-fineprint">{refs.original.attached
+            ? 'The layer is edited as it is now. The original product is attached only as the identity reference, so earlier AI edits cannot drift it further and approved changes are kept.'
+            : 'Only the current layer is sent. Earlier AI edits may already differ from the original product.'}</p>
+          <button type="button" className="ai-layer-link" aria-pressed={refs.original.attached} onClick={() => void estimate({ ...options, useOriginal: !refs.original!.attached })}>
+            {refs.original.attached ? `Leave the original product out (−${extra})` : `Attach the original product as identity reference (+${extra})`}</button>
+        </div>}
+        {refs?.unavailable && <p className="ai-layer-fineprint">{refs.unavailable}</p>}
+        <button type="button" className="ai-layer-link" aria-expanded={picking || !!options.region} onClick={() => setPicking(p => !p)}>{options.region ? 'Change the area limit' : 'Limit the edit to an area…'}</button>
+        {(picking || options.region) && <LayerEditRegionPicker src={quote!.before} region={quote!.estimate.region} onChange={region => void estimate({ ...options, region })} />}
+        {clarify && <div className="ai-layer-card is-warning" role="alert">
+          <p className="ai-layer-card-title">Clarify the instruction</p><p>{clarify}</p>
+          <button type="button" className="ai-layer-link" aria-pressed={asWritten} onClick={() => setAsWritten(v => !v)}>{asWritten ? 'Generating it as written · undo' : 'Generate it as written anyway'}</button>
+        </div>}
         {quote!.estimate.reason ? <p className="ai-layer-inline-error" role="alert">{quote!.estimate.reason}</p> : <>
           <p className="ai-layer-fineprint">An estimate, not a fixed price: final cost depends on usage, and a failed result may still be charged. Comparing, applying and discarding are free.</p>
           <label className="ai-layer-consent"><input type="checkbox" checked={approved} onChange={e => setApproved(e.target.checked)} />
             <span>I approve one {offline ? 'offline test' : 'paid'} generation{offline ? '' : ` (about ${price})`}.</span></label>
         </>}
         <div className="ai-layer-actions">
-          {!quote!.estimate.reason && <button className="button ai-layer-primary" disabled={!approved || !validPrompt} onClick={() => void generate()}>Approve and generate</button>}
+          {!quote!.estimate.reason && <button className="button ai-layer-primary" disabled={!approved || !validPrompt || (!!clarify && !asWritten)} onClick={() => void generate()}>Approve and generate</button>}
           <button className="button" onClick={() => { setQuote(undefined); setApproved(false); }}>Cancel</button>
         </div>
       </div>;
@@ -323,7 +401,8 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
         <p className="ai-layer-hint">Sent once and never repeated automatically. If you select another layer, come back to it to collect the result.</p>
       </>;
       case 'processing': case 'preview-failed': case 'compare': case 'applying': {
-        const applying = phase === 'applying', ready = phase === 'compare' || applying;
+        const applying = phase === 'applying', ready = phase === 'compare' || applying, validation = candidate!.validation, flagged = validation.identity === 'drift-suspected';
+        const verdict = identityNote(validation);
         const choice = (value: 'before' | 'after', label: string, alt: string, src: string) => <button type="button" className="ai-layer-choice" aria-label={label} aria-pressed={activeMode === value}
           disabled={applying || (value === 'after' && !ready)} onClick={() => setMode(value)}>
           <span className="ai-layer-choice-head">{label}{activeMode === value && <Check size={14} aria-hidden="true" />}</span>
@@ -340,27 +419,42 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
             ? <div className="ai-layer-card is-error" role="alert"><p className="ai-layer-card-title">The edited image couldn’t be shown</p>
               <p>The AI preview image could not load or failed verification. The original layer is unchanged. Discard this result.</p></div>
             : <p className="ai-layer-hint" role="status">{!ready ? 'Edit received. Preparing the canvas preview…' : activeMode === 'after' ? 'The canvas shows the AI edit. Nothing is saved until you apply it.' : 'The canvas shows the original. Select After to apply the edit.'}</p>}
+          <div className={`ai-layer-card is-${verdict.tone === 'success' ? 'info' : verdict.tone}`} role={flagged ? 'alert' : 'status'} aria-label="Product identity">
+            <p className="ai-layer-card-title">{verdict.title}</p>{verdict.detail && <p>{verdict.detail}</p>}
+            {!!validation.checks?.length && <details className="ai-layer-details" open={flagged}><summary>Automated checks</summary>
+              <ul className="ai-layer-checks">{[...validation.checks].sort((a, b) => SEVERITY[a.status] - SEVERITY[b.status]).map(c => <li key={c.id} className={`is-${c.status}`}><strong>{c.label}</strong> · {c.status === 'pass' ? 'OK' : c.status === 'skipped' ? 'not checked' : c.status === 'warn' ? 'check' : 'differs'}<br />{c.detail}</li>)}</ul>
+            </details>}
+            {flagged && <label className="ai-layer-consent"><input type="checkbox" checked={sameProduct} disabled={applying} onChange={e => setSameProduct(e.target.checked)} />
+              <span>I compared Before and After: it is the same product.</span></label>}
+          </div>
           <div className="ai-layer-actions">
-            <button className="button ai-layer-primary" disabled={!ready || applying || activeMode !== 'after'} aria-busy={applying || phase === 'processing'} onClick={() => void apply()}>
+            <button className="button ai-layer-primary" disabled={!ready || applying || activeMode !== 'after' || applyBlocked(validation, sameProduct)} aria-busy={applying || phase === 'processing'} onClick={() => void apply()}>
               {applying ? <><Spinner />Applying…</> : phase === 'processing' ? <><Spinner />Preparing preview…</> : <><Check size={14} aria-hidden="true" />Apply Edit</>}
             </button>
             <button className="button" disabled={applying} onClick={() => void discard()}>Discard</button>
           </div>
+          {flagged && <button type="button" className="ai-layer-link" disabled={applying} onClick={() => void discard(false, true)}>Reject · not the same product</button>}
           {phase !== 'preview-failed' && <button type="button" className="ai-layer-link" disabled={applying} onClick={() => void discard(true)}>Regenerate · new approval</button>}
-          <p className="ai-layer-fineprint">Check identity, details and edges before applying — AI can change unintended details. The edited object may be larger; its centre stays in place. {candidate!.costUsd === undefined ? 'Final usage cost unavailable.' : `Reported usage cost: $${candidate!.costUsd.toFixed(3)}.`}</p>
+          <p className="ai-layer-fineprint">The edited object may be larger; its centre stays in place. {candidate!.costUsd === undefined ? 'Final usage cost unavailable.' : `Reported usage cost: $${candidate!.costUsd.toFixed(3)}.`}</p>
         </>;
       }
       case 'pending': case 'checking-status': {
-        const checking = phase === 'checking-status', text = pendingText!;
+        const checking = phase === 'checking-status', text = pendingText!, p = pending!, final = p.status === 'failed' || p.status === 'uncertain';
+        const progress = p.status === 'running' && p.phase === 'queued' ? 'Waiting for an image slot — nothing has been sent to OpenAI yet.'
+          : p.status === 'running' && p.phase === 'received' ? 'The result arrived and is being checked.' : '';
         return <>
           <div className={`ai-layer-card is-${text.tone}`} role={text.tone === 'error' ? 'alert' : 'status'}>
             <p className="ai-layer-card-title">{text.title}</p><p>{text.body}</p>
-            {pending!.detail && <details className="ai-layer-details"><summary>Details</summary><p>{pending!.detail}</p></details>}
+            {progress && <p>{progress}</p>}
+            {final && <p>{billingText(p.billing)}</p>}
+            <p className="ai-layer-meta">Request {p.id}{p.submittedAt ? ` · sent ${new Date(p.submittedAt).toLocaleTimeString()}` : ''}</p>
+            {pollingStopped && pollsAutomatically(p.status) && <p className="ai-layer-meta">Automatic checks have stopped. Check again any time — it’s free.</p>}
+            {p.detail && <details className="ai-layer-details"><summary>Details</summary><p>{p.detail}</p></details>}
           </div>
           <div className="ai-layer-actions">
-            {pending!.status !== 'failed' && <button className="button ai-layer-primary" disabled={checking} aria-busy={checking} onClick={() => void recover()}>
+            {p.status !== 'failed' && <button className="button ai-layer-primary" disabled={checking} aria-busy={checking} onClick={() => void recover()}>
               {checking ? <><Spinner />Checking status…</> : 'Check request status'}</button>}
-            <button className="button" disabled={checking} onClick={() => void discard()}>Discard</button>
+            <button className="button" disabled={checking} onClick={() => void discard()}>{p.status === 'uncertain' ? 'Set aside · start a new edit' : 'Discard'}</button>
           </div>
         </>;
       }
@@ -395,7 +489,8 @@ export function LayerEditPanel({ variant, layer }: { variant: DesignVariant; lay
       <label className="ai-layer-label" htmlFor={`${ids}-prompt`}>Describe the change</label>
       <textarea id={`${ids}-prompt`} aria-label="Layer edit prompt" aria-describedby={`${ids}-count`} rows={3} maxLength={LAYER_EDIT_LIMITS.prompt} value={prompt}
         disabled={phase !== 'ready' && phase !== 'approval'} placeholder="For example: open both doors, make it red, raise the left arm…"
-        onChange={e => { setPrompt(e.target.value); setApproved(false); setFeedback(undefined); }} />
+        // A quote is made for its instruction (its edit type and framing): a changed instruction is quoted again, free.
+        onChange={e => { setPrompt(e.target.value); setApproved(false); setFeedback(undefined); if (quote && phase === 'approval') { setQuote(undefined); setAsWritten(false); } }} />
       <p className="ai-layer-count" id={`${ids}-count`}>{prompt.trim().length}/{LAYER_EDIT_LIMITS.prompt}</p>
       {body()}
       {feedback && phase !== 'stale' && <Note feedback={feedback} />}

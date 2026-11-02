@@ -9,13 +9,17 @@ import type { LayerEditSource, LayerEditTarget } from '@frameflow/shared';
 import { RunError } from './layerizeExperiment.js';
 import type { RatioRegenerator } from './protectedTemplates/product/ratioRegeneration.js';
 import { createLayerEdits } from './layerEdit.js';
+import { closedLike, recoloured, type EditRequest } from './layerEdit.fixture.js';
 import { layerEditPrompt, prepareLayerEdit, validateLayerEdit } from './layerEditImage.js';
+import { classifyLayerEdit } from './layerEditIntent.js';
 import { layerEditTarget } from './layerEditSource.js';
 import { sha256 } from './protectedTemplates/pixels.js';
 
 const png = (content: string, w = 1024, h = 1024) => sharp(Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">${content}</svg>`)).png().toBuffer();
 const original = () => png('<rect x="30" y="20" width="140" height="360" rx="12" fill="#9e6847"/>', 200, 400);
 const opened = () => png('<path d="M172 300 L392 232 H632 L852 300 V740 L632 792 H392 L172 740 Z" fill="#9e6847"/><rect x="410" y="270" width="204" height="490" fill="#334155"/>');
+/** The same brown body closed again (faithful), drawn at the edited image's height. */
+const closed = (r: EditRequest) => closedLike(r, { svg: '<rect width="140" height="360" rx="12" fill="#9e6847"/>', width: 140, height: 360 });
 async function setup(output = opened) {
   const bytes = await original(), dir = mkdtempSync(join(tmpdir(), 'layer-edit-unit-'));
   const regenerate = vi.fn<RatioRegenerator['regenerate']>(async () => ({ image: await output(), requestId: 'req_test', costUsd: 0.26 }));
@@ -28,12 +32,14 @@ async function setup(output = opened) {
 describe('single-object image editing, fully offline', () => {
   it('chains three trusted applied references using each exact latest image, without saving the older creative over it', async () => {
     const s = await setup();
-    const outputs = [await opened(), await png('<rect x="390" y="210" width="244" height="600" fill="#94a3b8"/>'), await png('<rect x="390" y="210" width="244" height="600" rx="20" fill="#2563eb"/>')];
+    // Faithful fake edits of the image sent: open, close again, recolour.
+    const edits = [async () => opened(), closed, (r: EditRequest) => recoloured(r, '#2563eb')], prompts = ['Open doors', 'Close doors', 'Change the colour to blue'];
     let bytes = s.bytes, source = s.source;
-    for (let i = 0; i < outputs.length; i++) {
-      s.regenerate.mockResolvedValueOnce({ image: outputs[i], requestId: `req_${i}` });
-      const candidate = await s.service.generate({ ...s.request, ...source, operationId: randomUUID(), prompt: ['Open doors', 'Close doors', 'Change color'][i] });
-      expect(s.regenerate.mock.calls[i][0].image).toEqual((await prepareLayerEdit(bytes)).image);
+    for (let i = 0; i < edits.length; i++) {
+      s.regenerate.mockImplementationOnce(async r => ({ image: await edits[i](r), requestId: `req_${i}` }));
+      const candidate = await s.service.generate({ ...s.request, ...source, operationId: randomUUID(), prompt: prompts[i] });
+      expect(s.regenerate.mock.calls[i][0].image).toEqual((await prepareLayerEdit(bytes, { intent: classifyLayerEdit(prompts[i]) })).image);
+      expect(candidate.validation.identity).not.toBe('drift-suspected');
       expect(candidate.sourceSha256).toBe(sha256(bytes));
       await s.service.apply(candidate.operationId);
       bytes = Buffer.from(candidate.image.base64, 'base64');
@@ -55,7 +61,7 @@ describe('single-object image editing, fully offline', () => {
     const first = await service.generate(s.request); await service.apply(first.operationId);
     const firstBytes = Buffer.from(first.image.base64, 'base64');
     // The editor saves the creative (now holding the applied image) while the second edit is generating.
-    s.regenerate.mockImplementationOnce(async () => { revision = 2; saved = firstBytes; return { image: await png('<rect x="390" y="210" width="244" height="600" fill="#94a3b8"/>'), requestId: 'req_close' }; });
+    s.regenerate.mockImplementationOnce(async r => { revision = 2; saved = firstBytes; return { image: await closed(r), requestId: 'req_close' }; });
     const second = await service.generate({ ...s.request, operationId: randomUUID(), prompt: 'Close the doors.', sourceSha256: first.image.sha256, sourceCandidateId: first.operationId });
     await expect(service.apply(second.operationId)).rejects.toThrow('This creative changed'); // The previous false failure.
     await expect(service.status(second.operationId)).rejects.toThrow('This creative changed');
@@ -65,8 +71,9 @@ describe('single-object image editing, fully offline', () => {
     // A third edit chains from the second at the saved revision, using exactly the second image.
     const third = { ...s.source, target: { ...s.source.target, revision: 2 }, sourceSha256: second.image.sha256, sourceCandidateId: second.operationId };
     expect((await service.estimate(third)).sourceSha256).toBe(second.image.sha256);
+    s.regenerate.mockImplementationOnce(async r => ({ image: await recoloured(r, '#dc2626'), requestId: 'req_red' }));
     const red = await service.generate({ ...s.request, ...third, operationId: randomUUID(), prompt: 'Make it red.' });
-    expect(s.regenerate.mock.calls[2][0].image).toEqual((await prepareLayerEdit(Buffer.from(second.image.base64, 'base64'))).image);
+    expect(s.regenerate.mock.calls[2][0].image).toEqual((await prepareLayerEdit(Buffer.from(second.image.base64, 'base64'), { intent: classifyLayerEdit('Make it red.') })).image);
     // A save that changed this layer's image is still rejected, even at the newer revision.
     revision = 3; saved = await png('<rect x="10" y="10" width="150" height="300" fill="#16a34a"/>', 200, 400);
     await expect(service.apply(red.operationId, 3)).rejects.toThrow(/local image differs|Save this edited layer/);
@@ -132,10 +139,13 @@ describe('single-object image editing, fully offline', () => {
     await expect(s.service.generate({ ...s.request, sourceSha256: 'a'.repeat(64) })).rejects.toThrow('differs');
     await expect(s.service.generate({ ...s.request, model: 'other' })).rejects.toThrow('model changed');
     const c = await s.service.generate(s.request);
-    await expect(s.service.generate(s.request)).rejects.toThrow('already submitted');
+    // A repeated operation returns its stored result, also after a restart: never a second provider request.
+    expect((await s.service.generate(s.request)).image.sha256).toBe(c.image.sha256);
     const restarted = createLayerEdits({ dir: s.dir, resolve: s.resolve, provider: () => ({ model: 'gpt-image-2', offline: false, regenerate: s.regenerate }) });
-    await expect(restarted.generate(s.request)).rejects.toThrow('already submitted');
+    expect((await restarted.generate(s.request)).image.sha256).toBe(c.image.sha256);
+    await expect(restarted.generate({ ...s.request, prompt: 'Something else' })).rejects.toThrow('already used for a different edit');
     await restarted.discard(c.operationId);
+    await expect(restarted.generate(s.request)).rejects.toThrow('already submitted');
     expect(JSON.parse(readFileSync(join(s.dir, `${c.operationId}.json`), 'utf8')).candidate).toBeUndefined();
     expect(s.regenerate).toHaveBeenCalledTimes(1);
   });
@@ -174,7 +184,8 @@ describe('single-object image editing, fully offline', () => {
     expect(status.status).toBe('failed'); expect(status.candidate).toBeUndefined();
     expect(status.message?.match(/No automatic retry was made\./g)).toHaveLength(1);
     const record = JSON.parse(readFileSync(join(s.dir, `${s.request.operationId}.json`), 'utf8'));
-    expect(record.failure).toEqual({ status: 400, code: 'invalid_value', parameter: 'background', requestId: 'req_layer_rejected' });
+    expect(record.failure).toMatchObject({ status: 400, code: 'invalid_value', parameter: 'background', requestId: 'req_layer_rejected', phase: 'submitting', transport: { status: 400, code: 'invalid_value' } });
+    expect(status.billing).toBe('none'); // Refused by the provider.
     expect(JSON.stringify(record)).not.toContain('private-provider-body');
     await expect(s.service.generate(s.request)).rejects.toThrow('already submitted');
     await s.service.discard(s.request.operationId);
@@ -208,9 +219,21 @@ describe('single-object image editing, fully offline', () => {
   it('rejects missing, unsupported and oversized sources without calling the provider', async () => {
     for (const bytes of [Buffer.alloc(0), Buffer.from('<svg/>'), Buffer.alloc(26 * 1024 * 1024)]) await expect(prepareLayerEdit(bytes)).rejects.toThrow();
   });
-  it('validates identifiers and keeps prompts generic and reference based', () => {
+  it('validates identifiers and builds the prompt from the edit type, the measured reference and the attached original', () => {
     for (const target of [{ kind: 'run', runId: '../secret', layerId: 'x' }, { kind: 'creative', templateId: '/tmp/x', creativeId: 'pc-123abc', layerId: 'x', revision: 1 }, { kind: 'creative', templateId: 'x', creativeId: 'pc-123abc', layerId: '../x', revision: 1 }]) expect(() => layerEditTarget(target)).toThrow();
-    expect(layerEditPrompt('Character', 'Raise the left arm', '#00ff00')).toContain('identity reference');
-    expect(layerEditPrompt('Lamp', 'Turn it on', '#00ff00')).not.toMatch(/LG|refrigerator|Seedream|FLUX/);
+    const measured = { palette: [{ hex: '#3f4246', share: 0.7 }], aspect: 0.54 };
+    const pose = layerEditPrompt({ name: 'Character', instruction: 'Raise the left arm', ground: '#00ff00', intent: classifyLayerEdit('Raise the left arm'), measured });
+    // The image is the identity reference; the measured colours are to be kept; the instruction is last.
+    expect(pose).toContain('it is the identity reference'); expect(pose).toContain('main colours are #3f4246 (70%). Keep these colours.');
+    expect(pose.endsWith('Requested edit: Raise the left arm')).toBe(true); expect(pose).not.toContain('Image 2');
+    expect(layerEditPrompt({ name: 'Lamp', instruction: 'Turn it on', ground: '#00ff00', intent: classifyLayerEdit('Turn it on') })).not.toMatch(/LG|refrigerator|Seedream|FLUX/);
+    // A colour change names the current colours without asking to keep them.
+    const red = layerEditPrompt({ name: 'Lamp', instruction: 'Make it red', ground: '#ff00ff', intent: classifyLayerEdit('Make it red'), measured });
+    expect(red).toContain('current main colours are #3f4246'); expect(red).not.toContain('Keep these colours');
+    // An attached original: how many earlier edits, and which instructions were recorded.
+    const chained = layerEditPrompt({ name: 'Fridge', instruction: 'Close the doors', ground: '#00ff00', intent: classifyLayerEdit('Close the doors'), original: { instructions: ['Open both doors'], unrecordedEdits: 1 } });
+    expect(chained).toContain('before 2 earlier AI edits (recorded instructions, oldest first: “Open both doors”; 1 more not recorded)');
+    // A requested replacement does not demand the same product.
+    expect(layerEditPrompt({ name: 'Fridge', instruction: 'Replace it with a sofa', ground: '#00ff00', intent: classifyLayerEdit('Replace it with a sofa') })).not.toContain('exact same physical product');
   });
 });
